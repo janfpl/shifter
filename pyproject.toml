@@ -17,6 +17,7 @@ dependencies = [
     "qtpy>=2.3",
     "scikit-image>=0.20",
     "matplotlib>=3.5",
+    "h5py>=3.7",
 ]
 
 [project.optional-dependencies]

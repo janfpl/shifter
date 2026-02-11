@@ -36,6 +36,7 @@ from qtpy.QtWidgets import (
 
 from chromatic_shift_corrector.data_loader import (
     BigTIFFLoader,
+    H5Loader,
     scan_bigtiff_files,
     validate_channels,
     z_dimensions_summary,
@@ -44,7 +45,9 @@ from chromatic_shift_corrector.export_engine import (
     compute_chunk_size,
     estimate_output_sizes,
     run_export,
+    run_export_h5,
 )
+from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
 from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
@@ -77,7 +80,7 @@ COLORMAP_OPTIONS = [
 
 
 class ExportWorker(QThread):
-    """Background thread for full-volume export."""
+    """Background thread for full-volume export (BigTIFF or H5)."""
 
     progress = Signal(int, int)  # (planes_done, total_planes)
     finished = Signal(str)  # metadata path or empty on cancel
@@ -85,12 +88,13 @@ class ExportWorker(QThread):
 
     def __init__(
         self,
-        loaders: list[BigTIFFLoader],
+        loaders: list[Any],
         shift_manager: ShiftManager,
         output_dir: Path,
         ram_percent: int,
         voxel_xy: float,
         voxel_z: float,
+        input_format: str = "bigtiff",
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -99,6 +103,7 @@ class ExportWorker(QThread):
         self.ram_percent = ram_percent
         self.voxel_xy = voxel_xy
         self.voxel_z = voxel_z
+        self.input_format = input_format
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -106,7 +111,8 @@ class ExportWorker(QThread):
 
     def run(self) -> None:
         try:
-            meta_path = run_export(
+            export_fn = run_export_h5 if self.input_format == "h5" else run_export
+            meta_path = export_fn(
                 self.loaders,
                 self.shift_manager,
                 self.output_dir,
@@ -243,14 +249,18 @@ class ChromaticShiftWidget(QWidget):
         super().__init__()
         self.viewer = napari_viewer
         self.shift_manager = ShiftManager()
-        self.loaders: list[BigTIFFLoader] = []
+        self.loaders: list[Any] = []  # BigTIFFLoader or H5Loader
         self._preview_layer_names: list[str] = []
         self._shapes_layer = None
         self._export_worker: ExportWorker | None = None
         self._registration_worker: RegistrationWorker | None = None
 
-        # Per-channel confidence scores (channel_index → confidence float).
+        # Per-channel confidence scores (channel_index -> confidence float).
         self._confidence_scores: dict[int, float] = {}
+
+        # Format state: "bigtiff" or "h5".
+        self._input_format: str = "bigtiff"
+        self._h5_file_manager: H5FileManager | None = None
 
         self._build_ui()
 
@@ -285,6 +295,15 @@ class ChromaticShiftWidget(QWidget):
     def _build_data_section(self) -> QGroupBox:
         grp = QGroupBox("Data Loading")
         lay = QVBoxLayout()
+
+        # Format selector
+        row_format = QHBoxLayout()
+        row_format.addWidget(QLabel("Format:"))
+        self.combo_format = QComboBox()
+        self.combo_format.addItems(["BigTIFF (.tif)", "Luxendo H5 (.lux.h5)"])
+        self.combo_format.currentIndexChanged.connect(self._on_format_changed)
+        row_format.addWidget(self.combo_format)
+        lay.addLayout(row_format)
 
         # Directory selector
         row_dir = QHBoxLayout()
@@ -325,6 +344,12 @@ class ChromaticShiftWidget(QWidget):
         self.spin_voxel_z.setValue(1.0)
         row_voxel.addWidget(self.spin_voxel_z)
         lay.addLayout(row_voxel)
+
+        # Voxel source label (shown for H5 when auto-filled from metadata).
+        self.lbl_voxel_source = QLabel("")
+        self.lbl_voxel_source.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_voxel_source.setVisible(False)
+        lay.addWidget(self.lbl_voxel_source)
 
         # Load button
         self.btn_load = QPushButton("Load Data")
@@ -507,6 +532,11 @@ class ChromaticShiftWidget(QWidget):
         grp = QGroupBox("Export")
         lay = QVBoxLayout()
 
+        # Output format indicator.
+        self.lbl_output_format = QLabel("Output format: BigTIFF")
+        self.lbl_output_format.setStyleSheet("font-weight: bold;")
+        lay.addWidget(self.lbl_output_format)
+
         row_outdir = QHBoxLayout()
         self.btn_select_outdir = QPushButton("Select Output Directory")
         self.btn_select_outdir.clicked.connect(self._on_select_output_dir)
@@ -602,6 +632,41 @@ class ChromaticShiftWidget(QWidget):
         else:
             self.btn_run_registration.setToolTip("")
 
+    def _on_format_changed(self, index: int) -> None:
+        """Handle format dropdown change."""
+        new_format = "h5" if index == 1 else "bigtiff"
+
+        # If data is loaded and format is changing, confirm clear.
+        if self.loaders and new_format != self._input_format:
+            ans = QMessageBox.question(
+                self,
+                "Change Format",
+                "Changing the format will unload all data. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                # Revert combo without triggering signal.
+                self.combo_format.blockSignals(True)
+                self.combo_format.setCurrentIndex(0 if self._input_format == "bigtiff" else 1)
+                self.combo_format.blockSignals(False)
+                return
+            self._close_loaders()
+            self._on_clear_preview()
+            layers_to_remove = [l for l in self.viewer.layers if l.name.startswith("ch")]
+            for l in layers_to_remove:
+                self.viewer.layers.remove(l)
+            self.file_table.setRowCount(0)
+            self.shift_manager = ShiftManager()
+            self._rebuild_shift_table()
+            self.lbl_dir.clear()
+
+        self._input_format = new_format
+        # Update format-dependent labels.
+        if new_format == "h5":
+            self.lbl_output_format.setText("Output format: Luxendo H5 (.lux.h5)")
+        else:
+            self.lbl_output_format.setText("Output format: BigTIFF")
+
     # ------------------------------------------------------------------ #
     # Callbacks — Data Loading
     # ------------------------------------------------------------------ #
@@ -612,14 +677,43 @@ class ChromaticShiftWidget(QWidget):
             return
         self.lbl_dir.setText(path)
         dir_path = Path(path)
-        files = scan_bigtiff_files(dir_path)
-        self._populate_file_table(files)
 
-        # Auto-fill voxel sizes from XML metadata if available.
-        voxel = parse_voxel_size_from_xml(dir_path)
-        if voxel is not None:
-            self.spin_voxel_xy.setValue(voxel[0])
-            self.spin_voxel_z.setValue(voxel[1])
+        if self._input_format == "h5":
+            files = scan_h5_files(dir_path)
+            self._populate_file_table(files)
+            self.lbl_voxel_source.setVisible(False)
+            # Try auto-filling voxel sizes from the first H5 file's metadata.
+            if files:
+                self._try_autofill_h5_voxel(files[0])
+        else:
+            files = scan_bigtiff_files(dir_path)
+            self._populate_file_table(files)
+            self.lbl_voxel_source.setVisible(False)
+            # Auto-fill voxel sizes from XML metadata if available.
+            voxel = parse_voxel_size_from_xml(dir_path)
+            if voxel is not None:
+                self.spin_voxel_xy.setValue(voxel[0])
+                self.spin_voxel_z.setValue(voxel[1])
+
+    def _try_autofill_h5_voxel(self, h5_path: Path) -> None:
+        """Try to auto-fill voxel sizes from H5 metadata."""
+        try:
+            from chromatic_shift_corrector.h5_utils import parse_h5_metadata
+            import h5py
+
+            with h5py.File(str(h5_path), "r") as f:
+                meta = parse_h5_metadata(f)
+            xy = meta.get("voxel_size_xy_um")
+            z = meta.get("voxel_size_z_um")
+            if xy and xy > 0:
+                self.spin_voxel_xy.setValue(xy)
+            if z and z > 0:
+                self.spin_voxel_z.setValue(z)
+            if xy or z:
+                self.lbl_voxel_source.setText("from H5 metadata")
+                self.lbl_voxel_source.setVisible(True)
+        except Exception:
+            pass
 
     def _populate_file_table(self, files: list[Path]) -> None:
         # Clear existing radio buttons from group
@@ -693,15 +787,42 @@ class ChromaticShiftWidget(QWidget):
 
         selected.sort(key=lambda t: t[0])
 
-        # Load files.
-        loaders: list[BigTIFFLoader] = []
+        # Load files — format-specific.
+        loaders: list[Any] = []
         filenames: list[str] = []
         colormaps: list[str] = []
         try:
-            for _, path, cmap in selected:
-                loaders.append(BigTIFFLoader(path))
-                filenames.append(path.name)
-                colormaps.append(cmap)
+            if self._input_format == "h5":
+                self._h5_file_manager = H5FileManager()
+                for _, path, cmap in selected:
+                    loaders.append(H5Loader(path, self._h5_file_manager))
+                    filenames.append(path.name)
+                    colormaps.append(cmap)
+                # Auto-fill voxel sizes from reference channel H5 metadata.
+                ref_loader_idx = 0
+                for idx, (_, path, _) in enumerate(selected):
+                    for r in range(self.file_table.rowCount()):
+                        item = self.file_table.item(r, 1)
+                        if item and Path(item.data(Qt.UserRole)) == path:
+                            if r == ref_row:
+                                ref_loader_idx = idx
+                            break
+                ref_meta = loaders[ref_loader_idx].h5_metadata
+                xy = ref_meta.get("voxel_size_xy_um")
+                z = ref_meta.get("voxel_size_z_um")
+                if xy and xy > 0:
+                    self.spin_voxel_xy.setValue(xy)
+                if z and z > 0:
+                    self.spin_voxel_z.setValue(z)
+                if xy or z:
+                    self.lbl_voxel_source.setText("from H5 metadata")
+                    self.lbl_voxel_source.setVisible(True)
+            else:
+                for _, path, cmap in selected:
+                    loaders.append(BigTIFFLoader(path))
+                    filenames.append(path.name)
+                    colormaps.append(cmap)
+                self.lbl_voxel_source.setVisible(False)
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
             return
@@ -712,6 +833,8 @@ class ChromaticShiftWidget(QWidget):
             QMessageBox.critical(self, "Validation Error", msg)
             for ld in loaders:
                 ld.close()
+            if self._h5_file_manager:
+                self._h5_file_manager.close_all()
             return
 
         # Warn about mismatched Z.
@@ -747,13 +870,24 @@ class ChromaticShiftWidget(QWidget):
         # Add layers to napari.
         for i, loader in enumerate(self.loaders):
             t = self.shift_manager[i]
-            self.viewer.add_image(
-                loader.dask_array,
-                name=f"ch{i}_{t.filename}",
-                colormap=t.colormap,
-                blending="additive",
-                visible=True,
-            )
+            # H5 loaders with pyramid levels use multiscale for napari.
+            if self._input_format == "h5" and len(loader.multiscale) > 1:
+                self.viewer.add_image(
+                    loader.multiscale,
+                    name=f"ch{i}_{t.filename}",
+                    colormap=t.colormap,
+                    blending="additive",
+                    visible=True,
+                    multiscale=True,
+                )
+            else:
+                self.viewer.add_image(
+                    loader.dask_array,
+                    name=f"ch{i}_{t.filename}",
+                    colormap=t.colormap,
+                    blending="additive",
+                    visible=True,
+                )
 
         # Clear old confidence scores and update UI.
         self._confidence_scores.clear()
@@ -775,6 +909,10 @@ class ChromaticShiftWidget(QWidget):
             except Exception:
                 pass
         self.loaders.clear()
+        # Close H5 file handles if any.
+        if self._h5_file_manager is not None:
+            self._h5_file_manager.close_all()
+            self._h5_file_manager = None
 
     # ------------------------------------------------------------------ #
     # Callbacks — Shift Table
@@ -1202,6 +1340,7 @@ class ChromaticShiftWidget(QWidget):
             ram_pct,
             self.spin_voxel_xy.value(),
             self.spin_voxel_z.value(),
+            input_format=self._input_format,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.finished.connect(self._on_export_finished)
@@ -1236,6 +1375,7 @@ class ChromaticShiftWidget(QWidget):
     def _set_ui_enabled(self, enabled: bool) -> None:
         """Enable or disable all interactive widgets."""
         for w in [
+            self.combo_format,
             self.btn_select_dir,
             self.btn_load,
             self.btn_reset_shifts,

@@ -128,17 +128,21 @@ def build_metadata(
         is_ref = ch["channel_index"] == reference_index
         if is_ref:
             ref_filename = ch["filename_original"]
-        channel_entries.append(
-            {
-                "filename_original": ch["filename_original"],
-                "filename_corrected": ch["filename_corrected"],
-                "channel_index": ch["channel_index"],
-                "is_reference": is_ref,
-                "shift_x_voxels": ch["shift_x"],
-                "shift_y_voxels": ch["shift_y"],
-                "shift_z_voxels": ch["shift_z"],
-            }
-        )
+        entry = {
+            "filename_original": ch["filename_original"],
+            "filename_corrected": ch["filename_corrected"],
+            "channel_index": ch["channel_index"],
+            "is_reference": is_ref,
+            "shift_x_voxels": ch["shift_x"],
+            "shift_y_voxels": ch["shift_y"],
+            "shift_z_voxels": ch["shift_z"],
+        }
+        # Include optional H5-specific fields if present.
+        if "channel_description" in ch:
+            entry["channel_description"] = ch["channel_description"]
+        if "pyramid_levels_regenerated" in ch:
+            entry["pyramid_levels_regenerated"] = ch["pyramid_levels_regenerated"]
+        channel_entries.append(entry)
 
     nz, ny, nx = volume_shape_zyx
     return {

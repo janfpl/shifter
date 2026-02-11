@@ -1,13 +1,13 @@
-"""BigTIFF / dask loading and channel management.
+"""BigTIFF / Luxendo H5 / dask loading and channel management.
 
-The loading interface is abstracted so that future formats (e.g. HDF5) can
-return dask arrays through the same API.
+The loading interface is abstracted so that different formats return dask
+arrays through the same API.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import dask.array as da
 import numpy as np
@@ -74,6 +74,101 @@ class BigTIFFLoader:
             self._store.close()
 
 
+class H5Loader:
+    """Lazy loader for a single-channel Luxendo .lux.h5 volume.
+
+    Uses :class:`h5_utils.H5FileManager` to keep h5py file handles open
+    so that dask arrays can access data lazily.  Also provides multiscale
+    dask arrays for napari pyramid rendering.
+
+    Parameters
+    ----------
+    path : Path | str
+        Path to a .lux.h5 file.
+    file_manager : h5_utils.H5FileManager
+        Shared file-handle manager.
+    chunk_z : int
+        Number of Z-planes per dask chunk (default 64).
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        file_manager: Any,
+        chunk_z: int = 64,
+    ) -> None:
+        from chromatic_shift_corrector.h5_utils import (
+            detect_pyramid_levels,
+            parse_h5_metadata,
+        )
+
+        self.path = Path(path)
+        self._file_manager = file_manager
+        self._h5 = file_manager.open(self.path)
+
+        if "Data" not in self._h5:
+            raise ValueError(
+                f"{self.path.name}: not a flat Luxendo H5 file "
+                "(missing 'Data' dataset)."
+            )
+
+        # Full-resolution dask array.
+        data_ds = self._h5["Data"]
+        self._dask = da.from_array(data_ds, chunks=(chunk_z, -1, -1))
+
+        # Ensure 3D.
+        if self._dask.ndim == 2:
+            self._dask = self._dask[np.newaxis, ...]
+
+        # Multiscale arrays (full-res + pyramid levels).
+        self._multiscale: list[da.Array] = [self._dask]
+        self._pyramid_levels = detect_pyramid_levels(self._h5)
+        for level_name, _fw, _fh, _fd in self._pyramid_levels:
+            ds = self._h5[level_name]
+            arr = da.from_array(ds, chunks=(min(chunk_z, ds.shape[0]), -1, -1))
+            self._multiscale.append(arr)
+
+        # Parse metadata.
+        self._metadata = parse_h5_metadata(self._h5)
+
+    @property
+    def dask_array(self) -> da.Array:
+        """Full-resolution dask array (Z, Y, X)."""
+        return self._dask
+
+    @property
+    def multiscale(self) -> list[da.Array]:
+        """List of dask arrays [full_res, 2x, 3x, ...] for napari."""
+        return self._multiscale
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._dask.shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._dask.dtype
+
+    @property
+    def h5_metadata(self) -> dict[str, Any]:
+        """Parsed Luxendo metadata dict."""
+        return self._metadata
+
+    @property
+    def pyramid_levels(self) -> list[tuple[str, int, int, int]]:
+        """List of (name, factor_w, factor_h, factor_d) pyramid levels."""
+        return self._pyramid_levels
+
+    @property
+    def channel_description(self) -> str:
+        """Channel description from metadata, or filename as fallback."""
+        return self._metadata.get("channel_description", self.path.name)
+
+    def close(self) -> None:
+        # File handles are managed by H5FileManager, not closed individually.
+        pass
+
+
 def scan_bigtiff_files(directory: Path | str) -> list[Path]:
     """Return sorted list of .tif / .tiff files in *directory*."""
     directory = Path(directory)
@@ -83,8 +178,10 @@ def scan_bigtiff_files(directory: Path | str) -> list[Path]:
     return sorted(set(files))
 
 
-def validate_channels(loaders: list[BigTIFFLoader]) -> tuple[bool, str]:
+def validate_channels(loaders: list[Any]) -> tuple[bool, str]:
     """Check that all loaders have matching XY dimensions and are 3D uint16.
+
+    Works with both ``BigTIFFLoader`` and ``H5Loader``.
 
     Returns
     -------
@@ -114,6 +211,6 @@ def validate_channels(loaders: list[BigTIFFLoader]) -> tuple[bool, str]:
     return True, "OK"
 
 
-def z_dimensions_summary(loaders: list[BigTIFFLoader]) -> dict[str, int]:
+def z_dimensions_summary(loaders: list[Any]) -> dict[str, int]:
     """Return a mapping of filename -> Z depth for all loaders."""
     return {loader.path.name: loader.shape[0] for loader in loaders}
