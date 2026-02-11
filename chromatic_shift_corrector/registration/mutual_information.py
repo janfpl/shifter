@@ -152,9 +152,9 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         confidence = self._compute_confidence(peak_mi, mi_values)
 
         return RegistrationResult(
-            shift_x=-best_shift[2],
-            shift_y=-best_shift[1],
-            shift_z=-best_shift[0],
+            shift_x=best_shift[2],
+            shift_y=best_shift[1],
+            shift_z=best_shift[0],
             confidence=confidence,
             raw_metric_value=peak_mi,
             algorithm_name=ALGORITHM_NAME,
@@ -290,9 +290,9 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         confidence = self._compute_confidence(best_mi, mi_values)
 
         return RegistrationResult(
-            shift_x=-best_shift[2],
-            shift_y=-best_shift[1],
-            shift_z=-best_shift[0],
+            shift_x=best_shift[2],
+            shift_y=best_shift[1],
+            shift_z=best_shift[0],
             confidence=confidence,
             raw_metric_value=best_mi,
             algorithm_name=ALGORITHM_NAME,

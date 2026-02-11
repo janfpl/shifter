@@ -75,9 +75,8 @@ class PhaseCorrelation(RegistrationAlgorithm):
             normalization=self.normalization,
         )
 
-        # shift is in (Z, Y, X) order and represents the shift to apply to
-        # *moving* to align with *reference*. Negate to get the detected
-        # displacement of moving relative to reference.
+        # shift is in (Z, Y, X) order and represents the correction to apply
+        # to *moving* to align with *reference*.
         dz, dy, dx = int(round(shift[0])), int(round(shift[1])), int(round(shift[2]))
 
         # Enforce search range: if the detected shift exceeds the search
@@ -89,9 +88,9 @@ class PhaseCorrelation(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, abs(raw)))
 
         return RegistrationResult(
-            shift_x=-dx,
-            shift_y=-dy,
-            shift_z=-dz,
+            shift_x=dx,
+            shift_y=dy,
+            shift_z=dz,
             confidence=confidence,
             raw_metric_value=raw,
             algorithm_name=ALGORITHM_NAME,
@@ -172,9 +171,9 @@ class PhaseCorrelation(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, abs(raw)))
 
         return RegistrationResult(
-            shift_x=-dx,
-            shift_y=-dy,
-            shift_z=-dz,
+            shift_x=dx,
+            shift_y=dy,
+            shift_z=dz,
             confidence=confidence,
             raw_metric_value=raw,
             algorithm_name=ALGORITHM_NAME,
@@ -239,9 +238,9 @@ class PhaseCorrelation(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, abs(raw)))
 
         return RegistrationResult(
-            shift_x=-dx,
-            shift_y=-dy,
-            shift_z=-dz,
+            shift_x=dx,
+            shift_y=dy,
+            shift_z=dz,
             confidence=confidence,
             raw_metric_value=raw,
             algorithm_name=ALGORITHM_NAME,

@@ -158,9 +158,9 @@ class ZNCCRegistration(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
         return RegistrationResult(
-            shift_x=-dx,
-            shift_y=-dy,
-            shift_z=-dz,
+            shift_x=dx,
+            shift_y=dy,
+            shift_z=dz,
             confidence=confidence,
             raw_metric_value=raw,
             algorithm_name=ALGORITHM_NAME,
@@ -188,9 +188,9 @@ class ZNCCRegistration(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, (best_zncc + 1.0) / 2.0))
 
         return RegistrationResult(
-            shift_x=-best_shift[2],
-            shift_y=-best_shift[1],
-            shift_z=-best_shift[0],
+            shift_x=best_shift[2],
+            shift_y=best_shift[1],
+            shift_z=best_shift[0],
             confidence=confidence,
             raw_metric_value=best_zncc,
             algorithm_name=ALGORITHM_NAME,
@@ -255,9 +255,9 @@ class ZNCCRegistration(RegistrationAlgorithm):
         confidence = max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
         return RegistrationResult(
-            shift_x=-dx,
-            shift_y=-dy,
-            shift_z=-dz,
+            shift_x=dx,
+            shift_y=dy,
+            shift_z=dz,
             confidence=confidence,
             raw_metric_value=raw,
             algorithm_name=ALGORITHM_NAME,
