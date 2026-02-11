@@ -153,11 +153,20 @@ def build_metadata(
     }
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    """Handle numpy integers/floats that are not JSON-serializable."""
+
+    def default(self, o: Any) -> Any:
+        if hasattr(o, "item"):
+            return o.item()
+        return super().default(o)
+
+
 def save_metadata(metadata: dict[str, Any], output_dir: Path) -> Path:
     """Write metadata dict to correction_metadata.json in *output_dir*."""
     path = output_dir / "correction_metadata.json"
     with open(path, "w") as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(metadata, f, indent=2, cls=_NumpyEncoder)
     return path
 
 
