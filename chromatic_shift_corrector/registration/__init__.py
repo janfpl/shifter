@@ -1,0 +1,46 @@
+"""Auto-registration algorithms for chromatic shift detection."""
+
+from chromatic_shift_corrector.registration.base import (
+    RegistrationAlgorithm,
+    RegistrationResult,
+)
+from chromatic_shift_corrector.registration.phase_correlation import PhaseCorrelation
+from chromatic_shift_corrector.registration.mutual_information import (
+    MutualInformationRegistration,
+)
+from chromatic_shift_corrector.registration.cross_correlation import ZNCCRegistration
+from chromatic_shift_corrector.registration.preprocessing import preprocess
+from chromatic_shift_corrector.registration.confidence import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
+    GUIDANCE_TEXT,
+    confidence_color_rgb,
+)
+from chromatic_shift_corrector.registration.gpu_utils import gpu_available, gpu_name
+
+# Algorithm registry: display name → class.
+ALGORITHM_REGISTRY: dict[str, type[RegistrationAlgorithm]] = {
+    "Phase Cross-Correlation": PhaseCorrelation,
+    "Mutual Information": MutualInformationRegistration,
+    "Zero-Normalized Cross-Correlation": ZNCCRegistration,
+}
+
+# Maximum allowed search range (developer-tuneable constant).
+MAX_SEARCH_RANGE = 200
+
+__all__ = [
+    "RegistrationAlgorithm",
+    "RegistrationResult",
+    "PhaseCorrelation",
+    "MutualInformationRegistration",
+    "ZNCCRegistration",
+    "preprocess",
+    "ALGORITHM_REGISTRY",
+    "MAX_SEARCH_RANGE",
+    "CONFIDENCE_HIGH",
+    "CONFIDENCE_LOW",
+    "GUIDANCE_TEXT",
+    "confidence_color_rgb",
+    "gpu_available",
+    "gpu_name",
+]
