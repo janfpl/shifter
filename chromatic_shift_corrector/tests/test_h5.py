@@ -124,11 +124,6 @@ def _create_h5_file(
         f.create_dataset("Data", data=data, chunks=CHUNK_SHAPE, dtype=np.uint16)
 
         # Pyramid: Data_2_2_2.
-        d2 = block_average_3d(
-            data.reshape(nz // 2, 2, ny, nx).transpose(1, 0, 2, 3).reshape(2, nz // 2, ny, nx)[0:1],
-            1, 1, 1,
-        )
-        # Actually, let's just do proper block averaging.
         out_nz_2 = nz // 2
         out_ny_2 = ny // 2
         out_nx_2 = nx // 2
