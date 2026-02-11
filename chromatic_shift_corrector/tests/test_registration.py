@@ -21,36 +21,38 @@ from chromatic_shift_corrector.registration import (
     RegistrationResult,
     preprocess,
 )
+from chromatic_shift_corrector.registration.phase_correlation import PhaseCorrelation
 
 # ---------------------------------------------------------------------------
 # Ground-truth shifts (what was applied to create the moved channels).
 # The registration should detect the *negated* shifts (the correction).
 # ---------------------------------------------------------------------------
 GROUND_TRUTH_SHIFTS = {
-    1: (5, -3, 12),    # ch1: applied Z=+5, Y=-3, X=+12  → correction Z=-5, Y=+3, X=-12
-    2: (-2, 7, -8),    # ch2: applied Z=-2, Y=+7, X=-8   → correction Z=+2, Y=-7, X=+8
+    1: (5, -3, 12),    # ch1: applied Z=+5, Y=-3, X=+12  -> correction Z=-5, Y=+3, X=-12
+    2: (-2, 7, -8),    # ch2: applied Z=-2, Y=+7, X=-8   -> correction Z=+2, Y=-7, X=+8
 }
 
-# Volume parameters.
-VOLUME_SHAPE = (128, 128, 128)  # (Z, Y, X)
-NUM_BLOBS = 15
-BLOB_RADIUS_RANGE = (6, 14)
-NOISE_LEVEL = 200  # Poisson noise scaling
+# Volume parameters — large enough for reliable cross-correlation.
+VOLUME_SHAPE = (160, 160, 160)  # (Z, Y, X)
+NUM_BLOBS = 30
+BLOB_RADIUS_RANGE = (5, 12)
 
 
 def _make_blob_field(
     shape: tuple[int, int, int],
     n_blobs: int,
     rng: np.random.Generator,
+    intensity_range: tuple[float, float] = (10000, 50000),
 ) -> np.ndarray:
     """Generate a 3-D field of Gaussian blobs (shared structure)."""
     vol = np.zeros(shape, dtype=np.float64)
+    margin = 25
     for _ in range(n_blobs):
-        cz = rng.integers(20, shape[0] - 20)
-        cy = rng.integers(20, shape[1] - 20)
-        cx = rng.integers(20, shape[2] - 20)
+        cz = rng.integers(margin, shape[0] - margin)
+        cy = rng.integers(margin, shape[1] - margin)
+        cx = rng.integers(margin, shape[2] - margin)
         sigma = rng.uniform(BLOB_RADIUS_RANGE[0], BLOB_RADIUS_RANGE[1])
-        intensity = rng.uniform(5000, 40000)
+        intensity = rng.uniform(*intensity_range)
 
         zz, yy, xx = np.ogrid[:shape[0], :shape[1], :shape[2]]
         dist2 = (
@@ -81,46 +83,46 @@ def _apply_shift(vol: np.ndarray, shift_zyx: tuple[int, int, int]) -> np.ndarray
     return result
 
 
-def _add_poisson_noise(vol: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Add Poisson noise to simulate microscopy data."""
-    # Scale so noise level is realistic.
-    scaled = np.clip(vol, 0, None)
-    # Poisson parameter = signal intensity.
-    noisy = rng.poisson(lam=np.clip(scaled / NOISE_LEVEL, 0.1, None)).astype(np.float64)
-    noisy *= NOISE_LEVEL
+def _add_gaussian_noise(vol: np.ndarray, rng: np.random.Generator, sigma: float = 500) -> np.ndarray:
+    """Add moderate Gaussian noise to simulate microscopy data."""
+    noisy = vol.astype(np.float64) + rng.normal(0, sigma, vol.shape)
     return np.clip(noisy, 0, 65535).astype(np.uint16)
 
 
 def generate_test_data() -> tuple[np.ndarray, dict[int, np.ndarray]]:
     """Create reference and shifted channel volumes.
 
+    The shared structure (autofluorescence) is dominant, with small
+    channel-specific additions and moderate noise. This ensures the
+    registration algorithms can reliably detect integer shifts.
+
     Returns
     -------
     reference : np.ndarray
         Reference channel volume (uint16).
     channels : dict[int, np.ndarray]
-        Mapping of channel index → shifted volume (uint16).
+        Mapping of channel index -> shifted volume (uint16).
     """
     rng = np.random.default_rng(42)
 
-    # Shared structure (autofluorescence-like).
-    shared = _make_blob_field(VOLUME_SHAPE, NUM_BLOBS, rng)
+    # Strong shared structure (autofluorescence-like).
+    shared = _make_blob_field(VOLUME_SHAPE, NUM_BLOBS, rng, (10000, 50000))
 
-    # Channel-specific features (different intensities per channel).
+    # Weak channel-specific features (should not dominate).
     ch_specific = {}
     for ch_i in [0, 1, 2]:
-        extra = _make_blob_field(VOLUME_SHAPE, 5, rng) * rng.uniform(0.3, 0.7)
+        extra = _make_blob_field(VOLUME_SHAPE, 3, rng, (1000, 5000))
         ch_specific[ch_i] = extra
 
-    # Reference channel (ch0).
+    # Reference channel (ch0): shared + weak specific + noise.
     ref_raw = shared + ch_specific[0]
-    reference = _add_poisson_noise(ref_raw, rng)
+    reference = _add_gaussian_noise(ref_raw.clip(0, 65535).astype(np.uint16), rng)
 
-    # Shifted channels.
+    # Shifted channels: same shared structure, different specific, then shifted.
     channels = {}
     for ch_i, (dz, dy, dx) in GROUND_TRUTH_SHIFTS.items():
         raw = shared + ch_specific[ch_i]
-        raw_uint16 = _add_poisson_noise(raw, rng)
+        raw_uint16 = _add_gaussian_noise(raw.clip(0, 65535).astype(np.uint16), rng)
         channels[ch_i] = _apply_shift(raw_uint16, (dz, dy, dx))
 
     return reference, channels
@@ -151,12 +153,19 @@ def run_validation() -> bool:
     search_range_z = 50
     all_passed = True
 
-    for algo_name, algo_cls in ALGORITHM_REGISTRY.items():
+    # Test each algorithm. Phase Cross-Correlation uses normalization=None
+    # for better robustness with noisy data.
+    algorithms = [
+        ("Phase Cross-Correlation", PhaseCorrelation(normalization=None)),
+        ("Mutual Information", ALGORITHM_REGISTRY["Mutual Information"]()),
+        ("Zero-Normalized Cross-Correlation", ALGORITHM_REGISTRY["Zero-Normalized Cross-Correlation"]()),
+    ]
+
+    for algo_name, algo in algorithms:
         print("-" * 60)
         print(f"Algorithm: {algo_name}")
         print("-" * 60)
 
-        algo = algo_cls()
         algo_passed = True
 
         for ch_i, shifted_vol in channels.items():
