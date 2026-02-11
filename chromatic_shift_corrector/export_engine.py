@@ -1,0 +1,233 @@
+"""Chunked full-volume processing and BigTIFF export."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import psutil
+import tifffile
+
+from chromatic_shift_corrector.utils import (
+    apply_integer_shift_2d,
+    build_metadata,
+    save_metadata,
+)
+
+if TYPE_CHECKING:
+    import dask.array as da
+    from chromatic_shift_corrector.shift_manager import ChannelTransform, ShiftManager
+
+
+def compute_chunk_size(
+    xy_shape: tuple[int, int],
+    n_channels: int,
+    ram_percent: int = 90,
+    bytes_per_voxel: int = 2,
+) -> int:
+    """Determine how many Z-planes to process per chunk.
+
+    We need to hold *n_channels* input slabs plus *n_channels* output slabs
+    simultaneously. Each slab has shape (chunk_z, Y, X) at *bytes_per_voxel*.
+
+    Parameters
+    ----------
+    xy_shape : (int, int)
+        (Y, X) dimensions.
+    n_channels : int
+        Number of channels.
+    ram_percent : int
+        Percentage of system RAM to use (50-95).
+    bytes_per_voxel : int
+        Bytes per voxel (2 for uint16).
+
+    Returns
+    -------
+    int
+        Number of Z-planes per processing chunk (>= 1).
+    """
+    total_ram = psutil.virtual_memory().total
+    available = int(total_ram * ram_percent / 100)
+
+    ny, nx = xy_shape
+    plane_bytes = ny * nx * bytes_per_voxel
+
+    # Each chunk we need: n_channels * chunk_z planes for reading
+    # + n_channels * chunk_z planes for writing = 2 * n_channels * chunk_z
+    bytes_per_z = 2 * n_channels * plane_bytes
+
+    chunk_z = max(1, available // bytes_per_z)
+    return chunk_z
+
+
+def estimate_output_sizes(
+    loaders: list[Any],
+    bytes_per_voxel: int = 2,
+) -> list[int]:
+    """Estimate output file sizes in bytes (same shape as input)."""
+    sizes = []
+    for loader in loaders:
+        nz, ny, nx = loader.shape
+        sizes.append(nz * ny * nx * bytes_per_voxel)
+    return sizes
+
+
+def export_channel(
+    dask_arr: da.Array,
+    transform: ChannelTransform,
+    output_path: Path,
+    chunk_z: int,
+    progress_callback: Any | None = None,
+    cancel_check: Any | None = None,
+) -> None:
+    """Export a single corrected channel to a BigTIFF file.
+
+    Processing is done slab-by-slab along Z. For Z-shifts the read window is
+    offset; for XY shifts each plane is shifted via slicing with zero-fill.
+
+    Parameters
+    ----------
+    dask_arr : dask.array.Array
+        Source lazy array of shape (Z, Y, X), dtype uint16.
+    transform : ChannelTransform
+        Shift parameters.
+    output_path : Path
+        Destination BigTIFF path.
+    chunk_z : int
+        Number of Z-planes per processing chunk.
+    progress_callback : callable, optional
+        Called with (planes_completed, total_planes) after each chunk.
+    cancel_check : callable, optional
+        Called before each chunk; if it returns True, export is aborted.
+    """
+    nz, ny, nx = dask_arr.shape
+    sz, sy, sx = transform.shift_z, transform.shift_y, transform.shift_x
+
+    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
+        planes_done = 0
+        for out_z_start in range(0, nz, chunk_z):
+            if cancel_check and cancel_check():
+                return
+
+            out_z_end = min(out_z_start + chunk_z, nz)
+            n_planes = out_z_end - out_z_start
+
+            # Determine which input Z-planes we need.
+            # Output plane out_z was originally at input plane out_z - sz.
+            in_z_start = out_z_start - sz
+            in_z_end = out_z_end - sz
+
+            # Clamp to valid input range and figure out padding.
+            read_start = max(in_z_start, 0)
+            read_end = min(in_z_end, nz)
+
+            if read_start >= read_end:
+                # Entire chunk is out of bounds → write zeros.
+                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+            else:
+                raw = np.asarray(dask_arr[read_start:read_end])
+
+                # Build output slab with potential Z-padding.
+                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+                # Where in the output slab does the read data land?
+                dst_start = read_start - in_z_start  # offset within slab
+                dst_end = dst_start + (read_end - read_start)
+                slab[dst_start:dst_end] = raw
+
+            # Apply XY shifts plane-by-plane.
+            if sy != 0 or sx != 0:
+                for i in range(n_planes):
+                    slab[i] = apply_integer_shift_2d(slab[i], (sy, sx))
+
+            # Write planes.
+            for i in range(n_planes):
+                tw.write(
+                    slab[i],
+                    photometric="minisblack",
+                    contiguous=True,
+                )
+
+            planes_done += n_planes
+            if progress_callback:
+                progress_callback(planes_done, nz)
+
+
+def run_export(
+    loaders: list[Any],
+    shift_manager: ShiftManager,
+    output_dir: Path,
+    ram_percent: int = 90,
+    progress_callback: Any | None = None,
+    cancel_check: Any | None = None,
+    voxel_xy: float = 1.0,
+    voxel_z: float = 1.0,
+) -> Path:
+    """Export all channels with corrections applied.
+
+    Parameters
+    ----------
+    loaders : list
+        One loader per channel, in channel order.
+    shift_manager : ShiftManager
+        Contains all channel transforms.
+    output_dir : Path
+        Directory to write corrected files into.
+    ram_percent : int
+        Percentage of system RAM to allocate.
+    progress_callback : callable, optional
+        Called with (current_step, total_steps) where total_steps accounts for
+        all planes across all channels.
+    cancel_check : callable, optional
+        Return True to abort.
+    voxel_xy, voxel_z : float
+        Voxel sizes for metadata.
+
+    Returns
+    -------
+    Path
+        Path to the written metadata JSON file.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    n_channels = len(loaders)
+    ref_shape = loaders[0].shape
+    xy_shape = (ref_shape[1], ref_shape[2])
+
+    chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
+
+    # Total planes across all channels for progress reporting.
+    total_planes = sum(loader.shape[0] for loader in loaders)
+    global_done = 0
+
+    def _channel_progress(done: int, _total: int) -> None:
+        nonlocal global_done
+        if progress_callback:
+            progress_callback(global_done + done, total_planes)
+
+    for i, (loader, transform) in enumerate(
+        zip(loaders, shift_manager.transforms)
+    ):
+        stem = transform.filename.rsplit(".", 1)[0]
+        ext = transform.filename.rsplit(".", 1)[1] if "." in transform.filename else "tif"
+        out_path = output_dir / f"{stem}_corrected.{ext}"
+
+        export_channel(
+            loader.dask_array,
+            transform,
+            out_path,
+            chunk_z,
+            progress_callback=_channel_progress,
+            cancel_check=cancel_check,
+        )
+        global_done += loader.shape[0]
+
+    # Write metadata.
+    channel_dicts = shift_manager.to_channel_dicts()
+    ref_idx = shift_manager.reference_index or 0
+    metadata = build_metadata(
+        channel_dicts, ref_idx, voxel_xy, voxel_z, ref_shape, ram_percent
+    )
+    meta_path = save_metadata(metadata, output_dir)
+    return meta_path
