@@ -46,7 +46,7 @@ from chromatic_shift_corrector.export_engine import (
 )
 from chromatic_shift_corrector.preview_engine import generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
-from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS
+from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
 
 # Available napari colormaps for the dropdown.
 COLORMAP_OPTIONS = [
@@ -318,8 +318,15 @@ class ChromaticShiftWidget(QWidget):
         if not path:
             return
         self.lbl_dir.setText(path)
-        files = scan_bigtiff_files(Path(path))
+        dir_path = Path(path)
+        files = scan_bigtiff_files(dir_path)
         self._populate_file_table(files)
+
+        # Auto-fill voxel sizes from XML metadata if available.
+        voxel = parse_voxel_size_from_xml(dir_path)
+        if voxel is not None:
+            self.spin_voxel_xy.setValue(voxel[0])
+            self.spin_voxel_z.setValue(voxel[1])
 
     def _populate_file_table(self, files: list[Path]) -> None:
         # Clear existing radio buttons from group

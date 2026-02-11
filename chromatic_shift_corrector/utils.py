@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -164,3 +165,33 @@ def load_metadata(path: Path) -> dict[str, Any]:
     """Load correction metadata from a JSON file."""
     with open(path) as f:
         return json.load(f)
+
+
+def parse_voxel_size_from_xml(directory: Path) -> tuple[float, float] | None:
+    """Find the single .xml file in *directory* and extract voxel sizes.
+
+    Looks for the first ``<voxelSize><size>`` element inside a
+    ``<ViewSetup>`` and returns ``(xy_um, z_um)``.  Returns *None* if no
+    ``.xml`` file is found or the expected structure is missing.
+    """
+    xml_files = list(directory.glob("*.xml"))
+    if len(xml_files) != 1:
+        return None
+    try:
+        tree = ET.parse(xml_files[0])
+    except ET.ParseError:
+        return None
+    root = tree.getroot()
+    # Search for the first voxelSize/size element anywhere in the tree.
+    for voxel_size in root.iter("voxelSize"):
+        size_el = voxel_size.find("size")
+        if size_el is not None and size_el.text:
+            parts = size_el.text.strip().split()
+            if len(parts) == 3:
+                try:
+                    xy = float(parts[0])
+                    z = float(parts[2])
+                    return xy, z
+                except ValueError:
+                    continue
+    return None
