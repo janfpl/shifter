@@ -26,29 +26,38 @@ def ensure_qt():
     if qtpy_mod is not None and hasattr(qtpy_mod, "API_NAME"):
         return
 
-    # If QT_API is already set, respect it.
-    if "QT_API" not in os.environ:
-        # Try default detection first.
+    # If QT_API is already set, try it first — but fall through on failure.
+    if "QT_API" in os.environ:
         try:
             import qtpy  # noqa: F401
             return
         except ImportError:
             _purge_qtpy_modules()
+            # The pre-set value didn't work; clear it and try all backends.
+            del os.environ["QT_API"]
 
-        # Default failed — try each backend explicitly.
-        for api in ("pyqt6", "pyqt5", "pyside6", "pyside2"):
-            os.environ["QT_API"] = api
-            _purge_qtpy_modules()
-            try:
-                import qtpy  # noqa: F401
-                return
-            except ImportError:
-                continue
-
-        # All failed.
-        del os.environ["QT_API"]
-        _purge_qtpy_modules()
-        raise ImportError("No Qt bindings found")
-    else:
-        # QT_API is set — just try importing.
+    # Try default detection (qtpy picks the first backend it finds).
+    try:
         import qtpy  # noqa: F401
+        return
+    except ImportError:
+        _purge_qtpy_modules()
+
+    # Default failed — try each backend explicitly.
+    for api in ("pyqt6", "pyqt5", "pyside6", "pyside2"):
+        os.environ["QT_API"] = api
+        _purge_qtpy_modules()
+        try:
+            import qtpy  # noqa: F401
+            return
+        except ImportError:
+            continue
+
+    # All failed — clean up and raise with diagnostic info.
+    if "QT_API" in os.environ:
+        del os.environ["QT_API"]
+    _purge_qtpy_modules()
+    raise ImportError(
+        "No Qt bindings found. Tried PyQt6, PyQt5, PySide6, PySide2.\n"
+        "Install one with: pip install PyQt6"
+    )
