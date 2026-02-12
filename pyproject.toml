@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Napari-based axial and lateral chromatic shift correction for light sheet microscopy"
 requires-python = ">=3.9"
 dependencies = [
-    "napari[all]>=0.4.18",
+    "napari>=0.4.18",
     "tifffile>=2023.2.3",
     "dask[array]>=2023.1.0",
     "numpy>=1.23",
