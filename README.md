@@ -21,7 +21,7 @@ Requires Python 3.9+.
 Launch the application:
 
 ```bash
-chromatic-shift-corrector
+python -m chromatic_shift_corrector
 ```
 
 This opens a napari viewer with the Chromatic Shift Corrector widget docked on the right.
