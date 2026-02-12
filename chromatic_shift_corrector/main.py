@@ -4,6 +4,9 @@ from __future__ import annotations
 
 
 def main() -> None:
+    from chromatic_shift_corrector._qt_setup import ensure_qt
+    ensure_qt()
+
     import napari
 
     from chromatic_shift_corrector.widget import ChromaticShiftWidget
