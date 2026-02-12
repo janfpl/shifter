@@ -259,7 +259,7 @@ class ChromaticShiftWidget(QWidget):
         self._confidence_scores: dict[int, float] = {}
 
         # Format state: "bigtiff" or "h5".
-        self._input_format: str = "bigtiff"
+        self._input_format: str = "h5"
         self._h5_file_manager: H5FileManager | None = None
 
         self._build_ui()
@@ -301,6 +301,7 @@ class ChromaticShiftWidget(QWidget):
         row_format.addWidget(QLabel("Format:"))
         self.combo_format = QComboBox()
         self.combo_format.addItems(["BigTIFF (.tif)", "Luxendo H5 (.lux.h5)"])
+        self.combo_format.setCurrentIndex(1)
         self.combo_format.currentIndexChanged.connect(self._on_format_changed)
         row_format.addWidget(self.combo_format)
         lay.addLayout(row_format)
@@ -533,7 +534,7 @@ class ChromaticShiftWidget(QWidget):
         lay = QVBoxLayout()
 
         # Output format indicator.
-        self.lbl_output_format = QLabel("Output format: BigTIFF")
+        self.lbl_output_format = QLabel("Output format: Luxendo H5 (.lux.h5)")
         self.lbl_output_format.setStyleSheet("font-weight: bold;")
         lay.addWidget(self.lbl_output_format)
 
