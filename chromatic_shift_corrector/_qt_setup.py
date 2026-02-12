@@ -16,6 +16,15 @@ def _purge_qtpy_modules():
         del sys.modules[key]
 
 
+def _try_direct_import(name):
+    """Try importing a Qt backend directly (bypassing qtpy) to get the real error."""
+    try:
+        __import__(name + ".QtCore")
+        return True, None
+    except Exception as exc:
+        return False, exc
+
+
 def ensure_qt():
     """Try to import qtpy, cycling through Qt backends if needed.
 
@@ -44,20 +53,42 @@ def ensure_qt():
         _purge_qtpy_modules()
 
     # Default failed — try each backend explicitly.
-    for api in ("pyqt6", "pyqt5", "pyside6", "pyside2"):
+    errors = {}
+    for api, pkg in [("pyqt6", "PyQt6"), ("pyqt5", "PyQt5"),
+                     ("pyside6", "PySide6"), ("pyside2", "PySide2")]:
         os.environ["QT_API"] = api
         _purge_qtpy_modules()
         try:
             import qtpy  # noqa: F401
             return
         except ImportError:
+            # Also try a direct import to capture the real error (e.g. DLL load failure).
+            _ok, exc = _try_direct_import(pkg)
+            if _ok:
+                # The package itself imports fine but qtpy rejects it — unusual.
+                errors[pkg] = "importable but rejected by qtpy"
+            else:
+                errors[pkg] = str(exc) if exc else "not installed"
             continue
 
     # All failed — clean up and raise with diagnostic info.
     if "QT_API" in os.environ:
         del os.environ["QT_API"]
     _purge_qtpy_modules()
+
+    diag_lines = [f"  QT_API env var was: {os.environ.get('QT_API', '<not set>')}",
+                  f"  Python: {sys.version}",
+                  f"  Platform: {sys.platform}"]
+    for pkg, err in errors.items():
+        diag_lines.append(f"  {pkg}: {err}")
+    diag = "\n".join(diag_lines)
+
     raise ImportError(
-        "No Qt bindings found. Tried PyQt6, PyQt5, PySide6, PySide2.\n"
-        "Install one with: pip install PyQt6"
+        f"No Qt bindings found.\n"
+        f"\n"
+        f"Diagnostic info:\n"
+        f"{diag}\n"
+        f"\n"
+        f"Install a Qt backend with:  pip install PyQt6\n"
+        f"Or with conda:              conda install pyqt"
     )
