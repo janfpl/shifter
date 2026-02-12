@@ -60,6 +60,7 @@ from chromatic_shift_corrector.registration import (
     RegistrationResult,
     confidence_color_rgb,
     gpu_available,
+    gpu_fail_reason,
     gpu_name,
     preprocess,
 )
@@ -588,9 +589,18 @@ class ChromaticShiftWidget(QWidget):
             name = gpu_name()
             self.lbl_gpu_status.setText(f"\u25cf GPU: {name}")
             self.lbl_gpu_status.setStyleSheet("color: #4a90d9; font-weight: bold;")
+            self.lbl_gpu_status.setToolTip("")
         else:
+            reason = gpu_fail_reason()
             self.lbl_gpu_status.setText("\u25cf CPU mode")
             self.lbl_gpu_status.setStyleSheet("color: #999; font-weight: bold;")
+            if reason:
+                self.lbl_gpu_status.setToolTip(reason)
+            else:
+                self.lbl_gpu_status.setToolTip(
+                    "No compatible GPU detected. Install cupy-cuda12x and "
+                    "the CUDA 12.x Toolkit for GPU acceleration."
+                )
 
     def _on_algorithm_changed(self, text: str) -> None:
         """Show/hide algorithm-specific options."""
