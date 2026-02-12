@@ -4,26 +4,14 @@ Napari-based axial and lateral chromatic shift correction for light sheet micros
 
 ## Installation
 
-Clone the repository and install in editable mode:
+Clone the repository and create a conda environment with Python 3.12 and Qt:
 
 ```bash
 git clone https://github.com/janfpl/shifter.git
 cd shifter
+conda create -n shifter python=3.12 pyqt -y
+conda activate shifter
 pip install -e .
-```
-
-**Conda users:** Install Qt via conda before running `pip install`:
-
-```bash
-conda install pyqt
-pip install -e .
-```
-
-If you still get a `QtBindingsNotFoundError`, a conflicting PyQt5 package may have
-been pulled in by pip. Fix it with:
-
-```bash
-pip uninstall PyQt5 PyQt5-Qt5 PyQt5-sip
 ```
 
 For GPU acceleration (optional):
@@ -32,7 +20,7 @@ For GPU acceleration (optional):
 pip install -e ".[gpu]"
 ```
 
-Requires Python 3.9+.
+Requires Python 3.12.
 
 ## Usage
 

@@ -1,59 +1,45 @@
 """Allow running as `python -m chromatic_shift_corrector`."""
 
-import os
 import sys
 
-
-def _try_import_qt():
-    """Try to import qtpy, cycling through Qt backends if needed."""
-    # If QT_API is already set, respect it.
-    if "QT_API" not in os.environ:
-        # Try default detection first.
-        try:
-            import qtpy  # noqa: F401
-            return
-        except ImportError:
-            pass
-
-        # Default failed — try each backend explicitly.
-        for api in ("pyqt6", "pyqt5", "pyside6", "pyside2"):
-            os.environ["QT_API"] = api
-            try:
-                import importlib
-                if "qtpy" in sys.modules:
-                    importlib.reload(sys.modules["qtpy"])
-                else:
-                    import qtpy  # noqa: F401
-                return
-            except ImportError:
-                continue
-
-        # All failed.
-        del os.environ["QT_API"]
-        raise ImportError("No Qt bindings found")
-
-
 try:
-    _try_import_qt()
+    from chromatic_shift_corrector._qt_setup import ensure_qt
+    ensure_qt()
     from chromatic_shift_corrector.main import main
     main()
 except ImportError as e:
     if "Qt" in str(e) or "QtBindingsNotFoundError" in type(e).__name__:
+        import os
+        # Gather diagnostics so the user can report what's actually installed.
+        diag_lines = [f"  QT_API env var: {os.environ.get('QT_API', '<not set>')}"]
+        for pkg in ("PyQt6", "PyQt5", "PySide6", "PySide2"):
+            try:
+                mod = __import__(pkg)
+                ver = getattr(mod, "__version__", getattr(mod, "PYQT_VERSION_STR", "?"))
+                diag_lines.append(f"  {pkg}: {ver}")
+            except ImportError:
+                diag_lines.append(f"  {pkg}: not installed")
+        diag = "\n".join(diag_lines)
         print(
-            "ERROR: No Qt bindings found.\n"
-            "\n"
-            "This application requires a Qt backend (PyQt5, PyQt6, or PySide2).\n"
-            "\n"
-            "If you are using conda, install Qt with:\n"
-            "    conda install pyqt\n"
-            "\n"
-            "If you are using pip, install Qt with:\n"
-            "    pip install PyQt5\n"
-            "\n"
-            "If you already installed Qt but still see this error, a conflicting\n"
-            "package may be interfering. Try:\n"
-            "    pip uninstall PyQt5 PyQt5-Qt5 PyQt5-sip\n"
-            "    pip install -e .\n",
+            f"ERROR: No Qt bindings found.\n"
+            f"\n"
+            f"Diagnostic info:\n"
+            f"{diag}\n"
+            f"\n"
+            f"This application requires a Qt backend (PyQt6, PyQt5, or PySide6).\n"
+            f"\n"
+            f"If you are using conda, install Qt with:\n"
+            f"    conda install pyqt\n"
+            f"\n"
+            f"If you are using pip, install Qt with:\n"
+            f"    pip install PyQt6\n"
+            f"\n"
+            f"If you already installed Qt but still see this error, a conflicting\n"
+            f"package may be interfering. Try creating a fresh environment:\n"
+            f"    conda create -n shifter python=3.12\n"
+            f"    conda activate shifter\n"
+            f"    conda install pyqt\n"
+            f"    pip install -e .\n",
             file=sys.stderr,
         )
         sys.exit(1)
