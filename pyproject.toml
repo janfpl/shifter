@@ -15,6 +15,7 @@ dependencies = [
     "scipy>=1.10",
     "psutil>=5.9",
     "qtpy>=2.3",
+    "PyQt5>=5.15",
     "scikit-image>=0.20",
     "matplotlib>=3.5",
     "h5py>=3.7",
