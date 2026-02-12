@@ -4,7 +4,11 @@ Napari-based axial and lateral chromatic shift correction for light sheet micros
 
 ## Installation
 
+Clone the repository and install in editable mode:
+
 ```bash
+git clone https://github.com/janfpl/shifter.git
+cd shifter
 pip install -e .
 ```
 
