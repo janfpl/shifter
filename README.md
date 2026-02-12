@@ -12,6 +12,12 @@ cd shifter
 pip install -e .
 ```
 
+**Conda users:** If you get a `QtBindingsNotFoundError`, install Qt via conda:
+
+```bash
+conda install pyqt
+```
+
 For GPU acceleration (optional):
 
 ```bash
