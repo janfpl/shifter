@@ -48,7 +48,7 @@ from chromatic_shift_corrector.export_engine import (
     run_export_h5,
 )
 from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
-from chromatic_shift_corrector.mip_panel import build_mip_panel_split, draw_crosshairs
+from chromatic_shift_corrector.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
 from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
@@ -265,8 +265,8 @@ class ChromaticShiftWidget(QWidget):
 
         # MIP panel state.
         self._raw_subvolumes: list[np.ndarray] = []
-        self._mip_layer_name: str = "MIP Panel"
-        self._mip_panel_base: np.ndarray | None = None  # panel without crosshairs
+        self._mip_channel_layer_names: list[str] = []
+        self._mip_crosshair_name: str = "MIP Crosshairs"
         self._mip_sub_dims: tuple[int, int, int] | None = None  # (nz, ny, nx)
         self._mip_gap: int = 2
         self._mip_translate: tuple[int, int] = (0, 0)
@@ -1281,13 +1281,19 @@ class ChromaticShiftWidget(QWidget):
                 pass
         self._preview_layer_names.clear()
 
-        # Remove MIP layer and cached data.
+        # Remove MIP channel layers and crosshair overlay.
+        for name in self._mip_channel_layer_names:
+            try:
+                self.viewer.layers.remove(self.viewer.layers[name])
+            except (KeyError, ValueError):
+                pass
+        self._mip_channel_layer_names.clear()
         try:
-            self.viewer.layers.remove(self.viewer.layers[self._mip_layer_name])
+            self.viewer.layers.remove(self.viewer.layers[self._mip_crosshair_name])
         except (KeyError, ValueError):
             pass
+
         self._raw_subvolumes.clear()
-        self._mip_panel_base = None
         self._mip_sub_dims = None
         self._disconnect_dims_events()
 
@@ -1300,51 +1306,65 @@ class ChromaticShiftWidget(QWidget):
         shifted_volumes: list[np.ndarray],
         colormaps: list[str],
     ) -> None:
-        """Compute the MIP panel from shifted sub-volumes and add it as a layer."""
-        panel_base, dims = build_mip_panel_split(
-            shifted_volumes, colormaps, gap=self._mip_gap,
-        )
-        self._mip_panel_base = panel_base
-        self._mip_sub_dims = dims
-        nz, ny, nx = dims
+        """Compute per-channel MIP panels and add them as napari layers."""
+        nz, ny, nx = shifted_volumes[0].shape
+        self._mip_sub_dims = (nz, ny, nx)
 
-        # Position the MIP panel below the full volume.
+        # Position the MIP panels below the full volume.
         full_y = self.loaders[0].shape[1] if self.loaders else 0
         self._mip_translate = (full_y + 30, 0)
 
-        # Draw crosshairs at current slider Z (mapped to sub-volume coords).
-        panel_rgb = self._draw_current_crosshairs()
-
-        # Remove old MIP layer if it exists, then add new one.
+        # Remove any existing MIP layers.
+        for name in self._mip_channel_layer_names:
+            try:
+                self.viewer.layers.remove(self.viewer.layers[name])
+            except (KeyError, ValueError):
+                pass
+        self._mip_channel_layer_names.clear()
         try:
-            self.viewer.layers.remove(self.viewer.layers[self._mip_layer_name])
+            self.viewer.layers.remove(self.viewer.layers[self._mip_crosshair_name])
         except (KeyError, ValueError):
             pass
 
+        # Create a per-channel MIP layer for each channel.
+        for i, (vol, cmap) in enumerate(zip(shifted_volumes, colormaps)):
+            mip_xy, mip_xz, mip_yz = compute_mips(vol)
+            panel = assemble_channel_panel(mip_xy, mip_xz, mip_yz, gap=self._mip_gap)
+            t = self.shift_manager[i]
+            layer_name = f"MIP ch{i}_{t.filename}"
+            self._mip_channel_layer_names.append(layer_name)
+            self.viewer.add_image(
+                panel,
+                name=layer_name,
+                colormap=cmap,
+                blending="additive",
+                translate=self._mip_translate,
+                interpolation2d="nearest",
+            )
+
+        # Add crosshair overlay on top.
+        crosshair = self._build_crosshair_image()
         self.viewer.add_image(
-            panel_rgb,
-            name=self._mip_layer_name,
-            rgb=True,
+            crosshair,
+            name=self._mip_crosshair_name,
+            colormap="gray",
+            blending="additive",
             translate=self._mip_translate,
             interpolation2d="nearest",
+            opacity=0.6,
         )
 
         # Connect dims slider for interactive crosshair tracking.
         self._connect_dims_events()
 
-    def _draw_current_crosshairs(self) -> np.ndarray:
-        """Return the MIP panel with crosshairs at the current viewer Z position."""
-        if self._mip_panel_base is None or self._mip_sub_dims is None:
-            return np.zeros((1, 1, 3), dtype=np.float32)
-
+    def _build_crosshair_image(self) -> np.ndarray:
+        """Build crosshair overlay at the current viewer Z position."""
+        if self._mip_sub_dims is None:
+            return np.zeros((1, 1), dtype=np.float32)
         nz, ny, nx = self._mip_sub_dims
-        # Map the viewer's current Z slider to sub-volume coordinates.
         current_z = int(self.viewer.dims.current_step[0])
-        sub_z = current_z - self._preview_z_start
-        sub_z = max(0, min(sub_z, nz - 1))
-
-        return draw_crosshairs(
-            self._mip_panel_base,
+        sub_z = max(0, min(current_z - self._preview_z_start, nz - 1))
+        return build_crosshair_overlay(
             ny, nx, nz,
             center_y=ny // 2,
             center_x=nx // 2,
@@ -1353,33 +1373,38 @@ class ChromaticShiftWidget(QWidget):
         )
 
     def _update_mip_panel(self) -> None:
-        """Re-apply current shifts to cached sub-volumes and refresh the MIP panel."""
+        """Re-apply current shifts to cached sub-volumes and refresh MIP layers."""
         if self._suppress_mip_update or not self._raw_subvolumes:
             return
 
         from chromatic_shift_corrector.utils import apply_integer_shift
 
         shifted: list[np.ndarray] = []
-        colormaps: list[str] = []
         for i, raw in enumerate(self._raw_subvolumes):
             t = self.shift_manager[i]
             if t.shift_z == 0 and t.shift_y == 0 and t.shift_x == 0:
                 shifted.append(raw)
             else:
                 shifted.append(apply_integer_shift(raw, t.shift_zyx))
-            colormaps.append(t.colormap)
 
-        # Rebuild MIP base panel.
-        panel_base, dims = build_mip_panel_split(
-            shifted, colormaps, gap=self._mip_gap,
-        )
-        self._mip_panel_base = panel_base
-        self._mip_sub_dims = dims
+        nz, ny, nx = shifted[0].shape
+        self._mip_sub_dims = (nz, ny, nx)
 
-        # Update MIP layer data.
-        panel_rgb = self._draw_current_crosshairs()
+        # Update each per-channel MIP layer.
+        for i, vol in enumerate(shifted):
+            t = self.shift_manager[i]
+            layer_name = f"MIP ch{i}_{t.filename}"
+            mip_xy, mip_xz, mip_yz = compute_mips(vol)
+            panel = assemble_channel_panel(mip_xy, mip_xz, mip_yz, gap=self._mip_gap)
+            try:
+                self.viewer.layers[layer_name].data = panel
+            except KeyError:
+                pass
+
+        # Update crosshair overlay.
+        crosshair = self._build_crosshair_image()
         try:
-            self.viewer.layers[self._mip_layer_name].data = panel_rgb
+            self.viewer.layers[self._mip_crosshair_name].data = crosshair
         except KeyError:
             pass
 
@@ -1394,11 +1419,11 @@ class ChromaticShiftWidget(QWidget):
 
     def _on_dims_changed(self, event: Any = None) -> None:
         """Redraw crosshairs when the Z slider moves."""
-        if self._mip_panel_base is None:
+        if self._mip_sub_dims is None:
             return
-        panel_rgb = self._draw_current_crosshairs()
+        crosshair = self._build_crosshair_image()
         try:
-            self.viewer.layers[self._mip_layer_name].data = panel_rgb
+            self.viewer.layers[self._mip_crosshair_name].data = crosshair
         except KeyError:
             pass
 

@@ -1,8 +1,9 @@
 """Max intensity projection (MIP) panel with L-shaped orthogonal views.
 
-Computes MIPs along Z, Y, and X axes, applies per-channel colormaps,
-composites them additively into a single RGB image, and assembles
-the three views into an ImageJ-style ortho layout:
+Computes MIPs along Z, Y, and X axes and assembles them into an
+ImageJ-style ortho layout.  Each channel is returned as a separate
+grayscale panel so that napari can composite them with additive
+blending, allowing individual channel toggling and contrast adjustment.
 
     +--------+------+
     |   XY   |  YZ  |
@@ -16,17 +17,6 @@ the three views into an ImageJ-style ortho layout:
 from __future__ import annotations
 
 import numpy as np
-
-# Simple single-color LUTs for common napari colormaps.
-_COLORMAP_RGB: dict[str, np.ndarray] = {
-    "green": np.array([0.0, 1.0, 0.0]),
-    "magenta": np.array([1.0, 0.0, 1.0]),
-    "cyan": np.array([0.0, 1.0, 1.0]),
-    "yellow": np.array([1.0, 1.0, 0.0]),
-    "red": np.array([1.0, 0.0, 0.0]),
-    "blue": np.array([0.0, 0.0, 1.0]),
-    "gray": np.array([1.0, 1.0, 1.0]),
-}
 
 
 def compute_mips(
@@ -55,91 +45,45 @@ def compute_mips(
     return mip_xy, mip_xz, mip_yz
 
 
-def normalize_intensity(
-    arr: np.ndarray,
-    plow: float = 0.1,
-    phigh: float = 99.9,
-) -> np.ndarray:
-    """Normalize to [0, 1] using percentile-based contrast limits."""
-    low = np.percentile(arr, plow)
-    high = np.percentile(arr, phigh)
-    if high <= low:
-        return np.zeros_like(arr, dtype=np.float32)
-    result = (arr.astype(np.float32) - low) / (high - low)
-    return np.clip(result, 0.0, 1.0)
-
-
-def apply_colormap(mip: np.ndarray, colormap: str) -> np.ndarray:
-    """Apply a named colormap to a normalized 2D array, producing RGB.
-
-    Parameters
-    ----------
-    mip : np.ndarray
-        Normalized 2D float32 array in [0, 1], shape (H, W).
-    colormap : str
-        Colormap name (e.g. ``"green"``, ``"magenta"``, ``"viridis"``).
-
-    Returns
-    -------
-    np.ndarray
-        RGB image, shape (H, W, 3), float32 in [0, 1].
-    """
-    if colormap in _COLORMAP_RGB:
-        return mip[..., np.newaxis] * _COLORMAP_RGB[colormap]
-
-    # Fall back to matplotlib for complex colormaps (viridis, inferno, …).
-    try:
-        from matplotlib import colormaps
-
-        cmap = colormaps[colormap]
-        rgba = cmap(mip)  # (H, W, 4)
-        return rgba[..., :3].astype(np.float32)
-    except (ImportError, KeyError):
-        return mip[..., np.newaxis] * np.array([1.0, 1.0, 1.0])
-
-
-def composite_rgb(rgb_layers: list[np.ndarray]) -> np.ndarray:
-    """Additively composite multiple RGB images, clamped to [0, 1]."""
-    result = np.zeros_like(rgb_layers[0])
-    for layer in rgb_layers:
-        result += layer
-    return np.clip(result, 0.0, 1.0)
-
-
-def assemble_panel(
+def assemble_channel_panel(
     mip_xy: np.ndarray,
     mip_xz: np.ndarray,
     mip_yz: np.ndarray,
     gap: int = 2,
 ) -> np.ndarray:
-    """Arrange three composited MIP views into an L-shaped panel.
+    """Arrange single-channel MIPs into an L-shaped panel.
 
-    Layout (see module docstring for diagram).
+    All inputs must be 2D arrays of the same dtype.  The gap region is
+    zero-filled.
 
     Parameters
     ----------
-    mip_xy : (ny, nx, 3)
-    mip_xz : (nz, nx, 3)
-    mip_yz : (ny, nz, 3)
+    mip_xy : (ny, nx)
+    mip_xz : (nz, nx)
+    mip_yz : (ny, nz)
     gap : int
-        Dark-pixel gap between panels.
+        Dark-pixel gap between sub-panels.
+
+    Returns
+    -------
+    np.ndarray
+        2D array of shape (ny + gap + nz, nx + gap + nz).
     """
-    ny, nx = mip_xy.shape[:2]
+    ny, nx = mip_xy.shape
     nz = mip_xz.shape[0]
     nz_yz = mip_yz.shape[1]
 
     h = ny + gap + nz
     w = nx + gap + nz_yz
 
-    panel = np.zeros((h, w, 3), dtype=np.float32)
+    panel = np.zeros((h, w), dtype=mip_xy.dtype)
     panel[:ny, :nx] = mip_xy
     panel[:ny, nx + gap : nx + gap + nz_yz] = mip_yz
     panel[ny + gap : ny + gap + nz, :nx] = mip_xz
     return panel
 
 
-def draw_crosshairs(
-    panel: np.ndarray,
+def build_crosshair_overlay(
     ny: int,
     nx: int,
     nz: int,
@@ -147,126 +91,48 @@ def draw_crosshairs(
     center_x: int,
     center_z: int,
     gap: int = 2,
-    color: tuple[float, float, float] = (1.0, 1.0, 1.0),
-    alpha: float = 0.5,
+    line_value: float = 1.0,
 ) -> np.ndarray:
-    """Draw crosshair lines on the L-shaped panel.
+    """Build a grayscale crosshair overlay for the L-shaped panel.
 
-    Crosshairs indicate the orthogonal slice position on each view.
-    """
-    out = panel.copy()
-    cc = np.array(color, dtype=np.float32)
-
-    def _blend_row(row: int, col_start: int, col_end: int) -> None:
-        out[row, col_start:col_end] = (
-            alpha * cc + (1 - alpha) * out[row, col_start:col_end]
-        )
-
-    def _blend_col(col: int, row_start: int, row_end: int) -> None:
-        out[row_start:row_end, col] = (
-            alpha * cc + (1 - alpha) * out[row_start:row_end, col]
-        )
-
-    # XY panel (top-left): crosshairs at (center_y, center_x)
-    if 0 <= center_y < ny:
-        _blend_row(center_y, 0, nx)
-    if 0 <= center_x < nx:
-        _blend_col(center_x, 0, ny)
-
-    # XZ panel (bottom-left, offset by ny + gap): crosshairs at (center_z, center_x)
-    yz_off = ny + gap
-    if 0 <= center_z < nz:
-        _blend_row(yz_off + center_z, 0, nx)
-    if 0 <= center_x < nx:
-        _blend_col(center_x, yz_off, yz_off + nz)
-
-    # YZ panel (top-right, offset by nx + gap): crosshairs at (center_y, center_z)
-    xz_off = nx + gap
-    if 0 <= center_y < ny:
-        _blend_row(center_y, xz_off, xz_off + nz)
-    if 0 <= center_z < nz:
-        _blend_col(xz_off + center_z, 0, ny)
-
-    return np.clip(out, 0.0, 1.0)
-
-
-def build_mip_panel(
-    volumes: list[np.ndarray],
-    colormaps: list[str],
-    crosshair_zyx: tuple[int, int, int] | None = None,
-    gap: int = 2,
-) -> np.ndarray:
-    """Build a complete MIP panel from multiple channel volumes.
+    Returns a float32 2D array with bright crosshair lines on a black
+    background, suitable for display as an additive-blended layer on top
+    of the per-channel MIP panels.
 
     Parameters
     ----------
-    volumes : list of np.ndarray
-        Shifted 3D sub-volumes for each channel, each (Z, Y, X).
-    colormaps : list of str
-        Colormap name per channel.
-    crosshair_zyx : (z, y, x) or None
-        Position for crosshair lines in sub-volume coordinates.
-        Defaults to the centre of the volume.
+    ny, nx, nz : int
+        Sub-volume dimensions (must match the channel panels).
+    center_y, center_x, center_z : int
+        Crosshair positions in sub-volume coordinates.
     gap : int
-        Dark-pixel gap between views.
-
-    Returns
-    -------
-    np.ndarray
-        L-shaped RGB panel, shape (H, W, 3), float32 in [0, 1].
+        Gap between sub-panels (must match the channel panels).
+    line_value : float
+        Intensity of the crosshair lines.
     """
-    nz, ny, nx = volumes[0].shape
+    h = ny + gap + nz
+    w = nx + gap + nz
 
-    xy_layers: list[np.ndarray] = []
-    xz_layers: list[np.ndarray] = []
-    yz_layers: list[np.ndarray] = []
+    overlay = np.zeros((h, w), dtype=np.float32)
 
-    for vol, cmap in zip(volumes, colormaps):
-        mip_xy, mip_xz, mip_yz = compute_mips(vol)
-        xy_layers.append(apply_colormap(normalize_intensity(mip_xy), cmap))
-        xz_layers.append(apply_colormap(normalize_intensity(mip_xz), cmap))
-        yz_layers.append(apply_colormap(normalize_intensity(mip_yz), cmap))
+    # XY panel (top-left)
+    if 0 <= center_y < ny:
+        overlay[center_y, :nx] = line_value
+    if 0 <= center_x < nx:
+        overlay[:ny, center_x] = line_value
 
-    panel = assemble_panel(
-        composite_rgb(xy_layers),
-        composite_rgb(xz_layers),
-        composite_rgb(yz_layers),
-        gap=gap,
-    )
+    # XZ panel (bottom-left, offset by ny + gap)
+    yz_off = ny + gap
+    if 0 <= center_z < nz:
+        overlay[yz_off + center_z, :nx] = line_value
+    if 0 <= center_x < nx:
+        overlay[yz_off : yz_off + nz, center_x] = line_value
 
-    if crosshair_zyx is None:
-        crosshair_zyx = (nz // 2, ny // 2, nx // 2)
-    cz, cy, cx = crosshair_zyx
-    return draw_crosshairs(panel, ny, nx, nz, cy, cx, cz, gap=gap)
+    # YZ panel (top-right, offset by nx + gap)
+    xz_off = nx + gap
+    if 0 <= center_y < ny:
+        overlay[center_y, xz_off : xz_off + nz] = line_value
+    if 0 <= center_z < nz:
+        overlay[:ny, xz_off + center_z] = line_value
 
-
-def build_mip_panel_split(
-    volumes: list[np.ndarray],
-    colormaps: list[str],
-    gap: int = 2,
-) -> tuple[np.ndarray, tuple[int, int, int]]:
-    """Build MIP panel *without* crosshairs and return sub-volume dims.
-
-    Returns ``(panel, (nz, ny, nx))`` so that crosshairs can be drawn
-    separately (e.g. in response to slider changes) without recomputing
-    the projections.
-    """
-    nz, ny, nx = volumes[0].shape
-
-    xy_layers: list[np.ndarray] = []
-    xz_layers: list[np.ndarray] = []
-    yz_layers: list[np.ndarray] = []
-
-    for vol, cmap in zip(volumes, colormaps):
-        mip_xy, mip_xz, mip_yz = compute_mips(vol)
-        xy_layers.append(apply_colormap(normalize_intensity(mip_xy), cmap))
-        xz_layers.append(apply_colormap(normalize_intensity(mip_xz), cmap))
-        yz_layers.append(apply_colormap(normalize_intensity(mip_yz), cmap))
-
-    panel = assemble_panel(
-        composite_rgb(xy_layers),
-        composite_rgb(xz_layers),
-        composite_rgb(yz_layers),
-        gap=gap,
-    )
-    return panel, (nz, ny, nx)
+    return overlay
