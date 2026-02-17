@@ -48,6 +48,7 @@ from chromatic_shift_corrector.export_engine import (
     run_export_h5,
 )
 from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
+from chromatic_shift_corrector.mip_panel import build_mip_panel_split, draw_crosshairs
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
 from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
@@ -261,6 +262,17 @@ class ChromaticShiftWidget(QWidget):
         # Format state: "bigtiff" or "h5".
         self._input_format: str = "h5"
         self._h5_file_manager: H5FileManager | None = None
+
+        # MIP panel state.
+        self._raw_subvolumes: list[np.ndarray] = []
+        self._mip_layer_name: str = "MIP Panel"
+        self._mip_panel_base: np.ndarray | None = None  # panel without crosshairs
+        self._mip_sub_dims: tuple[int, int, int] | None = None  # (nz, ny, nx)
+        self._mip_gap: int = 2
+        self._mip_translate: tuple[int, int] = (0, 0)
+        self._preview_z_start: int = 0
+        self._suppress_mip_update: bool = False
+        self._dims_connected: bool = False
 
         self._build_ui()
 
@@ -920,6 +932,7 @@ class ChromaticShiftWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _rebuild_shift_table(self) -> None:
+        self._suppress_mip_update = True
         n = len(self.shift_manager)
         self.shift_table.setRowCount(n)
         has_confidence = bool(self._confidence_scores)
@@ -972,9 +985,13 @@ class ChromaticShiftWidget(QWidget):
         # Show confidence guidance if we have scores.
         self.lbl_confidence_guide.setVisible(has_confidence)
 
+        self._suppress_mip_update = False
+        self._update_mip_panel()
+
     def _make_shift_callback(self, channel_idx: int, axis: str):
         def _cb(value: int) -> None:
             self.shift_manager.set_shift(channel_idx, axis, value)
+            self._update_mip_panel()
         return _cb
 
     def _on_reset_shifts(self) -> None:
@@ -1217,22 +1234,35 @@ class ChromaticShiftWidget(QWidget):
         # Clear previous previews.
         self._on_clear_preview()
 
-        for i, loader in enumerate(self.loaders):
-            t = self.shift_manager[i]
-            preview = generate_preview(
-                loader.dask_array,
-                t,
-                z_start,
-                z_end,
-                y_start,
-                y_end,
-                x_start,
-                x_end,
+        # Cache unshifted sub-volumes for MIP auto-update.
+        self._raw_subvolumes.clear()
+        self._preview_z_start = z_start
+        for loader in self.loaders:
+            self._raw_subvolumes.append(
+                extract_subvolume(
+                    loader.dask_array, z_start, z_end,
+                    y_start, y_end, x_start, x_end,
+                )
             )
+
+        # Generate shifted previews and add as layers.
+        from chromatic_shift_corrector.utils import apply_integer_shift
+
+        shifted_volumes: list[np.ndarray] = []
+        colormaps: list[str] = []
+        for i, raw in enumerate(self._raw_subvolumes):
+            t = self.shift_manager[i]
+            if t.shift_z == 0 and t.shift_y == 0 and t.shift_x == 0:
+                shifted = raw
+            else:
+                shifted = apply_integer_shift(raw, t.shift_zyx)
+            shifted_volumes.append(shifted)
+            colormaps.append(t.colormap)
+
             layer_name = f"{t.filename}_preview_corrected"
             self._preview_layer_names.append(layer_name)
             self.viewer.add_image(
-                preview,
+                shifted,
                 name=layer_name,
                 colormap=t.colormap,
                 blending="additive",
@@ -1240,14 +1270,150 @@ class ChromaticShiftWidget(QWidget):
                 visible=True,
             )
 
+        # Build and display MIP panel.
+        self._build_and_show_mip(shifted_volumes, colormaps)
+
     def _on_clear_preview(self) -> None:
         for name in self._preview_layer_names:
             try:
-                layer = self.viewer.layers[name]
-                self.viewer.layers.remove(layer)
+                self.viewer.layers.remove(self.viewer.layers[name])
             except (KeyError, ValueError):
                 pass
         self._preview_layer_names.clear()
+
+        # Remove MIP layer and cached data.
+        try:
+            self.viewer.layers.remove(self.viewer.layers[self._mip_layer_name])
+        except (KeyError, ValueError):
+            pass
+        self._raw_subvolumes.clear()
+        self._mip_panel_base = None
+        self._mip_sub_dims = None
+        self._disconnect_dims_events()
+
+    # ------------------------------------------------------------------ #
+    # MIP Panel
+    # ------------------------------------------------------------------ #
+
+    def _build_and_show_mip(
+        self,
+        shifted_volumes: list[np.ndarray],
+        colormaps: list[str],
+    ) -> None:
+        """Compute the MIP panel from shifted sub-volumes and add it as a layer."""
+        panel_base, dims = build_mip_panel_split(
+            shifted_volumes, colormaps, gap=self._mip_gap,
+        )
+        self._mip_panel_base = panel_base
+        self._mip_sub_dims = dims
+        nz, ny, nx = dims
+
+        # Position the MIP panel below the full volume.
+        full_y = self.loaders[0].shape[1] if self.loaders else 0
+        self._mip_translate = (full_y + 30, 0)
+
+        # Draw crosshairs at current slider Z (mapped to sub-volume coords).
+        panel_rgb = self._draw_current_crosshairs()
+
+        # Remove old MIP layer if it exists, then add new one.
+        try:
+            self.viewer.layers.remove(self.viewer.layers[self._mip_layer_name])
+        except (KeyError, ValueError):
+            pass
+
+        self.viewer.add_image(
+            panel_rgb,
+            name=self._mip_layer_name,
+            rgb=True,
+            translate=self._mip_translate,
+            interpolation2d="nearest",
+        )
+
+        # Connect dims slider for interactive crosshair tracking.
+        self._connect_dims_events()
+
+    def _draw_current_crosshairs(self) -> np.ndarray:
+        """Return the MIP panel with crosshairs at the current viewer Z position."""
+        if self._mip_panel_base is None or self._mip_sub_dims is None:
+            return np.zeros((1, 1, 3), dtype=np.float32)
+
+        nz, ny, nx = self._mip_sub_dims
+        # Map the viewer's current Z slider to sub-volume coordinates.
+        current_z = int(self.viewer.dims.current_step[0])
+        sub_z = current_z - self._preview_z_start
+        sub_z = max(0, min(sub_z, nz - 1))
+
+        return draw_crosshairs(
+            self._mip_panel_base,
+            ny, nx, nz,
+            center_y=ny // 2,
+            center_x=nx // 2,
+            center_z=sub_z,
+            gap=self._mip_gap,
+        )
+
+    def _update_mip_panel(self) -> None:
+        """Re-apply current shifts to cached sub-volumes and refresh the MIP panel."""
+        if self._suppress_mip_update or not self._raw_subvolumes:
+            return
+
+        from chromatic_shift_corrector.utils import apply_integer_shift
+
+        shifted: list[np.ndarray] = []
+        colormaps: list[str] = []
+        for i, raw in enumerate(self._raw_subvolumes):
+            t = self.shift_manager[i]
+            if t.shift_z == 0 and t.shift_y == 0 and t.shift_x == 0:
+                shifted.append(raw)
+            else:
+                shifted.append(apply_integer_shift(raw, t.shift_zyx))
+            colormaps.append(t.colormap)
+
+        # Rebuild MIP base panel.
+        panel_base, dims = build_mip_panel_split(
+            shifted, colormaps, gap=self._mip_gap,
+        )
+        self._mip_panel_base = panel_base
+        self._mip_sub_dims = dims
+
+        # Update MIP layer data.
+        panel_rgb = self._draw_current_crosshairs()
+        try:
+            self.viewer.layers[self._mip_layer_name].data = panel_rgb
+        except KeyError:
+            pass
+
+        # Also update the 3D preview layers with the new shifted data.
+        for i, vol in enumerate(shifted):
+            t = self.shift_manager[i]
+            layer_name = f"{t.filename}_preview_corrected"
+            try:
+                self.viewer.layers[layer_name].data = vol
+            except KeyError:
+                pass
+
+    def _on_dims_changed(self, event: Any = None) -> None:
+        """Redraw crosshairs when the Z slider moves."""
+        if self._mip_panel_base is None:
+            return
+        panel_rgb = self._draw_current_crosshairs()
+        try:
+            self.viewer.layers[self._mip_layer_name].data = panel_rgb
+        except KeyError:
+            pass
+
+    def _connect_dims_events(self) -> None:
+        if not self._dims_connected:
+            self.viewer.dims.events.current_step.connect(self._on_dims_changed)
+            self._dims_connected = True
+
+    def _disconnect_dims_events(self) -> None:
+        if self._dims_connected:
+            try:
+                self.viewer.dims.events.current_step.disconnect(self._on_dims_changed)
+            except Exception:
+                pass
+            self._dims_connected = False
 
     # ------------------------------------------------------------------ #
     # Callbacks — Export
