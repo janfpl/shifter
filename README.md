@@ -138,6 +138,29 @@ pip install -e ".[gpu]"
 
 Requires CUDA 12.x compatible hardware and drivers.
 
+**Troubleshooting: GPU not detected**
+
+If the widget shows CPU-only mode despite having a CUDA-capable GPU, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
+
+```cmd
+echo %CUDA_PATH%
+```
+
+If this prints nothing, set it manually for your session:
+
+```cmd
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
+```
+
+To make this permanent for the conda environment, create an activation script:
+
+```cmd
+mkdir "%CONDA_PREFIX%\etc\conda\activate.d"
+echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%CONDA_PREFIX%\etc\conda\activate.d\cuda_path.bat"
+```
+
+Adjust the path and version number to match your CUDA installation.
+
 ## Dependencies
 
 - napari (>=0.4.18)

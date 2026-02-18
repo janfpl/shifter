@@ -16,7 +16,11 @@ from chromatic_shift_corrector.registration.confidence import (
     GUIDANCE_TEXT,
     confidence_color_rgb,
 )
-from chromatic_shift_corrector.registration.gpu_utils import gpu_available, gpu_name
+from chromatic_shift_corrector.registration.gpu_utils import (
+    gpu_available,
+    gpu_fail_reason,
+    gpu_name,
+)
 
 # Algorithm registry: display name → class.
 ALGORITHM_REGISTRY: dict[str, type[RegistrationAlgorithm]] = {
@@ -42,5 +46,6 @@ __all__ = [
     "GUIDANCE_TEXT",
     "confidence_color_rgb",
     "gpu_available",
+    "gpu_fail_reason",
     "gpu_name",
 ]
