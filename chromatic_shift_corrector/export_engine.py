@@ -1,8 +1,15 @@
-"""Chunked full-volume processing and BigTIFF / Luxendo H5 export."""
+"""Chunked full-volume processing and BigTIFF / Luxendo H5 export.
+
+XY-shift application within each slab is parallelised across CPU cores
+using ``concurrent.futures.ThreadPoolExecutor``.  Performance timestamps
+are emitted via :mod:`chromatic_shift_corrector.perf_logger`.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +17,7 @@ import numpy as np
 import psutil
 import tifffile
 
+from chromatic_shift_corrector.perf_logger import log_event, timed_operation
 from chromatic_shift_corrector.utils import (
     apply_integer_shift_2d,
     build_metadata,
@@ -21,6 +29,9 @@ if TYPE_CHECKING:
     from chromatic_shift_corrector.shift_manager import ChannelTransform, ShiftManager
 
 logger = logging.getLogger(__name__)
+
+# Number of threads for per-plane XY shift (capped to avoid over-subscription).
+_XY_WORKERS = min(os.cpu_count() or 1, 16)
 
 
 def compute_chunk_size(
@@ -76,6 +87,26 @@ def estimate_output_sizes(
     return sizes
 
 
+def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
+    """Apply XY shift to every plane in *slab*, parallelised across cores."""
+    if sy == 0 and sx == 0:
+        return slab
+
+    n_planes = slab.shape[0]
+
+    def _shift_plane(i: int) -> None:
+        slab[i] = apply_integer_shift_2d(slab[i], (sy, sx))
+
+    if n_planes <= 2:
+        for i in range(n_planes):
+            _shift_plane(i)
+    else:
+        with ThreadPoolExecutor(max_workers=min(_XY_WORKERS, n_planes)) as pool:
+            list(pool.map(_shift_plane, range(n_planes)))
+
+    return slab
+
+
 def export_channel(
     dask_arr: da.Array,
     transform: ChannelTransform,
@@ -107,53 +138,50 @@ def export_channel(
     nz, ny, nx = dask_arr.shape
     sz, sy, sx = transform.shift_z, transform.shift_y, transform.shift_x
 
-    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
-        planes_done = 0
-        for out_z_start in range(0, nz, chunk_z):
-            if cancel_check and cancel_check():
-                return
+    log_event(f"Export TIFF channel: {output_path.name} | "
+              f"shape=({nz},{ny},{nx}) shift=({sz},{sy},{sx}) chunk_z={chunk_z}")
 
-            out_z_end = min(out_z_start + chunk_z, nz)
-            n_planes = out_z_end - out_z_start
+    with timed_operation(f"Write TIFF: {output_path.name}"):
+        with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
+            planes_done = 0
+            for out_z_start in range(0, nz, chunk_z):
+                if cancel_check and cancel_check():
+                    return
 
-            # Determine which input Z-planes we need.
-            # Output plane out_z was originally at input plane out_z - sz.
-            in_z_start = out_z_start - sz
-            in_z_end = out_z_end - sz
+                out_z_end = min(out_z_start + chunk_z, nz)
+                n_planes = out_z_end - out_z_start
 
-            # Clamp to valid input range and figure out padding.
-            read_start = max(in_z_start, 0)
-            read_end = min(in_z_end, nz)
+                # Determine which input Z-planes we need.
+                in_z_start = out_z_start - sz
+                in_z_end = out_z_end - sz
 
-            if read_start >= read_end:
-                # Entire chunk is out of bounds → write zeros.
-                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-            else:
-                raw = np.asarray(dask_arr[read_start:read_end])
+                # Clamp to valid input range and figure out padding.
+                read_start = max(in_z_start, 0)
+                read_end = min(in_z_end, nz)
 
-                # Build output slab with potential Z-padding.
-                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                # Where in the output slab does the read data land?
-                dst_start = read_start - in_z_start  # offset within slab
-                dst_end = dst_start + (read_end - read_start)
-                slab[dst_start:dst_end] = raw
+                if read_start >= read_end:
+                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+                else:
+                    raw = np.asarray(dask_arr[read_start:read_end])
+                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+                    dst_start = read_start - in_z_start
+                    dst_end = dst_start + (read_end - read_start)
+                    slab[dst_start:dst_end] = raw
 
-            # Apply XY shifts plane-by-plane.
-            if sy != 0 or sx != 0:
+                # Apply XY shifts (parallel across planes).
+                slab = _shift_slab_xy(slab, sy, sx)
+
+                # Write planes.
                 for i in range(n_planes):
-                    slab[i] = apply_integer_shift_2d(slab[i], (sy, sx))
+                    tw.write(
+                        slab[i],
+                        photometric="minisblack",
+                        contiguous=True,
+                    )
 
-            # Write planes.
-            for i in range(n_planes):
-                tw.write(
-                    slab[i],
-                    photometric="minisblack",
-                    contiguous=True,
-                )
-
-            planes_done += n_planes
-            if progress_callback:
-                progress_callback(planes_done, nz)
+                planes_done += n_planes
+                if progress_callback:
+                    progress_callback(planes_done, nz)
 
 
 def run_export(
@@ -283,70 +311,73 @@ def export_channel_h5(
     nz, ny, nx = dask_arr.shape
     sz, sy, sx = transform.shift_z, transform.shift_y, transform.shift_x
 
+    log_event(f"Export H5 channel: {output_path.name} | "
+              f"shape=({nz},{ny},{nx}) shift=({sz},{sy},{sx}) chunk_z={chunk_z}")
+
     # Determine chunking from original Data dataset.
     orig_data = original_h5["Data"]
     orig_chunks = orig_data.chunks if orig_data.chunks else (64, 64, 64)
 
-    with h5py.File(str(output_path), "w") as out_h5:
-        # Create output Data dataset.
-        ds = out_h5.create_dataset(
-            "Data",
-            shape=(nz, ny, nx),
-            dtype=np.uint16,
-            chunks=orig_chunks,
-        )
+    with timed_operation(f"Write H5: {output_path.name}"):
+        with h5py.File(str(output_path), "w") as out_h5:
+            # Create output Data dataset.
+            ds = out_h5.create_dataset(
+                "Data",
+                shape=(nz, ny, nx),
+                dtype=np.uint16,
+                chunks=orig_chunks,
+            )
 
-        # Write corrected full-resolution data slab-by-slab.
-        planes_done = 0
-        for out_z_start in range(0, nz, chunk_z):
-            if cancel_check and cancel_check():
-                return
+            # Write corrected full-resolution data slab-by-slab.
+            planes_done = 0
+            for out_z_start in range(0, nz, chunk_z):
+                if cancel_check and cancel_check():
+                    return
 
-            out_z_end = min(out_z_start + chunk_z, nz)
-            n_planes = out_z_end - out_z_start
+                out_z_end = min(out_z_start + chunk_z, nz)
+                n_planes = out_z_end - out_z_start
 
-            in_z_start = out_z_start - sz
-            in_z_end = out_z_end - sz
+                in_z_start = out_z_start - sz
+                in_z_end = out_z_end - sz
 
-            read_start = max(in_z_start, 0)
-            read_end = min(in_z_end, nz)
+                read_start = max(in_z_start, 0)
+                read_end = min(in_z_end, nz)
 
-            if read_start >= read_end:
-                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-            else:
-                raw = np.asarray(dask_arr[read_start:read_end])
-                slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                dst_start = read_start - in_z_start
-                dst_end = dst_start + (read_end - read_start)
-                slab[dst_start:dst_end] = raw
+                if read_start >= read_end:
+                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+                else:
+                    raw = np.asarray(dask_arr[read_start:read_end])
+                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+                    dst_start = read_start - in_z_start
+                    dst_end = dst_start + (read_end - read_start)
+                    slab[dst_start:dst_end] = raw
 
-            if sy != 0 or sx != 0:
-                for i in range(n_planes):
-                    slab[i] = apply_integer_shift_2d(slab[i], (sy, sx))
+                # Apply XY shifts (parallel across planes).
+                slab = _shift_slab_xy(slab, sy, sx)
 
-            ds[out_z_start:out_z_end] = slab
+                ds[out_z_start:out_z_end] = slab
 
-            planes_done += n_planes
-            if progress_callback:
-                progress_callback(planes_done, nz)
+                planes_done += n_planes
+                if progress_callback:
+                    progress_callback(planes_done, nz)
 
-        # Copy metadata verbatim.
-        if "metadata" in original_h5:
-            raw_meta = original_h5["metadata"][()]
-            out_h5.create_dataset("metadata", data=raw_meta)
+            # Copy metadata verbatim.
+            if "metadata" in original_h5:
+                raw_meta = original_h5["metadata"][()]
+                out_h5.create_dataset("metadata", data=raw_meta)
 
-        # Regenerate pyramid levels.
-        pyramid_levels = detect_pyramid_levels(original_h5)
-        for level_name, fw, fh, fd in pyramid_levels:
-            if cancel_check and cancel_check():
-                return
+            # Regenerate pyramid levels.
+            pyramid_levels = detect_pyramid_levels(original_h5)
+            for level_name, fw, fh, fd in pyramid_levels:
+                if cancel_check and cancel_check():
+                    return
 
-            # Match original chunking for this pyramid level.
-            orig_pyr = original_h5[level_name]
-            pyr_chunks = orig_pyr.chunks if orig_pyr.chunks else None
+                # Match original chunking for this pyramid level.
+                orig_pyr = original_h5[level_name]
+                pyr_chunks = orig_pyr.chunks if orig_pyr.chunks else None
 
-            logger.info("Regenerating pyramid level %s (factors %d×%d×%d)", level_name, fw, fh, fd)
-            generate_pyramid_level(out_h5, level_name, fw, fh, fd, chunks=pyr_chunks)
+                logger.info("Regenerating pyramid level %s (factors %d×%d×%d)", level_name, fw, fh, fd)
+                generate_pyramid_level(out_h5, level_name, fw, fh, fd, chunks=pyr_chunks)
 
 
 def run_export_h5(

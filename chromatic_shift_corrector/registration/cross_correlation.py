@@ -1,8 +1,16 @@
-"""Zero-normalized cross-correlation (ZNCC) registration algorithm."""
+"""Zero-normalized cross-correlation (ZNCC) registration algorithm.
+
+CPU FFT path uses multithreaded ``scipy.fft`` (``workers=-1``).
+The brute-force fallback parallelises shift evaluations across CPU cores
+using ``concurrent.futures.ThreadPoolExecutor`` (numpy releases the GIL
+for the heavy number-crunching).
+"""
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -80,7 +88,7 @@ class ZNCCRegistration(RegistrationAlgorithm):
         )
 
     # ------------------------------------------------------------------ #
-    # CPU — FFT-based approach
+    # CPU — FFT-based approach (multithreaded)
     # ------------------------------------------------------------------ #
 
     def _register_cpu(
@@ -112,16 +120,19 @@ class ZNCCRegistration(RegistrationAlgorithm):
         sr_xy: int,
         sr_z: int,
     ) -> RegistrationResult:
-        """FFT-based ZNCC: cross-correlate in Fourier space, then normalise."""
+        """FFT-based ZNCC: cross-correlate in Fourier space, then normalise.
+
+        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        """
         from scipy.fft import fftn, ifftn
 
         ref_zm = ref - ref.mean()
         mov_zm = mov - mov.mean()
 
-        # Cross-correlation via FFT.
-        F_ref = fftn(ref_zm)
-        F_mov = fftn(mov_zm)
-        cc = np.real(ifftn(F_ref * np.conj(F_mov)))
+        # Cross-correlation via FFT — use all CPU cores.
+        F_ref = fftn(ref_zm, workers=-1)
+        F_mov = fftn(mov_zm, workers=-1)
+        cc = np.real(ifftn(F_ref * np.conj(F_mov), workers=-1))
 
         # Normalise by product of standard deviations and volume size.
         n = ref.size
@@ -173,17 +184,30 @@ class ZNCCRegistration(RegistrationAlgorithm):
         sr_xy: int,
         sr_z: int,
     ) -> RegistrationResult:
-        """Evaluate ZNCC at every candidate shift within the search range."""
+        """Evaluate ZNCC at every candidate shift, parallelised across CPU cores."""
+        # Build list of all candidate shifts.
+        candidates = [
+            (dz, dy, dx)
+            for dz in range(-sr_z, sr_z + 1)
+            for dy in range(-sr_xy, sr_xy + 1)
+            for dx in range(-sr_xy, sr_xy + 1)
+        ]
+
+        n_workers = min(os.cpu_count() or 1, len(candidates))
+
+        def _eval_shift(args):
+            dz, dy, dx = args
+            val = _zncc_at_shift(ref, mov, dz, dy, dx)
+            return (dz, dy, dx, val)
+
         best_zncc = -2.0
         best_shift = (0, 0, 0)
 
-        for dz in range(-sr_z, sr_z + 1):
-            for dy in range(-sr_xy, sr_xy + 1):
-                for dx in range(-sr_xy, sr_xy + 1):
-                    val = _zncc_at_shift(ref, mov, dz, dy, dx)
-                    if val is not None and val > best_zncc:
-                        best_zncc = val
-                        best_shift = (dz, dy, dx)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for dz, dy, dx, val in pool.map(_eval_shift, candidates):
+                if val is not None and val > best_zncc:
+                    best_zncc = val
+                    best_shift = (dz, dy, dx)
 
         confidence = max(0.0, min(1.0, (best_zncc + 1.0) / 2.0))
 

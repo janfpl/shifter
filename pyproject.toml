@@ -19,6 +19,7 @@ dependencies = [
     "scikit-image>=0.20",
     "matplotlib>=3.5",
     "h5py>=3.7",
+    "numba>=0.57",
 ]
 
 [project.optional-dependencies]

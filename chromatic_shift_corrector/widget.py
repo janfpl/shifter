@@ -47,6 +47,11 @@ from chromatic_shift_corrector.export_engine import (
     run_export,
     run_export_h5,
 )
+from chromatic_shift_corrector.perf_logger import (
+    setup_perf_log,
+    timed_operation,
+    log_event,
+)
 from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
@@ -112,17 +117,21 @@ class ExportWorker(QThread):
 
     def run(self) -> None:
         try:
-            export_fn = run_export_h5 if self.input_format == "h5" else run_export
-            meta_path = export_fn(
-                self.loaders,
-                self.shift_manager,
-                self.output_dir,
-                self.ram_percent,
-                progress_callback=lambda done, total: self.progress.emit(done, total),
-                cancel_check=lambda: self._cancelled,
-                voxel_xy=self.voxel_xy,
-                voxel_z=self.voxel_z,
-            )
+            setup_perf_log(self.output_dir)
+            log_event(f"Export started | format={self.input_format} "
+                      f"channels={len(self.loaders)} ram%={self.ram_percent}")
+            with timed_operation("Full export (all channels)"):
+                export_fn = run_export_h5 if self.input_format == "h5" else run_export
+                meta_path = export_fn(
+                    self.loaders,
+                    self.shift_manager,
+                    self.output_dir,
+                    self.ram_percent,
+                    progress_callback=lambda done, total: self.progress.emit(done, total),
+                    cancel_check=lambda: self._cancelled,
+                    voxel_xy=self.voxel_xy,
+                    voxel_z=self.voxel_z,
+                )
             self.finished.emit(str(meta_path) if not self._cancelled else "")
         except Exception:
             self.error.emit(traceback.format_exc())
@@ -176,6 +185,11 @@ class RegistrationWorker(QThread):
     def _run_registration(self) -> list:
         y_start, y_end, x_start, x_end = self.roi_bounds
 
+        log_event(f"Registration started | algo={self.algorithm_name} "
+                  f"channels={self.channels_to_register} "
+                  f"search_xy={self.search_range_xy} search_z={self.search_range_z} "
+                  f"gpu={self.use_gpu}")
+
         # Extract reference sub-volume.
         ref_loader = self.loaders[self.reference_index]
         ref_vol = extract_subvolume(
@@ -220,23 +234,27 @@ class RegistrationWorker(QThread):
             )
 
             # Run registration with GPU OOM fallback.
-            try:
-                result = algo.register(
-                    ref_vol, mov_vol,
-                    self.search_range_xy, self.search_range_z,
-                    use_gpu=self.use_gpu,
-                )
-            except Exception:
-                # If GPU fails (e.g. OOM), retry on CPU.
-                if self.use_gpu:
+            with timed_operation(f"Registration channel {ch_i} ({self.algorithm_name})"):
+                try:
                     result = algo.register(
                         ref_vol, mov_vol,
                         self.search_range_xy, self.search_range_z,
-                        use_gpu=False,
+                        use_gpu=self.use_gpu,
                     )
-                else:
-                    raise
+                except Exception:
+                    # If GPU fails (e.g. OOM), retry on CPU.
+                    if self.use_gpu:
+                        result = algo.register(
+                            ref_vol, mov_vol,
+                            self.search_range_xy, self.search_range_z,
+                            use_gpu=False,
+                        )
+                    else:
+                        raise
 
+            log_event(f"Registration channel {ch_i} result: "
+                      f"shift=({result.shift_z},{result.shift_y},{result.shift_x}) "
+                      f"confidence={result.confidence:.3f}")
             results.append((ch_i, result))
 
         self.progress.emit(total, total, "Registration complete.")
