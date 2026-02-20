@@ -103,11 +103,14 @@ class PhaseCorrelation(RegistrationAlgorithm):
         sr_xy: int,
         sr_z: int,
     ) -> RegistrationResult:
-        """Masked FFT-based cross-correlation with search range enforcement."""
+        """Masked FFT-based cross-correlation with search range enforcement.
+
+        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        """
         from scipy.fft import fftn, ifftn
 
-        F_ref = fftn(ref)
-        F_mov = fftn(mov)
+        F_ref = fftn(ref, workers=-1)
+        F_mov = fftn(mov, workers=-1)
 
         if self.normalization == "phase":
             cross_power = F_ref * np.conj(F_mov)
@@ -116,7 +119,7 @@ class PhaseCorrelation(RegistrationAlgorithm):
         else:
             cross_power = F_ref * np.conj(F_mov)
 
-        cc = np.real(ifftn(cross_power))
+        cc = np.real(ifftn(cross_power, workers=-1))
 
         # Build mask for allowed shifts.
         shape = ref.shape
