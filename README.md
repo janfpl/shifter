@@ -4,15 +4,22 @@ Napari-based axial and lateral chromatic shift correction for light sheet micros
 
 ## Installation
 
-Clone the repository and create a conda environment with Python 3.12 and Qt:
+Clone the repository and create a conda environment with Python 3.12, Qt, and numba:
 
 ```bash
 git clone https://github.com/janfpl/shifter.git
 cd shifter
-conda create -n shifter python=3.12 pyqt -y
+conda create -n shifter python=3.12 pyqt numba -y
 conda activate shifter
 pip install -e .
 ```
+
+> **Note:** Installing `numba` via conda is recommended because it provides pre-built
+> binaries for `numba` and its dependency `llvmlite`. Installing these via pip may fail
+> on macOS and other platforms due to build toolchain incompatibilities. If you skip the
+> conda numba install, mutual-information registration will still work but will use a
+> slower pure-NumPy fallback. You can also install numba as a pip extra with
+> `pip install -e ".[numba]"`, though this may require additional build dependencies.
 
 For GPU acceleration (optional):
 
@@ -173,4 +180,5 @@ Adjust the path and version number to match your CUDA installation.
 - psutil (>=5.9)
 - qtpy (>=2.3)
 - matplotlib (>=3.5)
+- numba (optional, for faster mutual-information registration; install via conda)
 - CuPy (optional, for GPU acceleration)
