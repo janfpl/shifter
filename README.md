@@ -14,11 +14,13 @@ conda activate shifter
 pip install -e .
 ```
 
-For GPU acceleration (optional):
+For GPU acceleration (optional, requires **CUDA Toolkit 12.6**):
 
 ```bash
 pip install -e ".[gpu]"
 ```
+
+> **Note:** CUDA Toolkit **12.6** is the recommended and tested version. CUDA 10.x and 13.x are **not compatible**.
 
 Requires Python 3.12.
 
@@ -74,7 +76,7 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 
 ### 4. Export
 
-Select an output directory and RAM allocation (50-95% of system memory). The export streams corrected volumes in Z-slab chunks, writing one file per channel. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, and processing details.
+Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, and processing details. ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output
@@ -136,7 +138,7 @@ Install GPU support:
 pip install -e ".[gpu]"
 ```
 
-Requires CUDA 12.x compatible hardware and drivers.
+Requires CUDA Toolkit 12.6 and compatible hardware/drivers. CUDA 10.x and 13.x are not supported.
 
 **Troubleshooting: GPU not detected**
 
@@ -159,7 +161,7 @@ mkdir "%CONDA_PREFIX%\etc\conda\activate.d"
 echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%CONDA_PREFIX%\etc\conda\activate.d\cuda_path.bat"
 ```
 
-Adjust the path and version number to match your CUDA installation.
+Ensure the path points to your CUDA 12.6 installation.
 
 ## Dependencies
 
