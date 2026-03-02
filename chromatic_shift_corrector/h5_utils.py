@@ -225,6 +225,9 @@ def generate_pyramid_level(
 
     if chunks is None:
         chunks = (min(64, out_nz), min(64, out_ny), min(64, out_nx))
+    else:
+        # Clamp chunk dimensions so they never exceed the data shape.
+        chunks = (min(chunks[0], out_nz), min(chunks[1], out_ny), min(chunks[2], out_nx))
 
     if level_name in corrected_h5:
         del corrected_h5[level_name]

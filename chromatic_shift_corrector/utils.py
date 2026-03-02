@@ -98,6 +98,7 @@ def build_metadata(
     voxel_z: float,
     volume_shape_zyx: tuple[int, int, int],
     ram_percent: int,
+    roi_bounds: tuple[int, int, int, int, int, int] | None = None,
 ) -> dict[str, Any]:
     """Build the correction metadata dictionary.
 
@@ -116,6 +117,8 @@ def build_metadata(
         Volume dimensions as (Z, Y, X).
     ram_percent : int
         RAM allocation percentage used during export.
+    roi_bounds : tuple, optional
+        (z_start, z_end, y_start, y_end, x_start, x_end) if ROI export.
 
     Returns
     -------
@@ -145,7 +148,7 @@ def build_metadata(
         channel_entries.append(entry)
 
     nz, ny, nx = volume_shape_zyx
-    return {
+    metadata: dict[str, Any] = {
         "reference_channel": ref_filename,
         "voxel_size_xy_um": voxel_xy,
         "voxel_size_z_um": voxel_z,
@@ -155,6 +158,22 @@ def build_metadata(
         "software_version": __version__,
         "ram_allocation_percent": ram_percent,
     }
+
+    if roi_bounds is not None:
+        rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi_bounds
+        metadata["export_region"] = "roi"
+        metadata["roi_bounds"] = {
+            "z_start": rz_s,
+            "z_end": rz_e,
+            "y_start": ry_s,
+            "y_end": ry_e,
+            "x_start": rx_s,
+            "x_end": rx_e,
+        }
+    else:
+        metadata["export_region"] = "full_volume"
+
+    return metadata
 
 
 class _NumpyEncoder(json.JSONEncoder):

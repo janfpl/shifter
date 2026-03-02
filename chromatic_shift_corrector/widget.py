@@ -102,6 +102,7 @@ class ExportWorker(QThread):
         voxel_xy: float,
         voxel_z: float,
         input_format: str = "bigtiff",
+        roi: tuple[int, int, int, int, int, int] | None = None,
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -111,6 +112,7 @@ class ExportWorker(QThread):
         self.voxel_xy = voxel_xy
         self.voxel_z = voxel_z
         self.input_format = input_format
+        self.roi = roi
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -119,8 +121,10 @@ class ExportWorker(QThread):
     def run(self) -> None:
         try:
             setup_perf_log(self.output_dir)
+            region_desc = "ROI" if self.roi else "full"
             log_event(f"Export started | format={self.input_format} "
-                      f"channels={len(self.loaders)} ram%={self.ram_percent}")
+                      f"channels={len(self.loaders)} ram%={self.ram_percent} "
+                      f"region={region_desc}")
             with timed_operation("Full export (all channels)"):
                 export_fn = run_export_h5 if self.input_format == "h5" else run_export
                 meta_path = export_fn(
@@ -132,6 +136,7 @@ class ExportWorker(QThread):
                     cancel_check=lambda: self._cancelled,
                     voxel_xy=self.voxel_xy,
                     voxel_z=self.voxel_z,
+                    roi=self.roi,
                 )
             self.finished.emit(str(meta_path) if not self._cancelled else "")
         except Exception:
@@ -568,6 +573,19 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_output_format = QLabel("Output format: Luxendo H5 (.lux.h5)")
         self.lbl_output_format.setStyleSheet("font-weight: bold;")
         lay.addWidget(self.lbl_output_format)
+
+        # Export region selector.
+        row_region = QHBoxLayout()
+        row_region.addWidget(QLabel("Export region:"))
+        self.radio_export_full = QRadioButton("Full volume")
+        self.radio_export_roi = QRadioButton("ROI only")
+        self.radio_export_full.setChecked(True)
+        self._export_region_group = QButtonGroup(self)
+        self._export_region_group.addButton(self.radio_export_full, 0)
+        self._export_region_group.addButton(self.radio_export_roi, 1)
+        row_region.addWidget(self.radio_export_full)
+        row_region.addWidget(self.radio_export_roi)
+        lay.addLayout(row_region)
 
         row_outdir = QHBoxLayout()
         self.btn_select_outdir = QPushButton("Select Output Directory")
@@ -1489,8 +1507,28 @@ class ChromaticShiftWidget(QWidget):
 
         outdir_path = Path(outdir)
 
+        # Determine export region (full volume or ROI).
+        roi: tuple[int, int, int, int, int, int] | None = None
+        if self.radio_export_roi.isChecked():
+            bounds = self._get_roi_bounds()
+            if bounds is None:
+                QMessageBox.warning(
+                    self, "No ROI",
+                    "ROI export is selected but no ROI rectangle has been drawn.\n"
+                    "Draw an ROI rectangle first, or switch to Full volume export.",
+                )
+                return
+            y_start, y_end, x_start, x_end = bounds
+            z_start = self.spin_z_start.value()
+            z_end = self.spin_z_end.value() + 1  # inclusive → exclusive
+            if z_end <= z_start:
+                QMessageBox.warning(self, "Invalid Z", "Z end must be > Z start.")
+                return
+            roi = (z_start, z_end, y_start, y_end, x_start, x_end)
+
         # Check for existing corrected files.
-        channel_dicts = self.shift_manager.to_channel_dicts()
+        suffix = "_corrected_roi" if roi else "_corrected"
+        channel_dicts = self.shift_manager.to_channel_dicts(output_suffix=suffix)
         existing = [
             d["filename_corrected"]
             for d in channel_dicts
@@ -1510,7 +1548,7 @@ class ChromaticShiftWidget(QWidget):
 
         # Build confirmation dialog.
         ram_pct = self.slider_ram.value()
-        sizes = estimate_output_sizes(self.loaders)
+        sizes = estimate_output_sizes(self.loaders, roi=roi)
         ref_shape = self.loaders[0].shape
 
         lines = ["Shifts to apply:\n"]
@@ -1520,19 +1558,29 @@ class ChromaticShiftWidget(QWidget):
                 f"  ch{i} {t.filename}{tag}: "
                 f"X={t.shift_x:+d}, Y={t.shift_y:+d}, Z={t.shift_z:+d}"
             )
-            # Edges that become zeros.
-            for axis, val, dim_name in [
-                (t.shift_x, ref_shape[2], "X"),
-                (t.shift_y, ref_shape[1], "Y"),
-                (t.shift_z, ref_shape[0], "Z"),
-            ]:
-                if axis != 0:
-                    side = "end" if axis > 0 else "start"
-                    lines.append(
-                        f"      {dim_name}: {abs(axis)} zero-padded voxels at {side}"
-                    )
+            # Edges that become zeros (only relevant for full volume export).
+            if roi is None:
+                for axis, val, dim_name in [
+                    (t.shift_x, ref_shape[2], "X"),
+                    (t.shift_y, ref_shape[1], "Y"),
+                    (t.shift_z, ref_shape[0], "Z"),
+                ]:
+                    if axis != 0:
+                        side = "end" if axis > 0 else "start"
+                        lines.append(
+                            f"      {dim_name}: {abs(axis)} zero-padded voxels at {side}"
+                        )
 
-        lines.append(f"\nOutput dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
+        if roi is not None:
+            rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
+            out_nx, out_ny, out_nz = rx_e - rx_s, ry_e - ry_s, rz_e - rz_s
+            lines.append(f"\nExport region: ROI only")
+            lines.append(f"ROI bounds: X=[{rx_s},{rx_e}] Y=[{ry_s},{ry_e}] Z=[{rz_s},{rz_e}]")
+            lines.append(f"Output dimensions: {out_nx}x{out_ny}x{out_nz} (XYZ)")
+        else:
+            lines.append(f"\nExport region: Full volume")
+            lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
+
         total_bytes = sum(sizes)
         lines.append(f"Estimated total output size: {total_bytes / (1024**3):.2f} GB")
         lines.append(f"RAM allocation: {ram_pct}%")
@@ -1561,6 +1609,7 @@ class ChromaticShiftWidget(QWidget):
             self.spin_voxel_xy.value(),
             self.spin_voxel_z.value(),
             input_format=self._input_format,
+            roi=roi,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.finished.connect(self._on_export_finished)
@@ -1613,5 +1662,7 @@ class ChromaticShiftWidget(QWidget):
             self.spin_sr_z,
             self.chk_bg_sub,
             self.chk_gaussian,
+            self.radio_export_full,
+            self.radio_export_roi,
         ]:
             w.setEnabled(enabled)
