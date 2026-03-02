@@ -172,6 +172,19 @@ def _add_cuda_bin_to_path(cuda_root: Path) -> None:
                 pass
 
 
+def _test_nvrtc(cupy) -> tuple[bool, str]:
+    """Run a small computation to verify NVRTC works.
+
+    Returns ``(success, error_message)``.
+    """
+    try:
+        a = cupy.array([1.0, 2.0, 3.0])
+        _ = float((a * a).sum())
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _probe_gpu() -> tuple[bool, str, str]:
     """Try to import cupy and detect a suitable NVIDIA GPU.
 
@@ -208,21 +221,43 @@ def _probe_gpu() -> tuple[bool, str, str]:
 
     # Verify that NVRTC (runtime compiler) actually works.  CuPy can
     # detect the GPU via the CUDA driver but fail later when JIT-compiling
-    # kernels if nvrtc DLLs are missing.
-    try:
-        a = cupy.array([1.0, 2.0, 3.0])
-        _ = float((a * a).sum())
-    except Exception as exc:
-        msg = str(exc)
-        if "nvrtc" in msg.lower() or "FileNotFoundError" in msg:
+    # kernels if nvrtc DLLs are missing or incompatible.
+    ok, err_msg = _test_nvrtc(cupy)
+
+    if not ok and "--std" in err_msg:
+        # Some CuPy / CUDA version combinations produce a malformed --std
+        # flag (e.g. ``--std`` without a value).  Retry with an explicit
+        # C++ standard override.
+        for std in ("--std=c++14", "--std=c++11", "--std=c++17"):
+            logger.debug("NVRTC --std error, retrying with %s", std)
+            os.environ["CUPY_NVRTC_COMPILE_OPTIONS"] = std
+            ok, err_msg = _test_nvrtc(cupy)
+            if ok:
+                logger.info(
+                    "NVRTC workaround succeeded with %s", std
+                )
+                break
+
+    if not ok:
+        if "--std" in err_msg:
             return (
                 False,
                 name,
-                f"CUDA toolkit libraries (NVRTC) not found: {msg}. "
+                f"NVRTC compilation failed: {err_msg}. "
+                "This usually indicates a CuPy / CUDA Toolkit version "
+                "mismatch. Try reinstalling CuPy to match your CUDA "
+                "version (pip install cupy-cuda12x) or install the "
+                "CUDA 12.x Toolkit.",
+            )
+        if "nvrtc" in err_msg.lower() or "FileNotFoundError" in err_msg:
+            return (
+                False,
+                name,
+                f"CUDA toolkit libraries (NVRTC) not found: {err_msg}. "
                 "Install the CUDA 12.x Toolkit or set the CUDA_PATH "
                 "environment variable to your CUDA installation directory.",
             )
-        return False, name, f"GPU computation test failed: {exc}"
+        return False, name, f"GPU computation test failed: {err_msg}"
 
     return True, name, ""
 
