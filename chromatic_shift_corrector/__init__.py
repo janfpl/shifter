@@ -1,3 +1,3 @@
-"""Napari-based chromatic shift correction for light sheet microscopy."""
+"""Napari-based image processing pipeline for light sheet microscopy."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

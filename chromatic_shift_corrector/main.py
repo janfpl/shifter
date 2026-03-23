@@ -1,4 +1,4 @@
-"""Entry point — launches napari with the Chromatic Shift Corrector widget."""
+"""Entry point — launches napari with the Image Processing Pipeline widget."""
 
 from __future__ import annotations
 
@@ -60,14 +60,14 @@ def main() -> None:
 
     import napari
 
-    from chromatic_shift_corrector.widget import ChromaticShiftWidget
+    from chromatic_shift_corrector.widget import ImageProcessingWidget
 
-    viewer = napari.Viewer(title="Chromatic Shift Corrector", show=False)
+    viewer = napari.Viewer(title="H5 Image Processor", show=False)
     _fit_window_to_screen(viewer)
     viewer.show()
 
-    widget = ChromaticShiftWidget(viewer)
-    viewer.window.add_dock_widget(widget, name="Chromatic Shift Corrector", area="right")
+    widget = ImageProcessingWidget(viewer)
+    viewer.window.add_dock_widget(widget, name="Image Processor", area="right")
     napari.run()
 
 
