@@ -287,6 +287,10 @@ class ChromaticShiftWidget(QWidget):
         self._input_format: str = "h5"
         self._h5_file_manager: H5FileManager | None = None
 
+        # Pyramid level range for viewer (0 = full-res, higher = more downsampled).
+        self._pyramid_min_level: int = 0
+        self._pyramid_max_level: int | None = None
+
         # MIP panel state.
         self._raw_subvolumes: list[np.ndarray] = []
         self._mip_channel_layer_names: list[str] = []
@@ -392,6 +396,43 @@ class ChromaticShiftWidget(QWidget):
         self.btn_load = QPushButton("Load Data")
         self.btn_load.clicked.connect(self._on_load_data)
         lay.addWidget(self.btn_load)
+
+        # -- Pyramid level range controls -------------------------------- #
+        self.lbl_pyramid_info = QLabel("No pyramid data loaded.")
+        self.lbl_pyramid_info.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_pyramid_info.setWordWrap(True)
+        lay.addWidget(self.lbl_pyramid_info)
+
+        row_pyr_min = QHBoxLayout()
+        row_pyr_min.addWidget(QLabel("Finest level:"))
+        self.spin_pyramid_min = QSpinBox()
+        self.spin_pyramid_min.setMinimum(0)
+        self.spin_pyramid_min.setMaximum(0)
+        self.spin_pyramid_min.setValue(0)
+        self.spin_pyramid_min.setToolTip(
+            "Highest resolution level (0 = full resolution)"
+        )
+        self.spin_pyramid_min.setEnabled(False)
+        row_pyr_min.addWidget(self.spin_pyramid_min)
+        lay.addLayout(row_pyr_min)
+
+        row_pyr_max = QHBoxLayout()
+        row_pyr_max.addWidget(QLabel("Coarsest level:"))
+        self.spin_pyramid_max = QSpinBox()
+        self.spin_pyramid_max.setMinimum(0)
+        self.spin_pyramid_max.setMaximum(0)
+        self.spin_pyramid_max.setValue(0)
+        self.spin_pyramid_max.setToolTip(
+            "Lowest resolution level (highest downsample factor)"
+        )
+        self.spin_pyramid_max.setEnabled(False)
+        row_pyr_max.addWidget(self.spin_pyramid_max)
+        lay.addLayout(row_pyr_max)
+
+        self.btn_apply_pyramid = QPushButton("Apply Pyramid Range")
+        self.btn_apply_pyramid.setEnabled(False)
+        self.btn_apply_pyramid.clicked.connect(self._on_apply_pyramid_range)
+        lay.addWidget(self.btn_apply_pyramid)
 
         grp.setLayout(lay)
         return grp
@@ -926,27 +967,9 @@ class ChromaticShiftWidget(QWidget):
 
         self.shift_manager.init_channels(filenames, ref_channel, colormaps)
 
-        # Add layers to napari.
-        for i, loader in enumerate(self.loaders):
-            t = self.shift_manager[i]
-            # H5 loaders with pyramid levels use multiscale for napari.
-            if self._input_format == "h5" and len(loader.multiscale) > 1:
-                self.viewer.add_image(
-                    loader.multiscale,
-                    name=f"ch{i}_{t.filename}",
-                    colormap=t.colormap,
-                    blending="additive",
-                    visible=True,
-                    multiscale=True,
-                )
-            else:
-                self.viewer.add_image(
-                    loader.dask_array,
-                    name=f"ch{i}_{t.filename}",
-                    colormap=t.colormap,
-                    blending="additive",
-                    visible=True,
-                )
+        # Configure pyramid range controls and add layers to napari.
+        self._setup_pyramid_controls()
+        self._reload_layers_with_pyramid_range()
 
         # Clear old confidence scores and update UI.
         self._confidence_scores.clear()
@@ -961,6 +984,106 @@ class ChromaticShiftWidget(QWidget):
         self.spin_z_start.setValue(0)
         self.spin_z_end.setValue(min(min_z - 1, 99))
 
+    # ---- Pyramid Level Range ---------------------------------------- #
+
+    def _setup_pyramid_controls(self) -> None:
+        """Configure pyramid spinboxes based on the loaded data."""
+        if self._input_format == "h5" and self.loaders:
+            n_levels = self.loaders[0].num_levels
+            if n_levels > 1:
+                self.spin_pyramid_min.setMaximum(n_levels - 1)
+                self.spin_pyramid_max.setMaximum(n_levels - 1)
+                self.spin_pyramid_min.setValue(0)
+                self.spin_pyramid_max.setValue(n_levels - 1)
+                self._pyramid_min_level = 0
+                self._pyramid_max_level = n_levels - 1
+
+                descs = self.loaders[0].level_descriptions()
+                self.lbl_pyramid_info.setText(
+                    f"{n_levels} pyramid levels available:\n"
+                    + "\n".join(descs)
+                )
+                self.spin_pyramid_min.setEnabled(True)
+                self.spin_pyramid_max.setEnabled(True)
+                self.btn_apply_pyramid.setEnabled(True)
+                return
+
+        self._disable_pyramid_controls(
+            "No pyramid data loaded."
+            if not self.loaders
+            else "Single resolution (no pyramid)."
+        )
+
+    def _disable_pyramid_controls(self, message: str) -> None:
+        self.lbl_pyramid_info.setText(message)
+        self.spin_pyramid_min.setEnabled(False)
+        self.spin_pyramid_max.setEnabled(False)
+        self.btn_apply_pyramid.setEnabled(False)
+        self.spin_pyramid_min.setValue(0)
+        self.spin_pyramid_max.setValue(0)
+        self.spin_pyramid_min.setMaximum(0)
+        self.spin_pyramid_max.setMaximum(0)
+        self._pyramid_min_level = 0
+        self._pyramid_max_level = None
+
+    def _on_apply_pyramid_range(self) -> None:
+        min_lvl = self.spin_pyramid_min.value()
+        max_lvl = self.spin_pyramid_max.value()
+        if min_lvl > max_lvl:
+            QMessageBox.warning(
+                self,
+                "Invalid Range",
+                "Finest level must be ≤ coarsest level.",
+            )
+            return
+        self._pyramid_min_level = min_lvl
+        self._pyramid_max_level = max_lvl
+        self._reload_layers_with_pyramid_range()
+
+    def _reload_layers_with_pyramid_range(self) -> None:
+        """Remove and re-add channel layers using the current pyramid range."""
+        # Remove existing channel layers.
+        to_remove = [l for l in self.viewer.layers if l.name.startswith("ch")]
+        for l in to_remove:
+            self.viewer.layers.remove(l)
+
+        for i, loader in enumerate(self.loaders):
+            t = self.shift_manager[i]
+            if (
+                self._input_format == "h5"
+                and hasattr(loader, "num_levels")
+                and loader.num_levels > 1
+            ):
+                subset = loader.multiscale_subset(
+                    self._pyramid_min_level,
+                    self._pyramid_max_level,
+                )
+                if len(subset) > 1:
+                    self.viewer.add_image(
+                        subset,
+                        name=f"ch{i}_{t.filename}",
+                        colormap=t.colormap,
+                        blending="additive",
+                        visible=True,
+                        multiscale=True,
+                    )
+                else:
+                    self.viewer.add_image(
+                        subset[0],
+                        name=f"ch{i}_{t.filename}",
+                        colormap=t.colormap,
+                        blending="additive",
+                        visible=True,
+                    )
+            else:
+                self.viewer.add_image(
+                    loader.dask_array,
+                    name=f"ch{i}_{t.filename}",
+                    colormap=t.colormap,
+                    blending="additive",
+                    visible=True,
+                )
+
     def _close_loaders(self) -> None:
         for ld in self.loaders:
             try:
@@ -972,6 +1095,7 @@ class ChromaticShiftWidget(QWidget):
         if self._h5_file_manager is not None:
             self._h5_file_manager.close_all()
             self._h5_file_manager = None
+        self._disable_pyramid_controls("No pyramid data loaded.")
 
     # ------------------------------------------------------------------ #
     # Callbacks — Shift Table

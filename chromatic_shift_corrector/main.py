@@ -3,8 +3,32 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
+
+
+def _set_default_font() -> None:
+    """Set a default application font on Windows to avoid DirectWrite warnings.
+
+    Qt may fall back to "MS Sans Serif" which triggers::
+
+        DirectWrite: CreateFontFaceFromHDC() failed …
+
+    Setting "Segoe UI" (available on all modern Windows) prevents this.
+    """
+    try:
+        if sys.platform != "win32":
+            return
+        from qtpy.QtWidgets import QApplication
+        from qtpy.QtGui import QFont
+
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.setFont(QFont("Segoe UI", 9))
+    except Exception:
+        pass  # Non-critical — the warning is cosmetic.
 
 
 def _fit_window_to_screen(viewer) -> None:
@@ -63,6 +87,7 @@ def main() -> None:
     from chromatic_shift_corrector.widget import ChromaticShiftWidget
 
     viewer = napari.Viewer(title="Chromatic Shift Corrector", show=False)
+    _set_default_font()
     _fit_window_to_screen(viewer)
     viewer.show()
 
