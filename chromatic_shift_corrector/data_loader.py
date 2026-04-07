@@ -160,6 +160,29 @@ class H5Loader:
         return self._pyramid_levels
 
     @property
+    def num_levels(self) -> int:
+        """Total number of resolution levels (including full-res)."""
+        return len(self._multiscale)
+
+    def multiscale_subset(
+        self, min_level: int = 0, max_level: int | None = None
+    ) -> list[da.Array]:
+        """Return a slice of the multiscale list from *min_level* to *max_level* (inclusive).
+
+        Level 0 is full resolution; higher indices are progressively downsampled.
+        """
+        if max_level is None:
+            max_level = len(self._multiscale) - 1
+        return self._multiscale[min_level : max_level + 1]
+
+    def level_descriptions(self) -> list[str]:
+        """Return human-readable descriptions for each pyramid level."""
+        descs = ["Level 0: Full resolution"]
+        for i, (name, fw, fh, fd) in enumerate(self._pyramid_levels):
+            descs.append(f"Level {i + 1}: {fw}x{fh}x{fd} downsample")
+        return descs
+
+    @property
     def channel_description(self) -> str:
         """Channel description from metadata, or filename as fallback."""
         return self._metadata.get("channel_description", self.path.name)
