@@ -1059,7 +1059,7 @@ class ChromaticShiftWidget(QWidget):
                     self._pyramid_max_level,
                 )
                 if len(subset) > 1:
-                    self.viewer.add_image(
+                    layer = self.viewer.add_image(
                         subset,
                         name=f"ch{i}_{t.filename}",
                         colormap=t.colormap,
@@ -1068,7 +1068,7 @@ class ChromaticShiftWidget(QWidget):
                         multiscale=True,
                     )
                 else:
-                    self.viewer.add_image(
+                    layer = self.viewer.add_image(
                         subset[0],
                         name=f"ch{i}_{t.filename}",
                         colormap=t.colormap,
@@ -1076,13 +1076,14 @@ class ChromaticShiftWidget(QWidget):
                         visible=True,
                     )
             else:
-                self.viewer.add_image(
+                layer = self.viewer.add_image(
                     loader.dask_array,
                     name=f"ch{i}_{t.filename}",
                     colormap=t.colormap,
                     blending="additive",
                     visible=True,
                 )
+            layer.reset_contrast_limits()
 
     def _close_loaders(self) -> None:
         for ld in self.loaders:
@@ -1450,7 +1451,7 @@ class ChromaticShiftWidget(QWidget):
 
             layer_name = f"{t.filename}_preview_corrected"
             self._preview_layer_names.append(layer_name)
-            self.viewer.add_image(
+            preview_layer = self.viewer.add_image(
                 shifted,
                 name=layer_name,
                 colormap=t.colormap,
@@ -1458,6 +1459,7 @@ class ChromaticShiftWidget(QWidget):
                 translate=(z_start, y_start, x_start),
                 visible=True,
             )
+            preview_layer.reset_contrast_limits()
 
         # Build and display MIP panel.
         self._build_and_show_mip(shifted_volumes, colormaps)
@@ -1522,7 +1524,7 @@ class ChromaticShiftWidget(QWidget):
             t = self.shift_manager[i]
             layer_name = f"MIP ch{i}_{t.filename}"
             self._mip_channel_layer_names.append(layer_name)
-            self.viewer.add_image(
+            mip_layer = self.viewer.add_image(
                 panel,
                 name=layer_name,
                 colormap=cmap,
@@ -1530,6 +1532,7 @@ class ChromaticShiftWidget(QWidget):
                 translate=self._mip_translate,
                 interpolation2d="nearest",
             )
+            mip_layer.reset_contrast_limits()
 
         # Add crosshair overlay on top.
         crosshair = self._build_crosshair_image()
