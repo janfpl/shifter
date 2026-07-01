@@ -83,7 +83,7 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 
 ### 4. Export
 
-Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, and processing details. ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
+Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. Progress is reported in actual bytes written (not Z-planes), so for Luxendo H5 output the indicator keeps moving through pyramid regeneration instead of appearing to finish early. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, processing details, and the total bytes written (`bytes_written_gb`). ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix

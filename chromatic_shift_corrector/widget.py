@@ -100,7 +100,9 @@ COLORMAP_OPTIONS = [
 class ExportWorker(QThread):
     """Background thread for full-volume export (BigTIFF or H5)."""
 
-    progress = Signal(int, int)  # (planes_done, total_planes)
+    # object (not int): byte counts for large exports can exceed the
+    # ~2.1 GB range of a 32-bit Qt "int" signal argument.
+    progress = Signal(object, object)  # (bytes_written, total_bytes)
     finished = Signal(str)  # metadata path or empty on cancel
     error = Signal(str)
 
@@ -1834,17 +1836,30 @@ class ChromaticShiftWidget(QWidget):
         if total > 0:
             pct = int(100 * done / total)
             self.progress_bar.setValue(pct)
-            self.lbl_progress.setText(f"Processing: {done}/{total} planes ({pct}%)")
+            done_gb = done / (1024**3)
+            total_gb = total / (1024**3)
+            self.lbl_progress.setText(
+                f"Processing: {done_gb:.2f}/{total_gb:.2f} GB written ({pct}%)"
+            )
 
     def _on_export_finished(self, meta_path: str) -> None:
         self._set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.lbl_progress.setVisible(False)
         if meta_path:
+            written_gb = ""
+            try:
+                from chromatic_shift_corrector.utils import load_metadata
+
+                meta = load_metadata(Path(meta_path))
+                if "bytes_written_gb" in meta:
+                    written_gb = f"\nTotal data written: {meta['bytes_written_gb']:.2f} GB"
+            except Exception:
+                pass
             QMessageBox.information(
                 self,
                 "Export Complete",
-                f"All channels exported successfully.\nMetadata: {meta_path}",
+                f"All channels exported successfully.\nMetadata: {meta_path}{written_gb}",
             )
         else:
             QMessageBox.information(self, "Cancelled", "Export was cancelled.")

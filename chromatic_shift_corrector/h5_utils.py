@@ -225,6 +225,14 @@ def block_average_3d(
     return reshaped.mean(axis=(0, 2, 4)).astype(np.uint16)
 
 
+def compute_pyramid_level_shape(
+    data_shape: tuple[int, int, int], factor_w: int, factor_h: int, factor_d: int
+) -> tuple[int, int, int]:
+    """Return the (nz, ny, nx) shape :func:`generate_pyramid_level` will produce."""
+    nz, ny, nx = data_shape
+    return nz // factor_d, ny // factor_h, nx // factor_w
+
+
 def generate_pyramid_level(
     corrected_h5: Any,
     level_name: str,
