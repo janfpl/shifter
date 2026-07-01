@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 from qtpy.QtCore import QThread, Signal, Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -65,6 +66,7 @@ from chromatic_shift_corrector.registration import (
     GUIDANCE_TEXT,
     RegistrationResult,
     confidence_color_rgb,
+    estimate_registration_bytes,
     gpu_available,
     gpu_fail_reason,
     gpu_name,
@@ -185,6 +187,15 @@ class RegistrationWorker(QThread):
         try:
             results = self._run_registration()
             self.finished.emit(results)
+        except MemoryError:
+            self.error.emit(
+                "Ran out of memory while registering this sub-volume. "
+                "Large ROIs and Z ranges require several full-precision "
+                "copies of the data in RAM at once for FFT-based algorithms.\n\n"
+                "Try shrinking the ROI rectangle or the Z range, closing "
+                "other applications to free up RAM, or switching to a "
+                "smaller search range."
+            )
         except Exception:
             self.error.emit(traceback.format_exc())
 
@@ -1230,6 +1241,26 @@ class ChromaticShiftWidget(QWidget):
         if algo_name == "Phase Cross-Correlation":
             norm_text = self.combo_normalization.currentText()
             algo_kwargs["normalization"] = "phase" if norm_text == "Phase" else None
+
+        # Warn if the sub-volume is large enough that CPU registration is
+        # likely to run out of memory (FFT-based algorithms hold several
+        # float64/complex128 copies of the whole sub-volume at once).
+        est_bytes = estimate_registration_bytes((roi_nz, roi_ny, roi_nx), algo_name)
+        available_bytes = psutil.virtual_memory().available
+        if est_bytes > 0.7 * available_bytes:
+            ans = QMessageBox.warning(
+                self,
+                "ROI May Be Too Large",
+                f"Registering this sub-volume ({roi_nx}×{roi_ny}×{roi_nz} voxels) "
+                f"with {algo_name} may need ~{est_bytes / (1024**3):.1f} GB of RAM, "
+                f"but only ~{available_bytes / (1024**3):.1f} GB is currently available.\n\n"
+                "This is likely to fail with an out-of-memory error. Consider "
+                "shrinking the ROI rectangle or the Z range before running "
+                "registration.\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
 
         ref_idx = self.shift_manager.reference_index
         if ref_idx is None:

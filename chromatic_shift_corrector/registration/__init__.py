@@ -3,6 +3,7 @@
 from chromatic_shift_corrector.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
+    estimate_registration_bytes,
 )
 from chromatic_shift_corrector.registration.phase_correlation import PhaseCorrelation
 from chromatic_shift_corrector.registration.mutual_information import (
@@ -35,6 +36,7 @@ MAX_SEARCH_RANGE = 200
 __all__ = [
     "RegistrationAlgorithm",
     "RegistrationResult",
+    "estimate_registration_bytes",
     "PhaseCorrelation",
     "MutualInformationRegistration",
     "ZNCCRegistration",

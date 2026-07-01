@@ -37,6 +37,30 @@ class RegistrationResult:
     algorithm_name: str = ""
 
 
+# Conservative estimate of peak host-RAM bytes needed per voxel to run a
+# given algorithm's CPU path. FFT-based algorithms (phase correlation,
+# ZNCC) hold several float64/complex128 copies of the sub-volume
+# simultaneously (skimage/scipy internals plus our own pre-cast copies);
+# mutual information only needs raveled float64 copies plus small
+# histograms. These are upper-bound heuristics for pre-flight warnings,
+# not an exact accounting.
+MEMORY_BYTES_PER_VOXEL: dict[str, int] = {
+    "Phase Cross-Correlation": 64,
+    "Zero-Normalized Cross-Correlation": 64,
+    "Mutual Information": 24,
+}
+_DEFAULT_MEMORY_BYTES_PER_VOXEL = 64
+
+
+def estimate_registration_bytes(shape: tuple[int, int, int], algorithm_name: str) -> int:
+    """Rough upper-bound estimate of peak CPU RAM (bytes) to register *shape*."""
+    voxels = 1
+    for d in shape:
+        voxels *= d
+    per_voxel = MEMORY_BYTES_PER_VOXEL.get(algorithm_name, _DEFAULT_MEMORY_BYTES_PER_VOXEL)
+    return voxels * per_voxel
+
+
 class RegistrationAlgorithm(ABC):
     """Interface that every registration algorithm must implement."""
 
