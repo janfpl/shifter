@@ -86,8 +86,10 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, and processing details. ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
 Output format matches the input format:
-- BigTIFF input produces BigTIFF output
+- BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
 - Luxendo H5 input produces H5 output with regenerated resolution pyramids and preserved metadata
+
+**Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are copied verbatim into the output directory alongside the corrected data. ROI exports still use the `_corrected_roi` suffix and do not copy these header files, since a cropped sub-volume has different dimensions and can't be opened via the original headers.
 
 ## Registration Algorithms
 

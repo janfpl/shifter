@@ -21,6 +21,7 @@ from chromatic_shift_corrector.perf_logger import log_event, timed_operation
 from chromatic_shift_corrector.utils import (
     apply_integer_shift_2d,
     build_metadata,
+    h5_output_filename,
     save_metadata,
 )
 
@@ -632,9 +633,13 @@ def run_export_h5(
         planes_per_channel = rz_e - rz_s
         suffix = "_corrected_roi"
     else:
+        # Full-volume export keeps the original filenames (no suffix) so
+        # that any companion Imaris (.ims) / BigDataViewer (_bdv.h5,
+        # _bdv.xml) header files copied alongside continue to resolve
+        # their internal references to the per-channel files.
         xy_shape = (ref_shape[1], ref_shape[2])
         planes_per_channel = None
-        suffix = "_corrected"
+        suffix = ""
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
 
@@ -652,16 +657,7 @@ def run_export_h5(
     for i, (loader, transform) in enumerate(
         zip(loaders, shift_manager.transforms)
     ):
-        # Output filename: {stem}{suffix}.lux.h5 or {stem}{suffix}.h5.
-        name = transform.filename
-        if name.lower().endswith(".lux.h5"):
-            stem = name[: -len(".lux.h5")]
-            out_name = f"{stem}{suffix}.lux.h5"
-        elif name.lower().endswith(".h5"):
-            stem = name[: -len(".h5")]
-            out_name = f"{stem}{suffix}.h5"
-        else:
-            out_name = f"{name}{suffix}.lux.h5"
+        out_name = h5_output_filename(transform.filename, suffix)
         out_path = output_dir / out_name
 
         export_channel_h5(
@@ -686,14 +682,7 @@ def run_export_h5(
     # Augment channel dicts with H5-specific info.
     for i, cd in enumerate(channel_dicts):
         loader = loaders[i]
-        # Fix corrected filename to match H5 naming.
-        name = cd["filename_original"]
-        if name.lower().endswith(".lux.h5"):
-            stem = name[: -len(".lux.h5")]
-            cd["filename_corrected"] = f"{stem}{suffix}.lux.h5"
-        elif name.lower().endswith(".h5"):
-            stem = name[: -len(".h5")]
-            cd["filename_corrected"] = f"{stem}{suffix}.h5"
+        cd["filename_corrected"] = h5_output_filename(cd["filename_original"], suffix)
 
         # Add channel_description and pyramid info.
         cd["channel_description"] = loader.channel_description
@@ -710,6 +699,26 @@ def run_export_h5(
     )
     metadata["input_format"] = "luxendo_h5"
     metadata["voxel_size_source"] = "h5_metadata"
+
+    # Full-volume exports keep original filenames, so copy any companion
+    # Imaris/BigDataViewer header files (.ims, *_bdv.h5, *_bdv.xml) from the
+    # input directory alongside the exported data — a ROI-cropped export has
+    # different dimensions and can't be opened via the original headers.
+    if roi is None:
+        from chromatic_shift_corrector.h5_utils import (
+            copy_companion_header_files,
+            find_companion_header_files,
+        )
+
+        input_dir = loaders[0].path.parent
+        header_files = find_companion_header_files(input_dir)
+        if header_files:
+            copied = copy_companion_header_files(header_files, output_dir)
+            log_event(
+                "Copied companion header files: "
+                + ", ".join(p.name for p in copied)
+            )
+            metadata["companion_header_files"] = [p.name for p in copied]
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path

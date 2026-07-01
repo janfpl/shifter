@@ -53,11 +53,20 @@ from chromatic_shift_corrector.perf_logger import (
     timed_operation,
     log_event,
 )
-from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
+from chromatic_shift_corrector.h5_utils import (
+    H5FileManager,
+    find_companion_header_files,
+    scan_h5_files,
+)
 from chromatic_shift_corrector.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
-from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
+from chromatic_shift_corrector.utils import (
+    DEFAULT_COLORMAPS,
+    MAX_CHANNELS,
+    h5_output_filename,
+    parse_voxel_size_from_xml,
+)
 from chromatic_shift_corrector.registration import (
     ALGORITHM_REGISTRY,
     MAX_SEARCH_RANGE,
@@ -1704,13 +1713,35 @@ class ChromaticShiftWidget(QWidget):
             roi = (z_start, z_end, y_start, y_end, x_start, x_end)
 
         # Check for existing corrected files.
-        suffix = "_corrected_roi" if roi else "_corrected"
-        channel_dicts = self.shift_manager.to_channel_dicts(output_suffix=suffix)
-        existing = [
-            d["filename_corrected"]
-            for d in channel_dicts
-            if (outdir_path / d["filename_corrected"]).exists()
-        ]
+        if roi:
+            suffix = "_corrected_roi"
+        elif self._input_format == "h5":
+            # Full-volume H5 export keeps original filenames so companion
+            # Imaris/BigDataViewer headers keep working.
+            suffix = ""
+        else:
+            suffix = "_corrected"
+
+        if self._input_format == "h5":
+            out_names = [
+                h5_output_filename(t.filename, suffix)
+                for t in self.shift_manager.transforms
+            ]
+        else:
+            channel_dicts = self.shift_manager.to_channel_dicts(output_suffix=suffix)
+            out_names = [d["filename_corrected"] for d in channel_dicts]
+
+        existing = [name for name in out_names if (outdir_path / name).exists()]
+
+        # A full-volume H5 export also copies companion header files
+        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory, if present.
+        header_files: list[Path] = []
+        if roi is None and self._input_format == "h5":
+            header_files = find_companion_header_files(self.loaders[0].path.parent)
+            existing.extend(
+                f.name for f in header_files if (outdir_path / f.name).exists()
+            )
+
         if existing:
             ans = QMessageBox.question(
                 self,
@@ -1757,6 +1788,12 @@ class ChromaticShiftWidget(QWidget):
         else:
             lines.append(f"\nExport region: Full volume")
             lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
+
+        if header_files:
+            lines.append(
+                "\nCompanion header files to copy: "
+                + ", ".join(f.name for f in header_files)
+            )
 
         total_bytes = sum(sizes)
         lines.append(f"Estimated total output size: {total_bytes / (1024**3):.2f} GB")

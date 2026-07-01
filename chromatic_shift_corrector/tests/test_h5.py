@@ -322,11 +322,12 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
             print(f"  FAIL: metadata voxel_size_source={meta.get('voxel_size_source')}")
             all_ok = False
 
-        # Check corrected files.
+        # Check corrected files. Full-volume H5 export keeps the original
+        # filename (no suffix) so companion Imaris/BigDataViewer headers
+        # keep working.
         for ch_i, (dz, dy, dx) in GROUND_TRUTH_SHIFTS.items():
             fname = files[ch_i].name
-            stem = fname[: -len(".lux.h5")]
-            out_name = f"{stem}_corrected.lux.h5"
+            out_name = fname
             out_path = outdir / out_name
 
             if not out_path.exists():
@@ -392,8 +393,7 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
                         print(f"  PASS: ch{ch_i} pyramids regenerated correctly")
 
         # Check reference channel (no shift) output.
-        ref_stem = files[0].name[: -len(".lux.h5")]
-        ref_out = outdir / f"{ref_stem}_corrected.lux.h5"
+        ref_out = outdir / files[0].name
         if ref_out.exists():
             with h5py.File(str(ref_out), "r") as f:
                 ref_corr = f["Data"][:]

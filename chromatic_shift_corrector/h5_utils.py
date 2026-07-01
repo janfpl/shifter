@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,47 @@ logger = logging.getLogger(__name__)
 
 # Regex for pyramid dataset names: Data_W_H_D (all integers).
 _PYRAMID_RE = re.compile(r"^Data_(\d+)_(\d+)_(\d+)$")
+
+# Sidecar header files sometimes shipped alongside Luxendo per-channel
+# .lux.h5 data: an Imaris (.ims) header and a BigDataViewer HDF5/XML pair.
+# Both the .ims file and the *_bdv.h5 file reference the per-channel data
+# files by their literal filenames (HDF5 external links / relative XML
+# paths), so they only continue to work if the exported channel files keep
+# their original names in the destination directory.
+_HEADER_FILE_GLOBS = ("*.ims", "*_bdv.h5", "*_bdv.xml")
+
+
+def find_companion_header_files(input_dir: Path | str) -> list[Path]:
+    """Return sidecar Imaris/BigDataViewer header files next to Luxendo data.
+
+    Looks in *input_dir* for ``.ims``, ``*_bdv.h5``, and ``*_bdv.xml`` files.
+    Returns an empty list if none are present (not every acquisition ships
+    these).
+    """
+    input_dir = Path(input_dir)
+    found: list[Path] = []
+    for pattern in _HEADER_FILE_GLOBS:
+        found.extend(sorted(input_dir.glob(pattern)))
+    return found
+
+
+def copy_companion_header_files(
+    header_files: list[Path], output_dir: Path | str
+) -> list[Path]:
+    """Copy *header_files* verbatim into *output_dir*, preserving filenames.
+
+    These headers reference the per-channel data files by their exact
+    original filenames, so the corresponding exported channel files must
+    also keep their original names (no ``_corrected`` suffix) for the
+    copied headers to resolve correctly.
+    """
+    output_dir = Path(output_dir)
+    copied: list[Path] = []
+    for src in header_files:
+        dst = output_dir / src.name
+        shutil.copy2(src, dst)
+        copied.append(dst)
+    return copied
 
 
 class H5FileManager:
