@@ -1364,6 +1364,14 @@ class ChromaticShiftWidget(QWidget):
     def _get_roi_bounds(self) -> tuple[int, int, int, int] | None:
         """Extract the bounding box of the last drawn rectangle.
 
+        The rectangle can be drawn (or dragged) partially or fully outside
+        the loaded volume's extent, since napari does not constrain shape
+        drawing to the image bounds. Clip to ``[0, min_shape)`` so the
+        resulting sub-volume always overlaps real data — otherwise
+        ``extract_subvolume`` can silently return a zero-length axis, which
+        later crashes FFT-based registration with "Invalid number of FFT
+        data points (0)".
+
         Returns (y_start, y_end, x_start, x_end) or None.
         """
         if self._shapes_layer is None or len(self._shapes_layer.data) == 0:
@@ -1372,7 +1380,18 @@ class ChromaticShiftWidget(QWidget):
         # rect is Nx2 array of (row, col) vertices
         ys = rect[:, 0]
         xs = rect[:, 1]
-        return int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+        y_start, y_end = int(ys.min()), int(ys.max())
+        x_start, x_end = int(xs.min()), int(xs.max())
+
+        if self.loaders:
+            max_y = min(ld.shape[1] for ld in self.loaders)
+            max_x = min(ld.shape[2] for ld in self.loaders)
+            y_start = max(0, min(y_start, max_y))
+            y_end = max(0, min(y_end, max_y))
+            x_start = max(0, min(x_start, max_x))
+            x_end = max(0, min(x_end, max_x))
+
+        return y_start, y_end, x_start, x_end
 
     def _on_load_preview(self) -> None:
         if not self.loaders:
