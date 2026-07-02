@@ -21,6 +21,7 @@ from chromatic_shift_corrector.perf_logger import log_event, timed_operation
 from chromatic_shift_corrector.utils import (
     apply_integer_shift_2d,
     build_metadata,
+    h5_output_filename,
     save_metadata,
 )
 
@@ -217,15 +218,17 @@ def _export_channel_roi_tiff(
     """Export an ROI-cropped corrected channel to a BigTIFF file."""
     rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
     out_nz = rz_e - rz_s
+    out_ny, out_nx = ry_e - ry_s, rx_e - rx_s
     sz, sy, sx = transform.shift_z, transform.shift_y, transform.shift_x
+    total_bytes = out_nz * out_ny * out_nx * 2
+    bytes_done = 0
 
     log_event(f"Export TIFF ROI channel: {output_path.name} | "
-              f"roi_shape=({out_nz},{ry_e - ry_s},{rx_e - rx_s}) "
+              f"roi_shape=({out_nz},{out_ny},{out_nx}) "
               f"shift=({sz},{sy},{sx}) chunk_z={chunk_z}")
 
     with timed_operation(f"Write TIFF ROI: {output_path.name}"):
         with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
-            planes_done = 0
             for slab_start in range(0, out_nz, chunk_z):
                 if cancel_check and cancel_check():
                     return
@@ -238,9 +241,9 @@ def _export_channel_roi_tiff(
                 for i in range(slab.shape[0]):
                     tw.write(slab[i], photometric="minisblack", contiguous=True)
 
-                planes_done += slab.shape[0]
+                bytes_done += slab.nbytes
                 if progress_callback:
-                    progress_callback(planes_done, out_nz)
+                    progress_callback(bytes_done, total_bytes)
 
 
 def export_channel(
@@ -268,7 +271,7 @@ def export_channel(
     chunk_z : int
         Number of Z-planes per processing chunk.
     progress_callback : callable, optional
-        Called with (planes_completed, total_planes) after each chunk.
+        Called with (bytes_written, total_bytes) after each chunk.
     cancel_check : callable, optional
         Called before each chunk; if it returns True, export is aborted.
     roi : tuple, optional
@@ -288,9 +291,11 @@ def export_channel(
     log_event(f"Export TIFF channel: {output_path.name} | "
               f"shape=({nz},{ny},{nx}) shift=({sz},{sy},{sx}) chunk_z={chunk_z}")
 
+    total_bytes = nz * ny * nx * 2
+    bytes_done = 0
+
     with timed_operation(f"Write TIFF: {output_path.name}"):
         with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
-            planes_done = 0
             for out_z_start in range(0, nz, chunk_z):
                 if cancel_check and cancel_check():
                     return
@@ -326,9 +331,9 @@ def export_channel(
                         contiguous=True,
                     )
 
-                planes_done += n_planes
+                bytes_done += slab.nbytes
                 if progress_callback:
-                    progress_callback(planes_done, nz)
+                    progress_callback(bytes_done, total_bytes)
 
 
 def run_export(
@@ -355,8 +360,8 @@ def run_export(
     ram_percent : int
         Percentage of system RAM to allocate.
     progress_callback : callable, optional
-        Called with (current_step, total_steps) where total_steps accounts for
-        all planes across all channels.
+        Called with (bytes_written, total_bytes) accounting for all
+        channels.
     cancel_check : callable, optional
         Return True to abort.
     voxel_xy, voxel_z : float
@@ -379,26 +384,28 @@ def run_export(
         rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
         roi_ny, roi_nx = ry_e - ry_s, rx_e - rx_s
         xy_shape = (roi_ny, roi_nx)
-        planes_per_channel = rz_e - rz_s
+        bytes_per_channel = (rz_e - rz_s) * roi_ny * roi_nx * 2
         suffix = "_corrected_roi"
     else:
         xy_shape = (ref_shape[1], ref_shape[2])
-        planes_per_channel = None  # varies per loader
+        bytes_per_channel = None  # varies per loader
         suffix = "_corrected"
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
 
-    # Total planes across all channels for progress reporting.
+    # Total bytes across all channels for progress reporting.
     if roi is not None:
-        total_planes = planes_per_channel * n_channels
+        total_bytes = bytes_per_channel * n_channels
     else:
-        total_planes = sum(loader.shape[0] for loader in loaders)
-    global_done = 0
+        total_bytes = sum(
+            loader.shape[0] * loader.shape[1] * loader.shape[2] * 2
+            for loader in loaders
+        )
+    global_bytes_done = 0
 
     def _channel_progress(done: int, _total: int) -> None:
-        nonlocal global_done
         if progress_callback:
-            progress_callback(global_done + done, total_planes)
+            progress_callback(global_bytes_done + done, total_bytes)
 
     for i, (loader, transform) in enumerate(
         zip(loaders, shift_manager.transforms)
@@ -417,9 +424,9 @@ def run_export(
             roi=roi,
         )
         if roi is not None:
-            global_done += planes_per_channel
+            global_bytes_done += bytes_per_channel
         else:
-            global_done += loader.shape[0]
+            global_bytes_done += loader.shape[0] * loader.shape[1] * loader.shape[2] * 2
 
     # Write metadata.
     channel_dicts = shift_manager.to_channel_dicts(output_suffix=suffix)
@@ -431,6 +438,8 @@ def run_export(
         channel_dicts, ref_idx, voxel_xy, voxel_z, vol_shape, ram_percent,
         roi_bounds=roi,
     )
+    metadata["bytes_written"] = total_bytes
+    metadata["bytes_written_gb"] = round(total_bytes / (1024**3), 3)
     meta_path = save_metadata(metadata, output_dir)
     return meta_path
 
@@ -469,7 +478,11 @@ def export_channel_h5(
     chunk_z : int
         Number of Z-planes per processing chunk.
     progress_callback : callable, optional
-        Called with (planes_completed, total_planes) after each chunk.
+        Called with (bytes_written, total_bytes) after each chunk write and
+        after each regenerated pyramid level. Tracking *bytes* rather than
+        Z-planes means the (often slow) pyramid-regeneration phase \u2014 which
+        happens after ``Data`` is fully written \u2014 still moves the progress
+        indicator instead of leaving it stuck at "100%".
     cancel_check : callable, optional
         Called before each chunk; if True, abort.
     roi : tuple, optional
@@ -478,6 +491,7 @@ def export_channel_h5(
     import h5py
 
     from chromatic_shift_corrector.h5_utils import (
+        compute_pyramid_level_shape,
         detect_pyramid_levels,
         generate_pyramid_level,
     )
@@ -503,6 +517,13 @@ def export_channel_h5(
     # Clamp chunk sizes to output dimensions for ROI exports.
     h5_chunks = tuple(min(c, d) for c, d in zip(orig_chunks, (out_nz, out_ny, out_nx)))
 
+    pyramid_levels = detect_pyramid_levels(original_h5)
+    total_bytes = out_nz * out_ny * out_nx * 2
+    for _name, fw, fh, fd in pyramid_levels:
+        pnz, pny, pnx = compute_pyramid_level_shape((out_nz, out_ny, out_nx), fw, fh, fd)
+        total_bytes += pnz * pny * pnx * 2
+    bytes_done = 0
+
     with timed_operation(f"Write H5: {output_path.name}"):
         with h5py.File(str(output_path), "w") as out_h5:
             # Create output Data dataset.
@@ -515,7 +536,6 @@ def export_channel_h5(
 
             if roi is not None:
                 # ROI export: read only the needed sub-region.
-                planes_done = 0
                 for slab_start in range(0, out_nz, chunk_z):
                     if cancel_check and cancel_check():
                         return
@@ -526,12 +546,11 @@ def export_channel_h5(
                     )
                     ds[slab_start:slab_end] = slab
 
-                    planes_done += slab.shape[0]
+                    bytes_done += slab.nbytes
                     if progress_callback:
-                        progress_callback(planes_done, out_nz)
+                        progress_callback(bytes_done, total_bytes)
             else:
                 # Full-volume export.
-                planes_done = 0
                 for out_z_start in range(0, nz, chunk_z):
                     if cancel_check and cancel_check():
                         return
@@ -559,9 +578,9 @@ def export_channel_h5(
 
                     ds[out_z_start:out_z_end] = slab
 
-                    planes_done += n_planes
+                    bytes_done += slab.nbytes
                     if progress_callback:
-                        progress_callback(planes_done, nz)
+                        progress_callback(bytes_done, total_bytes)
 
             # Copy metadata verbatim.
             if "metadata" in original_h5:
@@ -569,7 +588,6 @@ def export_channel_h5(
                 out_h5.create_dataset("metadata", data=raw_meta)
 
             # Regenerate pyramid levels.
-            pyramid_levels = detect_pyramid_levels(original_h5)
             for level_name, fw, fh, fd in pyramid_levels:
                 if cancel_check and cancel_check():
                     return
@@ -580,6 +598,14 @@ def export_channel_h5(
 
                 logger.info("Regenerating pyramid level %s (factors %d\u00d7%d\u00d7%d)", level_name, fw, fh, fd)
                 generate_pyramid_level(out_h5, level_name, fw, fh, fd, chunks=pyr_chunks)
+
+                pnz, pny, pnx = compute_pyramid_level_shape(
+                    (out_nz, out_ny, out_nx), fw, fh, fd
+                )
+                if pnz > 0 and pny > 0 and pnx > 0:
+                    bytes_done += pnz * pny * pnx * 2
+                    if progress_callback:
+                        progress_callback(bytes_done, total_bytes)
 
 
 def run_export_h5(
@@ -619,6 +645,8 @@ def run_export_h5(
     Path
         Path to the written metadata JSON file.
     """
+    from chromatic_shift_corrector.h5_utils import compute_pyramid_level_shape
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -629,39 +657,47 @@ def run_export_h5(
         rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
         roi_ny, roi_nx = ry_e - ry_s, rx_e - rx_s
         xy_shape = (roi_ny, roi_nx)
-        planes_per_channel = rz_e - rz_s
         suffix = "_corrected_roi"
     else:
+        # Full-volume export keeps the original filenames (no suffix) so
+        # that any companion Imaris (.ims) / BigDataViewer (_bdv.h5,
+        # _bdv.xml) header files copied alongside continue to resolve
+        # their internal references to the per-channel files.
         xy_shape = (ref_shape[1], ref_shape[2])
-        planes_per_channel = None
-        suffix = "_corrected"
+        suffix = ""
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
 
-    if roi is not None:
-        total_planes = planes_per_channel * n_channels
-    else:
-        total_planes = sum(loader.shape[0] for loader in loaders)
-    global_done = 0
+    # Track progress in bytes rather than Z-planes: pyramid regeneration
+    # (which runs after "Data" is fully written, per channel) writes no
+    # planes of its own, so a plane-based total would leave the progress
+    # indicator stuck once Data finishes while pyramids are still churning.
+    def _channel_out_shape(loader: Any) -> tuple[int, int, int]:
+        if roi is not None:
+            return (rz_e - rz_s, ry_e - ry_s, rx_e - rx_s)
+        return loader.shape
+
+    def _channel_total_bytes(loader: Any) -> int:
+        out_shape = _channel_out_shape(loader)
+        total = out_shape[0] * out_shape[1] * out_shape[2] * 2
+        for _name, fw, fh, fd in loader.pyramid_levels:
+            pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
+            if all(d > 0 for d in pshape):
+                total += pshape[0] * pshape[1] * pshape[2] * 2
+        return total
+
+    channel_bytes = [_channel_total_bytes(loader) for loader in loaders]
+    total_bytes = sum(channel_bytes)
+    global_bytes_done = 0
 
     def _channel_progress(done: int, _total: int) -> None:
-        nonlocal global_done
         if progress_callback:
-            progress_callback(global_done + done, total_planes)
+            progress_callback(global_bytes_done + done, total_bytes)
 
     for i, (loader, transform) in enumerate(
         zip(loaders, shift_manager.transforms)
     ):
-        # Output filename: {stem}{suffix}.lux.h5 or {stem}{suffix}.h5.
-        name = transform.filename
-        if name.lower().endswith(".lux.h5"):
-            stem = name[: -len(".lux.h5")]
-            out_name = f"{stem}{suffix}.lux.h5"
-        elif name.lower().endswith(".h5"):
-            stem = name[: -len(".h5")]
-            out_name = f"{stem}{suffix}.h5"
-        else:
-            out_name = f"{name}{suffix}.lux.h5"
+        out_name = h5_output_filename(transform.filename, suffix)
         out_path = output_dir / out_name
 
         export_channel_h5(
@@ -674,10 +710,7 @@ def run_export_h5(
             cancel_check=cancel_check,
             roi=roi,
         )
-        if roi is not None:
-            global_done += planes_per_channel
-        else:
-            global_done += loader.shape[0]
+        global_bytes_done += channel_bytes[i]
 
     # Build metadata with H5-specific fields.
     channel_dicts = shift_manager.to_channel_dicts(output_suffix=suffix)
@@ -686,14 +719,7 @@ def run_export_h5(
     # Augment channel dicts with H5-specific info.
     for i, cd in enumerate(channel_dicts):
         loader = loaders[i]
-        # Fix corrected filename to match H5 naming.
-        name = cd["filename_original"]
-        if name.lower().endswith(".lux.h5"):
-            stem = name[: -len(".lux.h5")]
-            cd["filename_corrected"] = f"{stem}{suffix}.lux.h5"
-        elif name.lower().endswith(".h5"):
-            stem = name[: -len(".h5")]
-            cd["filename_corrected"] = f"{stem}{suffix}.h5"
+        cd["filename_corrected"] = h5_output_filename(cd["filename_original"], suffix)
 
         # Add channel_description and pyramid info.
         cd["channel_description"] = loader.channel_description
@@ -710,6 +736,28 @@ def run_export_h5(
     )
     metadata["input_format"] = "luxendo_h5"
     metadata["voxel_size_source"] = "h5_metadata"
+    metadata["bytes_written"] = total_bytes
+    metadata["bytes_written_gb"] = round(total_bytes / (1024**3), 3)
+
+    # Full-volume exports keep original filenames, so copy any companion
+    # Imaris/BigDataViewer header files (.ims, *_bdv.h5, *_bdv.xml) from the
+    # input directory alongside the exported data — a ROI-cropped export has
+    # different dimensions and can't be opened via the original headers.
+    if roi is None:
+        from chromatic_shift_corrector.h5_utils import (
+            copy_companion_header_files,
+            find_companion_header_files,
+        )
+
+        input_dir = loaders[0].path.parent
+        header_files = find_companion_header_files(input_dir)
+        if header_files:
+            copied = copy_companion_header_files(header_files, output_dir)
+            log_event(
+                "Copied companion header files: "
+                + ", ".join(p.name for p in copied)
+            )
+            metadata["companion_header_files"] = [p.name for p in copied]
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path

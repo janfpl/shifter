@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 from qtpy.QtCore import QThread, Signal, Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -52,11 +53,20 @@ from chromatic_shift_corrector.perf_logger import (
     timed_operation,
     log_event,
 )
-from chromatic_shift_corrector.h5_utils import H5FileManager, scan_h5_files
+from chromatic_shift_corrector.h5_utils import (
+    H5FileManager,
+    find_companion_header_files,
+    scan_h5_files,
+)
 from chromatic_shift_corrector.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
 from chromatic_shift_corrector.shift_manager import ShiftManager
-from chromatic_shift_corrector.utils import DEFAULT_COLORMAPS, MAX_CHANNELS, parse_voxel_size_from_xml
+from chromatic_shift_corrector.utils import (
+    DEFAULT_COLORMAPS,
+    MAX_CHANNELS,
+    h5_output_filename,
+    parse_voxel_size_from_xml,
+)
 from chromatic_shift_corrector.registration import (
     ALGORITHM_REGISTRY,
     MAX_SEARCH_RANGE,
@@ -65,6 +75,7 @@ from chromatic_shift_corrector.registration import (
     GUIDANCE_TEXT,
     RegistrationResult,
     confidence_color_rgb,
+    estimate_registration_bytes,
     gpu_available,
     gpu_fail_reason,
     gpu_name,
@@ -89,7 +100,9 @@ COLORMAP_OPTIONS = [
 class ExportWorker(QThread):
     """Background thread for full-volume export (BigTIFF or H5)."""
 
-    progress = Signal(int, int)  # (planes_done, total_planes)
+    # object (not int): byte counts for large exports can exceed the
+    # ~2.1 GB range of a 32-bit Qt "int" signal argument.
+    progress = Signal(object, object)  # (bytes_written, total_bytes)
     finished = Signal(str)  # metadata path or empty on cancel
     error = Signal(str)
 
@@ -185,6 +198,15 @@ class RegistrationWorker(QThread):
         try:
             results = self._run_registration()
             self.finished.emit(results)
+        except MemoryError:
+            self.error.emit(
+                "Ran out of memory while registering this sub-volume. "
+                "Large ROIs and Z ranges require several full-precision "
+                "copies of the data in RAM at once for FFT-based algorithms.\n\n"
+                "Try shrinking the ROI rectangle or the Z range, closing "
+                "other applications to free up RAM, or switching to a "
+                "smaller search range."
+            )
         except Exception:
             self.error.emit(traceback.format_exc())
 
@@ -1059,7 +1081,7 @@ class ChromaticShiftWidget(QWidget):
                     self._pyramid_max_level,
                 )
                 if len(subset) > 1:
-                    self.viewer.add_image(
+                    layer = self.viewer.add_image(
                         subset,
                         name=f"ch{i}_{t.filename}",
                         colormap=t.colormap,
@@ -1068,7 +1090,7 @@ class ChromaticShiftWidget(QWidget):
                         multiscale=True,
                     )
                 else:
-                    self.viewer.add_image(
+                    layer = self.viewer.add_image(
                         subset[0],
                         name=f"ch{i}_{t.filename}",
                         colormap=t.colormap,
@@ -1076,13 +1098,14 @@ class ChromaticShiftWidget(QWidget):
                         visible=True,
                     )
             else:
-                self.viewer.add_image(
+                layer = self.viewer.add_image(
                     loader.dask_array,
                     name=f"ch{i}_{t.filename}",
                     colormap=t.colormap,
                     blending="additive",
                     visible=True,
                 )
+            layer.reset_contrast_limits()
 
     def _close_loaders(self) -> None:
         for ld in self.loaders:
@@ -1230,6 +1253,26 @@ class ChromaticShiftWidget(QWidget):
             norm_text = self.combo_normalization.currentText()
             algo_kwargs["normalization"] = "phase" if norm_text == "Phase" else None
 
+        # Warn if the sub-volume is large enough that CPU registration is
+        # likely to run out of memory (FFT-based algorithms hold several
+        # float64/complex128 copies of the whole sub-volume at once).
+        est_bytes = estimate_registration_bytes((roi_nz, roi_ny, roi_nx), algo_name)
+        available_bytes = psutil.virtual_memory().available
+        if est_bytes > 0.7 * available_bytes:
+            ans = QMessageBox.warning(
+                self,
+                "ROI May Be Too Large",
+                f"Registering this sub-volume ({roi_nx}×{roi_ny}×{roi_nz} voxels) "
+                f"with {algo_name} may need ~{est_bytes / (1024**3):.1f} GB of RAM, "
+                f"but only ~{available_bytes / (1024**3):.1f} GB is currently available.\n\n"
+                "This is likely to fail with an out-of-memory error. Consider "
+                "shrinking the ROI rectangle or the Z range before running "
+                "registration.\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
         ref_idx = self.shift_manager.reference_index
         if ref_idx is None:
             QMessageBox.warning(self, "No Reference", "No reference channel set.")
@@ -1364,6 +1407,14 @@ class ChromaticShiftWidget(QWidget):
     def _get_roi_bounds(self) -> tuple[int, int, int, int] | None:
         """Extract the bounding box of the last drawn rectangle.
 
+        The rectangle can be drawn (or dragged) partially or fully outside
+        the loaded volume's extent, since napari does not constrain shape
+        drawing to the image bounds. Clip to ``[0, min_shape)`` so the
+        resulting sub-volume always overlaps real data — otherwise
+        ``extract_subvolume`` can silently return a zero-length axis, which
+        later crashes FFT-based registration with "Invalid number of FFT
+        data points (0)".
+
         Returns (y_start, y_end, x_start, x_end) or None.
         """
         if self._shapes_layer is None or len(self._shapes_layer.data) == 0:
@@ -1372,7 +1423,18 @@ class ChromaticShiftWidget(QWidget):
         # rect is Nx2 array of (row, col) vertices
         ys = rect[:, 0]
         xs = rect[:, 1]
-        return int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+        y_start, y_end = int(ys.min()), int(ys.max())
+        x_start, x_end = int(xs.min()), int(xs.max())
+
+        if self.loaders:
+            max_y = min(ld.shape[1] for ld in self.loaders)
+            max_x = min(ld.shape[2] for ld in self.loaders)
+            y_start = max(0, min(y_start, max_y))
+            y_end = max(0, min(y_end, max_y))
+            x_start = max(0, min(x_start, max_x))
+            x_end = max(0, min(x_end, max_x))
+
+        return y_start, y_end, x_start, x_end
 
     def _on_load_preview(self) -> None:
         if not self.loaders:
@@ -1431,7 +1493,7 @@ class ChromaticShiftWidget(QWidget):
 
             layer_name = f"{t.filename}_preview_corrected"
             self._preview_layer_names.append(layer_name)
-            self.viewer.add_image(
+            preview_layer = self.viewer.add_image(
                 shifted,
                 name=layer_name,
                 colormap=t.colormap,
@@ -1439,6 +1501,7 @@ class ChromaticShiftWidget(QWidget):
                 translate=(z_start, y_start, x_start),
                 visible=True,
             )
+            preview_layer.reset_contrast_limits()
 
         # Build and display MIP panel.
         self._build_and_show_mip(shifted_volumes, colormaps)
@@ -1503,7 +1566,7 @@ class ChromaticShiftWidget(QWidget):
             t = self.shift_manager[i]
             layer_name = f"MIP ch{i}_{t.filename}"
             self._mip_channel_layer_names.append(layer_name)
-            self.viewer.add_image(
+            mip_layer = self.viewer.add_image(
                 panel,
                 name=layer_name,
                 colormap=cmap,
@@ -1511,6 +1574,7 @@ class ChromaticShiftWidget(QWidget):
                 translate=self._mip_translate,
                 interpolation2d="nearest",
             )
+            mip_layer.reset_contrast_limits()
 
         # Add crosshair overlay on top.
         crosshair = self._build_crosshair_image()
@@ -1651,13 +1715,35 @@ class ChromaticShiftWidget(QWidget):
             roi = (z_start, z_end, y_start, y_end, x_start, x_end)
 
         # Check for existing corrected files.
-        suffix = "_corrected_roi" if roi else "_corrected"
-        channel_dicts = self.shift_manager.to_channel_dicts(output_suffix=suffix)
-        existing = [
-            d["filename_corrected"]
-            for d in channel_dicts
-            if (outdir_path / d["filename_corrected"]).exists()
-        ]
+        if roi:
+            suffix = "_corrected_roi"
+        elif self._input_format == "h5":
+            # Full-volume H5 export keeps original filenames so companion
+            # Imaris/BigDataViewer headers keep working.
+            suffix = ""
+        else:
+            suffix = "_corrected"
+
+        if self._input_format == "h5":
+            out_names = [
+                h5_output_filename(t.filename, suffix)
+                for t in self.shift_manager.transforms
+            ]
+        else:
+            channel_dicts = self.shift_manager.to_channel_dicts(output_suffix=suffix)
+            out_names = [d["filename_corrected"] for d in channel_dicts]
+
+        existing = [name for name in out_names if (outdir_path / name).exists()]
+
+        # A full-volume H5 export also copies companion header files
+        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory, if present.
+        header_files: list[Path] = []
+        if roi is None and self._input_format == "h5":
+            header_files = find_companion_header_files(self.loaders[0].path.parent)
+            existing.extend(
+                f.name for f in header_files if (outdir_path / f.name).exists()
+            )
+
         if existing:
             ans = QMessageBox.question(
                 self,
@@ -1705,6 +1791,12 @@ class ChromaticShiftWidget(QWidget):
             lines.append(f"\nExport region: Full volume")
             lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
 
+        if header_files:
+            lines.append(
+                "\nCompanion header files to copy: "
+                + ", ".join(f.name for f in header_files)
+            )
+
         total_bytes = sum(sizes)
         lines.append(f"Estimated total output size: {total_bytes / (1024**3):.2f} GB")
         lines.append(f"RAM allocation: {ram_pct}%")
@@ -1744,17 +1836,30 @@ class ChromaticShiftWidget(QWidget):
         if total > 0:
             pct = int(100 * done / total)
             self.progress_bar.setValue(pct)
-            self.lbl_progress.setText(f"Processing: {done}/{total} planes ({pct}%)")
+            done_gb = done / (1024**3)
+            total_gb = total / (1024**3)
+            self.lbl_progress.setText(
+                f"Processing: {done_gb:.2f}/{total_gb:.2f} GB written ({pct}%)"
+            )
 
     def _on_export_finished(self, meta_path: str) -> None:
         self._set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.lbl_progress.setVisible(False)
         if meta_path:
+            written_gb = ""
+            try:
+                from chromatic_shift_corrector.utils import load_metadata
+
+                meta = load_metadata(Path(meta_path))
+                if "bytes_written_gb" in meta:
+                    written_gb = f"\nTotal data written: {meta['bytes_written_gb']:.2f} GB"
+            except Exception:
+                pass
             QMessageBox.information(
                 self,
                 "Export Complete",
-                f"All channels exported successfully.\nMetadata: {meta_path}",
+                f"All channels exported successfully.\nMetadata: {meta_path}{written_gb}",
             )
         else:
             QMessageBox.information(self, "Cancelled", "Export was cancelled.")

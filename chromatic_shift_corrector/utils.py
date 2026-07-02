@@ -91,6 +91,22 @@ def apply_integer_shift_2d(plane: np.ndarray, shift_yx: tuple[int, int]) -> np.n
     return result
 
 
+def h5_output_filename(original_filename: str, suffix: str) -> str:
+    """Build the export filename for a Luxendo H5 channel.
+
+    Handles the double ``.lux.h5`` extension correctly (a naive
+    "split on the last dot" would produce e.g. ``foo.lux_corrected.h5``
+    instead of ``foo_corrected.lux.h5``).
+    """
+    if original_filename.lower().endswith(".lux.h5"):
+        stem = original_filename[: -len(".lux.h5")]
+        return f"{stem}{suffix}.lux.h5"
+    if original_filename.lower().endswith(".h5"):
+        stem = original_filename[: -len(".h5")]
+        return f"{stem}{suffix}.h5"
+    return f"{original_filename}{suffix}.lux.h5"
+
+
 def build_metadata(
     channels: list[dict[str, Any]],
     reference_index: int,
