@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,7 +18,13 @@ import numpy as np
 import psutil
 import tifffile
 
-from chromatic_shift_corrector.perf_logger import log_event, timed_operation
+from chromatic_shift_corrector.perf_logger import (
+    is_debug_enabled,
+    log_debug,
+    log_event,
+    log_memory,
+    timed_operation,
+)
 from chromatic_shift_corrector.utils import (
     apply_integer_shift_2d,
     build_metadata,
@@ -35,44 +42,93 @@ logger = logging.getLogger(__name__)
 _XY_WORKERS = min(os.cpu_count() or 1, 16)
 
 
+# --- Chunk-size policy ----------------------------------------------------- #
+# Materialising one export slab via ``np.asarray(dask_arr[read_start:read_end])``
+# transiently holds several full-size copies of the slab in RAM at once: dask
+# reads the source chunks, then ``concatenate3`` allocates a *fresh* output
+# buffer while those inputs are still alive (~2x the slab), and the caller then
+# copies that result into a zero-initialised output slab (another 1x). Budgeting
+# for this many copies keeps the true peak within the RAM allowance rather than
+# the ~2x the old model assumed.
+_SLAB_PEAK_COPIES = 3
+
+# Hard cap on the *output* bytes of a single slab, independent of installed RAM.
+# Export throughput is bound by disk I/O and per-chunk decode, not by how many
+# Z-planes are batched into one read, so there is no speed benefit to building
+# enormous slabs -- only a large, fragile memory footprint. This cap is what
+# prevents a high-RAM machine from sizing a slab at, e.g., 57 GiB and then
+# running out of memory when the system is already loaded.
+_MAX_SLAB_BYTES = 4 * 1024**3
+
+
 def compute_chunk_size(
     xy_shape: tuple[int, int],
-    n_channels: int,
+    n_channels: int = 1,
     ram_percent: int = 90,
     bytes_per_voxel: int = 2,
 ) -> int:
-    """Determine how many Z-planes to process per chunk.
+    """Determine how many Z-planes to process per slab.
 
-    We need to hold *n_channels* input slabs plus *n_channels* output slabs
-    simultaneously. Each slab has shape (chunk_z, Y, X) at *bytes_per_voxel*.
+    The returned ``chunk_z`` is bounded by two independent limits:
+
+    1. **Available RAM.** At most *ram_percent* of the *currently available*
+       system memory (``psutil.virtual_memory().available``, **not** ``.total``)
+       may be consumed by the transient full-size copies made while a slab is
+       read, concatenated by dask, and written. The previous implementation
+       budgeted against total RAM, which is why an export could size a slab at
+       ~57 GiB on a machine that was already >90% full and then crash with an
+       ``ArrayMemoryError``.
+    2. **An absolute slab-size cap** (:data:`_MAX_SLAB_BYTES`) so that even on a
+       machine with hundreds of GiB free, a single slab stays modest. Larger
+       slabs do not export any faster (the pipeline is disk-bound) but multiply
+       peak RAM, GC pressure, and the blast radius of a bad estimate.
+
+    Channels are exported strictly sequentially (see :func:`run_export` /
+    :func:`run_export_h5`), so only one channel's slab is ever resident at a
+    time; *n_channels* therefore no longer scales the budget and is retained
+    only for backward compatibility with existing callers.
 
     Parameters
     ----------
     xy_shape : (int, int)
-        (Y, X) dimensions.
+        (Y, X) dimensions of a single plane.
     n_channels : int
-        Number of channels.
+        Number of channels (unused; kept for backward compatibility).
     ram_percent : int
-        Percentage of system RAM to use (50-95).
+        Percentage of *available* system RAM to use (50-95).
     bytes_per_voxel : int
         Bytes per voxel (2 for uint16).
 
     Returns
     -------
     int
-        Number of Z-planes per processing chunk (>= 1).
+        Number of Z-planes per processing slab (>= 1).
     """
-    total_ram = psutil.virtual_memory().total
-    available = int(total_ram * ram_percent / 100)
+    available = psutil.virtual_memory().available
+    budget = int(available * ram_percent / 100)
 
     ny, nx = xy_shape
-    plane_bytes = ny * nx * bytes_per_voxel
+    plane_bytes = max(1, ny * nx * bytes_per_voxel)
 
-    # Each chunk we need: n_channels * chunk_z planes for reading
-    # + n_channels * chunk_z planes for writing = 2 * n_channels * chunk_z
-    bytes_per_z = 2 * n_channels * plane_bytes
+    # Peak RAM per Z-plane while a slab is read, concatenated, and copied.
+    peak_bytes_per_z = plane_bytes * _SLAB_PEAK_COPIES
+    chunk_z_by_ram = budget // peak_bytes_per_z
+    chunk_z_by_cap = _MAX_SLAB_BYTES // plane_bytes
 
-    chunk_z = max(1, available // bytes_per_z)
+    chunk_z = max(1, int(min(chunk_z_by_ram, chunk_z_by_cap)))
+
+    log_debug(
+        "compute_chunk_size: chunk_z=%d (ram-bound=%d, cap-bound=%d) | "
+        "plane=%.1fMiB slab_out=%.2fGiB est_peak=%.2fGiB | "
+        "budget=%.2fGiB avail=%.2fGiB ram%%=%d n_channels=%d"
+        % (
+            chunk_z, chunk_z_by_ram, chunk_z_by_cap,
+            plane_bytes / 1024**2,
+            chunk_z * plane_bytes / 1024**3,
+            chunk_z * peak_bytes_per_z / 1024**3,
+            budget / 1024**3, available / 1024**3, ram_percent, n_channels,
+        )
+    )
     return chunk_z
 
 
@@ -122,6 +178,76 @@ def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
             list(pool.map(_shift_plane, range(n_planes)))
 
     return slab
+
+
+def _read_full_slab(
+    dask_arr: da.Array,
+    out_z_start: int,
+    out_z_end: int,
+    sz: int,
+) -> np.ndarray:
+    """Read a full-XY Z-slab for a full-volume export, with the Z-shift applied.
+
+    Returns a writable ``(n_planes, ny, nx)`` uint16 array whose planes are the
+    source planes offset by *sz* along Z and zero-padded where the shifted read
+    window falls outside the source volume.
+
+    When the shifted window lies fully inside the volume -- the common interior
+    case, i.e. every slab except the one or two at the shifted Z-boundary -- the
+    materialised dask result is returned directly. This avoids allocating a
+    second full-size slab and copying into it, which previously doubled the peak
+    RAM of the read step. Only boundary slabs (or a slab entirely outside the
+    source range) allocate a zero-filled buffer.
+    """
+    nz, ny, nx = dask_arr.shape
+    n_planes = out_z_end - out_z_start
+
+    in_z_start = out_z_start - sz
+    in_z_end = out_z_end - sz
+    read_start = max(in_z_start, 0)
+    read_end = min(in_z_end, nz)
+
+    if read_start >= read_end:
+        # Entire slab maps outside the source volume -> all zeros.
+        return np.zeros((n_planes, ny, nx), dtype=np.uint16)
+
+    raw = np.asarray(dask_arr[read_start:read_end])
+
+    if read_start == in_z_start and read_end == in_z_end:
+        # No Z-padding needed: the read already covers every output plane, so
+        # return the freshly materialised array directly instead of allocating
+        # and copying into a second full-size slab. This is safe to mutate in
+        # place (the subsequent XY shift does so): computing a dask slice yields
+        # a freshly allocated array, and the production sources (h5py datasets,
+        # zarr stores) always copy out of storage on read, so ``raw`` never
+        # aliases any live buffer the caller still needs.
+        return raw
+
+    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+    dst_start = read_start - in_z_start
+    slab[dst_start : dst_start + (read_end - read_start)] = raw
+    return slab
+
+
+def _log_slab_perf(
+    kind: str,
+    name: str,
+    z_start: int,
+    z_end: int,
+    nbytes: int,
+    t0: float,
+) -> None:
+    """Emit a DEBUG per-slab timing/throughput line plus a memory snapshot."""
+    if not is_debug_enabled():
+        return
+    dt = time.perf_counter() - t0
+    mib = nbytes / 1024**2
+    mibps = mib / dt if dt > 0 else 0.0
+    log_debug(
+        f"slab {kind} {name} z=[{z_start}:{z_end}] planes={z_end - z_start} "
+        f"{mib:.1f}MiB in {dt * 1000:.0f}ms ({mibps:.0f} MiB/s)"
+    )
+    log_memory(f"{kind} {name} z=[{z_start}:{z_end}]")
 
 
 def _read_roi_slab(
@@ -234,12 +360,19 @@ def _export_channel_roi_tiff(
                     return
 
                 slab_end = min(slab_start + chunk_z, out_nz)
+
+                t0 = time.perf_counter()
                 slab = _read_roi_slab(
                     dask_arr, roi, slab_start, slab_end, sz, sy, sx,
                 )
 
                 for i in range(slab.shape[0]):
                     tw.write(slab[i], photometric="minisblack", contiguous=True)
+
+                _log_slab_perf(
+                    "TIFF-ROI", output_path.name, slab_start, slab_end,
+                    slab.nbytes, t0,
+                )
 
                 bytes_done += slab.nbytes
                 if progress_callback:
@@ -301,35 +434,25 @@ def export_channel(
                     return
 
                 out_z_end = min(out_z_start + chunk_z, nz)
-                n_planes = out_z_end - out_z_start
 
-                # Determine which input Z-planes we need.
-                in_z_start = out_z_start - sz
-                in_z_end = out_z_end - sz
-
-                # Clamp to valid input range and figure out padding.
-                read_start = max(in_z_start, 0)
-                read_end = min(in_z_end, nz)
-
-                if read_start >= read_end:
-                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                else:
-                    raw = np.asarray(dask_arr[read_start:read_end])
-                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                    dst_start = read_start - in_z_start
-                    dst_end = dst_start + (read_end - read_start)
-                    slab[dst_start:dst_end] = raw
+                t0 = time.perf_counter()
+                slab = _read_full_slab(dask_arr, out_z_start, out_z_end, sz)
 
                 # Apply XY shifts (parallel across planes).
                 slab = _shift_slab_xy(slab, sy, sx)
 
                 # Write planes.
-                for i in range(n_planes):
+                for i in range(slab.shape[0]):
                     tw.write(
                         slab[i],
                         photometric="minisblack",
                         contiguous=True,
                     )
+
+                _log_slab_perf(
+                    "TIFF", output_path.name, out_z_start, out_z_end,
+                    slab.nbytes, t0,
+                )
 
                 bytes_done += slab.nbytes
                 if progress_callback:
@@ -392,6 +515,12 @@ def run_export(
         suffix = "_corrected"
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
+    log_event(
+        f"TIFF export plan | channels={n_channels} chunk_z={chunk_z} "
+        f"xy=({xy_shape[0]},{xy_shape[1]}) ram%={ram_percent} "
+        f"roi={roi is not None}"
+    )
+    log_memory("TIFF export start", level=logging.INFO)
 
     # Total bytes across all channels for progress reporting.
     if roi is not None:
@@ -541,10 +670,17 @@ def export_channel_h5(
                         return
 
                     slab_end = min(slab_start + chunk_z, out_nz)
+
+                    t0 = time.perf_counter()
                     slab = _read_roi_slab(
                         dask_arr, roi, slab_start, slab_end, sz, sy, sx,
                     )
                     ds[slab_start:slab_end] = slab
+
+                    _log_slab_perf(
+                        "H5-ROI", output_path.name, slab_start, slab_end,
+                        slab.nbytes, t0,
+                    )
 
                     bytes_done += slab.nbytes
                     if progress_callback:
@@ -556,27 +692,19 @@ def export_channel_h5(
                         return
 
                     out_z_end = min(out_z_start + chunk_z, nz)
-                    n_planes = out_z_end - out_z_start
 
-                    in_z_start = out_z_start - sz
-                    in_z_end = out_z_end - sz
-
-                    read_start = max(in_z_start, 0)
-                    read_end = min(in_z_end, nz)
-
-                    if read_start >= read_end:
-                        slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                    else:
-                        raw = np.asarray(dask_arr[read_start:read_end])
-                        slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                        dst_start = read_start - in_z_start
-                        dst_end = dst_start + (read_end - read_start)
-                        slab[dst_start:dst_end] = raw
+                    t0 = time.perf_counter()
+                    slab = _read_full_slab(dask_arr, out_z_start, out_z_end, sz)
 
                     # Apply XY shifts (parallel across planes).
                     slab = _shift_slab_xy(slab, sy, sx)
 
                     ds[out_z_start:out_z_end] = slab
+
+                    _log_slab_perf(
+                        "H5", output_path.name, out_z_start, out_z_end,
+                        slab.nbytes, t0,
+                    )
 
                     bytes_done += slab.nbytes
                     if progress_callback:
@@ -667,6 +795,12 @@ def run_export_h5(
         suffix = ""
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
+    log_event(
+        f"H5 export plan | channels={n_channels} chunk_z={chunk_z} "
+        f"xy=({xy_shape[0]},{xy_shape[1]}) ram%={ram_percent} "
+        f"roi={roi is not None}"
+    )
+    log_memory("H5 export start", level=logging.INFO)
 
     # Track progress in bytes rather than Z-planes: pyramid regeneration
     # (which runs after "Data" is fully written, per channel) writes no

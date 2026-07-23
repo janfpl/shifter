@@ -85,6 +85,21 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 
 Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. Progress is reported in actual bytes written (not Z-planes), so for Luxendo H5 output the indicator keeps moving through pyramid regeneration instead of appearing to finish early. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, processing details, and the total bytes written (`bytes_written_gb`). ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
+The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
+
+### Export diagnostics
+
+Every export writes a `performance_log.txt` into the output directory with timestamped start/end markers and elapsed times for each phase. Set the `CSC_DEBUG` environment variable before launching to raise the log to **DEBUG** level, which additionally records the chunk-size decision (and which limit bound it), a memory snapshot at export start, and per-slab timing, throughput (MiB/s), and memory usage — useful for tracking down slow or memory-hungry exports:
+
+```bash
+# Windows (cmd)
+set CSC_DEBUG=1
+python -m chromatic_shift_corrector
+
+# macOS / Linux
+CSC_DEBUG=1 python -m chromatic_shift_corrector
+```
+
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
 - Luxendo H5 input produces H5 output with regenerated resolution pyramids and preserved metadata

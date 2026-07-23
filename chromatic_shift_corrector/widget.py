@@ -152,6 +152,24 @@ class ExportWorker(QThread):
                     roi=self.roi,
                 )
             self.finished.emit(str(meta_path) if not self._cancelled else "")
+        except MemoryError:
+            log_event("Export aborted: out of memory")
+            self.error.emit(
+                "Ran out of memory while exporting.\n\n"
+                "The export streams the volume in Z-slabs sized to fit the "
+                "selected RAM allocation, but the system had less free memory "
+                "than expected — other applications, cached data, or the "
+                "napari viewer itself all consume RAM that isn't available to "
+                "the export.\n\n"
+                "Try one of the following:\n"
+                "  • Lower the RAM allocation slider before exporting "
+                "(smaller slabs use less peak memory)\n"
+                "  • Close other applications to free up RAM\n"
+                "  • Export a smaller ROI instead of the full volume\n\n"
+                "A performance_log.txt has been written to the output folder. "
+                "Re-running with the CSC_DEBUG=1 environment variable set adds "
+                "detailed per-slab memory and timing diagnostics to it."
+            )
         except Exception:
             self.error.emit(traceback.format_exc())
 
