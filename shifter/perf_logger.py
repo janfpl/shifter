@@ -65,14 +65,20 @@ def _proc() -> Any:
     return _proc_handle
 
 
+def process_rss() -> int:
+    """Return this process's resident set size in bytes (0 if unavailable)."""
+    try:
+        return int(_proc().memory_info().rss)
+    except Exception:
+        return 0
+
+
 def memory_status() -> str:
     """Return a compact 'process RSS / system available / % used' string."""
     vm = psutil.virtual_memory()
-    try:
-        rss = _fmt_gib(_proc().memory_info().rss)
-    except Exception:
-        rss = "n/a"
-    return f"proc_rss={rss} sys_avail={_fmt_gib(vm.available)} ({vm.percent:.0f}% used)"
+    rss = process_rss()
+    rss_str = _fmt_gib(rss) if rss else "n/a"
+    return f"proc_rss={rss_str} sys_avail={_fmt_gib(vm.available)} ({vm.percent:.0f}% used)"
 
 
 def setup_perf_log(log_dir: str | Path, debug: bool | None = None) -> Path:

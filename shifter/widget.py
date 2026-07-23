@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,9 @@ from shifter.perf_logger import (
     setup_perf_log,
     timed_operation,
     log_event,
+    log_memory,
 )
+from shifter.memory import release_memory
 from shifter.h5_utils import (
     H5FileManager,
     find_companion_header_files,
@@ -196,6 +199,7 @@ class RegistrationWorker(QThread):
         background_subtraction: bool,
         gaussian_smoothing: bool,
         use_gpu: bool,
+        log_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -211,12 +215,27 @@ class RegistrationWorker(QThread):
         self.background_subtraction = background_subtraction
         self.gaussian_smoothing = gaussian_smoothing
         self.use_gpu = use_gpu
+        self.log_dir = log_dir
 
     def run(self) -> None:
+        # Route registration diagnostics to a performance_log.txt when we have a
+        # directory to write it into; guarded so a read-only location never
+        # breaks registration itself.
+        if self.log_dir is not None:
+            try:
+                setup_perf_log(self.log_dir)
+            except Exception:
+                pass
         try:
             results = self._run_registration()
+            # Registration allocates several float64 copies of the sub-volume;
+            # once done they are unreferenced but the allocator hoards the pages,
+            # which also shrinks the next export's RAM budget. Hand them back.
+            release_memory(use_gpu=self.use_gpu, context="registration")
             self.finished.emit(results)
         except MemoryError:
+            # Reclaim what we can so the app stays usable after an OOM.
+            release_memory(use_gpu=self.use_gpu, context="registration (after OOM)")
             self.error.emit(
                 "Ran out of memory while registering this sub-volume. "
                 "Large ROIs and Z ranges require several full-precision "
@@ -235,6 +254,7 @@ class RegistrationWorker(QThread):
                   f"channels={self.channels_to_register} "
                   f"search_xy={self.search_range_xy} search_z={self.search_range_z} "
                   f"gpu={self.use_gpu}")
+        log_memory("registration start", level=logging.INFO)
 
         # Extract reference sub-volume.
         ref_loader = self.loaders[self.reference_index]
@@ -1304,6 +1324,16 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_reg_progress.setText("Starting registration...")
         self.lbl_reg_result.setVisible(False)
 
+        # Where to write registration diagnostics (performance_log.txt): the
+        # chosen output directory if one is set, else the input data directory.
+        outdir_text = self.lbl_outdir.text().strip()
+        if outdir_text:
+            reg_log_dir: Path | None = Path(outdir_text)
+        elif self.loaders:
+            reg_log_dir = self.loaders[ref_idx].path.parent
+        else:
+            reg_log_dir = None
+
         self._registration_worker = RegistrationWorker(
             loaders=self.loaders,
             reference_index=ref_idx,
@@ -1318,6 +1348,7 @@ class ChromaticShiftWidget(QWidget):
             background_subtraction=self.chk_bg_sub.isChecked(),
             gaussian_smoothing=self.chk_gaussian.isChecked(),
             use_gpu=gpu_available(),
+            log_dir=reg_log_dir,
         )
         self._registration_worker.progress.connect(self._on_reg_progress)
         self._registration_worker.finished.connect(self._on_reg_finished)

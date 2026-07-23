@@ -77,6 +77,8 @@ Results populate the shift table with X/Y/Z voxel shifts and a confidence score 
 - Background subtraction (percentile-based)
 - Gaussian smoothing
 
+When registration finishes it releases the working memory it allocated (several full-precision copies of the sub-volume) back to the OS — running a garbage collection, freeing GPU/pinned memory pools when the GPU path was used, and trimming the process heap. This keeps the resident footprint from lingering at its peak, which also matters for a subsequent export: slab sizing is based on *available* RAM, so memory the process is still hoarding would otherwise shrink the export's budget. The performance log records a before/after memory snapshot (written to the output directory if one is selected, otherwise the input data directory) so you can see how much was reclaimed.
+
 ### 3. Adjust Shifts
 
 Shifts can be edited manually via spinboxes in the shift table. Use the preview button to visualize the corrected sub-volume in napari before committing to a full export.
