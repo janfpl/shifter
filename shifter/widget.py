@@ -280,13 +280,30 @@ class RegistrationWorker(QThread):
         algo_cls = ALGORITHM_REGISTRY[self.algorithm_name]
         algo = algo_cls(**self.algorithm_kwargs)
 
-        total = len(self.channels_to_register)
+        # Instantiate algorithm.
+        n = len(self.channels_to_register)
         results = []
+
+        # Progress is tracked at sub-channel resolution: each channel spans one
+        # unit, and the algorithm reports a fraction within it, so the bar keeps
+        # moving during a single (possibly long) mutual-information search rather
+        # than jumping once per channel. ``scale`` gives the bar smooth steps.
+        scale = 1000
+
+        def _emit(idx: int, frac: float) -> None:
+            frac = min(1.0, max(0.0, frac))
+            done = idx
+            remaining = n - idx - 1
+            self.progress.emit(
+                int((idx + frac) * scale),
+                n * scale,
+                f"Registering channel {idx + 1} of {n} — "
+                f"{done} done, {remaining} remaining",
+            )
 
         for idx, ch_i in enumerate(self.channels_to_register):
             loader = self.loaders[ch_i]
-            ch_name = Path(loader.dask_array.name).name if hasattr(loader.dask_array, 'name') else f"channel {ch_i}"
-            self.progress.emit(idx, total, f"Registering channel {idx + 1}/{total}...")
+            _emit(idx, 0.0)
 
             # Extract moving sub-volume.
             mov_vol = extract_subvolume(
@@ -303,6 +320,9 @@ class RegistrationWorker(QThread):
                 use_gpu=self.use_gpu,
             )
 
+            # Advance the bar within this channel as the algorithm searches.
+            channel_cb = lambda frac, _idx=idx: _emit(_idx, frac)
+
             # Run registration with GPU OOM fallback.
             with timed_operation(f"Registration channel {ch_i} ({self.algorithm_name})"):
                 try:
@@ -310,6 +330,7 @@ class RegistrationWorker(QThread):
                         ref_vol, mov_vol,
                         self.search_range_xy, self.search_range_z,
                         use_gpu=self.use_gpu,
+                        progress_callback=channel_cb,
                     )
                 except Exception:
                     # If GPU fails (e.g. OOM), retry on CPU.
@@ -318,16 +339,18 @@ class RegistrationWorker(QThread):
                             ref_vol, mov_vol,
                             self.search_range_xy, self.search_range_z,
                             use_gpu=False,
+                            progress_callback=channel_cb,
                         )
                     else:
                         raise
 
+            _emit(idx, 1.0)
             log_event(f"Registration channel {ch_i} result: "
                       f"shift=({result.shift_z},{result.shift_y},{result.shift_x}) "
                       f"confidence={result.confidence:.3f}")
             results.append((ch_i, result))
 
-        self.progress.emit(total, total, "Registration complete.")
+        self.progress.emit(n * scale, n * scale, f"Registration complete — {n}/{n} done")
         return results
 
 

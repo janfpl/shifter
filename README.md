@@ -73,6 +73,8 @@ Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define th
 
 Results populate the shift table with X/Y/Z voxel shifts and a confidence score per channel. Confidence is color-coded in the table (green = high, red = low).
 
+The progress bar advances at sub-channel resolution — for Mutual Information it moves through the coarse and fine search passes rather than jumping once per channel — and the status text shows how many channel registrations are done and how many remain.
+
 **Preprocessing options:**
 - Background subtraction (percentile-based)
 - Gaussian smoothing

@@ -7,6 +7,7 @@ import logging
 import numpy as np
 
 from shifter.registration.base import (
+    ProgressCallback,
     RegistrationAlgorithm,
     RegistrationResult,
 )
@@ -39,18 +40,27 @@ class PhaseCorrelation(RegistrationAlgorithm):
         search_range_xy: int,
         search_range_z: int,
         use_gpu: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
+        # Phase correlation is a single FFT-based step with no internal search
+        # loop to subdivide, so it reports completion only.
         if use_gpu:
             try:
-                return self._register_gpu(
+                result = self._register_gpu(
                     reference_volume, moving_volume, search_range_xy, search_range_z
                 )
+                if progress_callback is not None:
+                    progress_callback(1.0)
+                return result
             except Exception as exc:
                 logger.warning("GPU phase correlation failed (%s), falling back to CPU", exc)
 
-        return self._register_cpu(
+        result = self._register_cpu(
             reference_volume, moving_volume, search_range_xy, search_range_z
         )
+        if progress_callback is not None:
+            progress_callback(1.0)
+        return result
 
     # ------------------------------------------------------------------ #
     # CPU path
