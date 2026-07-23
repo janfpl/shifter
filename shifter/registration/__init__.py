@@ -1,23 +1,23 @@
 """Auto-registration algorithms for chromatic shift detection."""
 
-from chromatic_shift_corrector.registration.base import (
+from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
     estimate_registration_bytes,
 )
-from chromatic_shift_corrector.registration.phase_correlation import PhaseCorrelation
-from chromatic_shift_corrector.registration.mutual_information import (
+from shifter.registration.phase_correlation import PhaseCorrelation
+from shifter.registration.mutual_information import (
     MutualInformationRegistration,
 )
-from chromatic_shift_corrector.registration.cross_correlation import ZNCCRegistration
-from chromatic_shift_corrector.registration.preprocessing import preprocess
-from chromatic_shift_corrector.registration.confidence import (
+from shifter.registration.cross_correlation import ZNCCRegistration
+from shifter.registration.preprocessing import preprocess
+from shifter.registration.confidence import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
     GUIDANCE_TEXT,
     confidence_color_rgb,
 )
-from chromatic_shift_corrector.registration.gpu_utils import (
+from shifter.registration.gpu_utils import (
     gpu_available,
     gpu_fail_reason,
     gpu_name,

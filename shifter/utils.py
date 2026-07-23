@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from chromatic_shift_corrector import __version__
+from shifter import __version__
 
 # Default colormaps in channel order.
 DEFAULT_COLORMAPS = ["green", "magenta", "cyan", "yellow", "red", "blue"]

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import psutil
 
-_perf_logger = logging.getLogger("chromatic_shift_corrector.perf")
+_perf_logger = logging.getLogger("shifter.perf")
 _perf_logger.propagate = False  # don't duplicate to root logger
 
 _setup_done = False

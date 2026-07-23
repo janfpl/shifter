@@ -2,7 +2,7 @@
 
 XY-shift application within each slab is parallelised across CPU cores
 using ``concurrent.futures.ThreadPoolExecutor``.  Performance timestamps
-are emitted via :mod:`chromatic_shift_corrector.perf_logger`.
+are emitted via :mod:`shifter.perf_logger`.
 """
 
 from __future__ import annotations
@@ -18,14 +18,14 @@ import numpy as np
 import psutil
 import tifffile
 
-from chromatic_shift_corrector.perf_logger import (
+from shifter.perf_logger import (
     is_debug_enabled,
     log_debug,
     log_event,
     log_memory,
     timed_operation,
 )
-from chromatic_shift_corrector.utils import (
+from shifter.utils import (
     apply_integer_shift_2d,
     build_metadata,
     h5_output_filename,
@@ -34,7 +34,7 @@ from chromatic_shift_corrector.utils import (
 
 if TYPE_CHECKING:
     import dask.array as da
-    from chromatic_shift_corrector.shift_manager import ChannelTransform, ShiftManager
+    from shifter.shift_manager import ChannelTransform, ShiftManager
 
 logger = logging.getLogger(__name__)
 
@@ -619,7 +619,7 @@ def export_channel_h5(
     """
     import h5py
 
-    from chromatic_shift_corrector.h5_utils import (
+    from shifter.h5_utils import (
         compute_pyramid_level_shape,
         detect_pyramid_levels,
         generate_pyramid_level,
@@ -773,7 +773,7 @@ def run_export_h5(
     Path
         Path to the written metadata JSON file.
     """
-    from chromatic_shift_corrector.h5_utils import compute_pyramid_level_shape
+    from shifter.h5_utils import compute_pyramid_level_shape
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -878,7 +878,7 @@ def run_export_h5(
     # input directory alongside the exported data — a ROI-cropped export has
     # different dimensions and can't be opened via the original headers.
     if roi is None:
-        from chromatic_shift_corrector.h5_utils import (
+        from shifter.h5_utils import (
             copy_companion_header_files,
             find_companion_header_files,
         )

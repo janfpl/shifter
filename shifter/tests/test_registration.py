@@ -6,7 +6,7 @@ ground truth exactly (integer-shift accuracy).
 
 Run via::
 
-    python -m chromatic_shift_corrector.tests.test_registration
+    python -m shifter.tests.test_registration
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ import time
 
 import numpy as np
 
-from chromatic_shift_corrector.registration import (
+from shifter.registration import (
     ALGORITHM_REGISTRY,
     RegistrationResult,
     preprocess,
 )
-from chromatic_shift_corrector.registration.phase_correlation import PhaseCorrelation
+from shifter.registration.phase_correlation import PhaseCorrelation
 
 # ---------------------------------------------------------------------------
 # Ground-truth shifts (what was applied to create the moved channels).

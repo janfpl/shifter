@@ -12,7 +12,7 @@ load-export pipeline, and validates:
 
 Run via::
 
-    python -m chromatic_shift_corrector.tests.test_h5
+    python -m shifter.tests.test_h5
 """
 
 from __future__ import annotations
@@ -26,16 +26,16 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from chromatic_shift_corrector.data_loader import H5Loader, validate_channels
-from chromatic_shift_corrector.export_engine import run_export_h5
-from chromatic_shift_corrector.h5_utils import (
+from shifter.data_loader import H5Loader, validate_channels
+from shifter.export_engine import run_export_h5
+from shifter.h5_utils import (
     H5FileManager,
     block_average_3d,
     detect_pyramid_levels,
     parse_h5_metadata,
     scan_h5_files,
 )
-from chromatic_shift_corrector.shift_manager import ShiftManager
+from shifter.shift_manager import ShiftManager
 
 # Test parameters.
 VOLUME_SHAPE = (100, 256, 256)  # (Z, Y, X)

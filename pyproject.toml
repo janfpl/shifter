@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chromatic-shift-corrector"
+name = "shifter"
 version = "1.0.0"
 description = "Napari-based axial and lateral chromatic shift correction for light sheet microscopy"
 requires-python = ">=3.9"
@@ -34,4 +34,4 @@ gpu = [
 ]
 
 [project.scripts]
-chromatic-shift-corrector = "chromatic_shift_corrector.main:main"
+shifter = "shifter.main:main"

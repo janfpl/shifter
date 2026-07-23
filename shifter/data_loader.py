@@ -97,7 +97,7 @@ class H5Loader:
         file_manager: Any,
         chunk_z: int = 64,
     ) -> None:
-        from chromatic_shift_corrector.h5_utils import (
+        from shifter.h5_utils import (
             detect_pyramid_levels,
             parse_h5_metadata,
         )

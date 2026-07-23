@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from chromatic_shift_corrector.utils import apply_integer_shift
+from shifter.utils import apply_integer_shift
 
 if TYPE_CHECKING:
     import dask.array as da
-    from chromatic_shift_corrector.shift_manager import ChannelTransform
+    from shifter.shift_manager import ChannelTransform
 
 
 def extract_subvolume(

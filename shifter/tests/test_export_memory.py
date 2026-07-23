@@ -14,7 +14,7 @@ already >90% full):
 
 Runnable via pytest, or standalone::
 
-    python -m chromatic_shift_corrector.tests.test_export_memory
+    python -m shifter.tests.test_export_memory
 """
 
 from __future__ import annotations
@@ -25,14 +25,14 @@ from unittest import mock
 import dask.array as da
 import numpy as np
 
-from chromatic_shift_corrector import export_engine as ee
-from chromatic_shift_corrector.export_engine import (
+from shifter import export_engine as ee
+from shifter.export_engine import (
     _MAX_SLAB_BYTES,
     _SLAB_PEAK_COPIES,
     _read_full_slab,
     compute_chunk_size,
 )
-from chromatic_shift_corrector.utils import apply_integer_shift
+from shifter.utils import apply_integer_shift
 
 
 class _FakeVM:

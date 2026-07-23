@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from chromatic_shift_corrector.registration.base import (
+from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
 )

@@ -36,7 +36,7 @@ Requires Python 3.12.
 Launch the application:
 
 ```bash
-python -m chromatic_shift_corrector
+python -m shifter
 ```
 
 This opens a napari viewer with the Chromatic Shift Corrector widget docked on the right.
@@ -94,10 +94,10 @@ Every export writes a `performance_log.txt` into the output directory with times
 ```bash
 # Windows (cmd)
 set CSC_DEBUG=1
-python -m chromatic_shift_corrector
+python -m shifter
 
 # macOS / Linux
-CSC_DEBUG=1 python -m chromatic_shift_corrector
+CSC_DEBUG=1 python -m shifter
 ```
 
 Output format matches the input format:

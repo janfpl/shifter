@@ -35,39 +35,39 @@ from qtpy.QtWidgets import (
     QButtonGroup,
 )
 
-from chromatic_shift_corrector.data_loader import (
+from shifter.data_loader import (
     BigTIFFLoader,
     H5Loader,
     scan_bigtiff_files,
     validate_channels,
     z_dimensions_summary,
 )
-from chromatic_shift_corrector.export_engine import (
+from shifter.export_engine import (
     compute_chunk_size,
     estimate_output_sizes,
     run_export,
     run_export_h5,
 )
-from chromatic_shift_corrector.perf_logger import (
+from shifter.perf_logger import (
     setup_perf_log,
     timed_operation,
     log_event,
 )
-from chromatic_shift_corrector.h5_utils import (
+from shifter.h5_utils import (
     H5FileManager,
     find_companion_header_files,
     scan_h5_files,
 )
-from chromatic_shift_corrector.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
-from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
-from chromatic_shift_corrector.shift_manager import ShiftManager
-from chromatic_shift_corrector.utils import (
+from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
+from shifter.preview_engine import extract_subvolume, generate_preview
+from shifter.shift_manager import ShiftManager
+from shifter.utils import (
     DEFAULT_COLORMAPS,
     MAX_CHANNELS,
     h5_output_filename,
     parse_voxel_size_from_xml,
 )
-from chromatic_shift_corrector.registration import (
+from shifter.registration import (
     ALGORITHM_REGISTRY,
     MAX_SEARCH_RANGE,
     CONFIDENCE_HIGH,
@@ -838,7 +838,7 @@ class ChromaticShiftWidget(QWidget):
     def _try_autofill_h5_voxel(self, h5_path: Path) -> None:
         """Try to auto-fill voxel sizes from H5 metadata."""
         try:
-            from chromatic_shift_corrector.h5_utils import parse_h5_metadata
+            from shifter.h5_utils import parse_h5_metadata
             import h5py
 
             with h5py.File(str(h5_path), "r") as f:
@@ -1496,7 +1496,7 @@ class ChromaticShiftWidget(QWidget):
             )
 
         # Generate shifted previews and add as layers.
-        from chromatic_shift_corrector.utils import apply_integer_shift
+        from shifter.utils import apply_integer_shift
 
         shifted_volumes: list[np.ndarray] = []
         colormaps: list[str] = []
@@ -1629,7 +1629,7 @@ class ChromaticShiftWidget(QWidget):
         if self._suppress_mip_update or not self._raw_subvolumes:
             return
 
-        from chromatic_shift_corrector.utils import apply_integer_shift
+        from shifter.utils import apply_integer_shift
 
         shifted: list[np.ndarray] = []
         for i, raw in enumerate(self._raw_subvolumes):
@@ -1867,7 +1867,7 @@ class ChromaticShiftWidget(QWidget):
         if meta_path:
             written_gb = ""
             try:
-                from chromatic_shift_corrector.utils import load_metadata
+                from shifter.utils import load_metadata
 
                 meta = load_metadata(Path(meta_path))
                 if "bytes_written_gb" in meta:
