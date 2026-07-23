@@ -23,6 +23,7 @@ from shifter.perf_logger import (
     log_debug,
     log_event,
     log_memory,
+    memory_status,
     timed_operation,
 )
 from shifter.utils import (
@@ -243,11 +244,13 @@ def _log_slab_perf(
     dt = time.perf_counter() - t0
     mib = nbytes / 1024**2
     mibps = mib / dt if dt > 0 else 0.0
+    # One self-contained line per slab: timing, throughput, and the memory
+    # state at that moment. Folding the memory snapshot in (rather than a
+    # separate MEM line) halves the log volume now that debug is on by default.
     log_debug(
         f"slab {kind} {name} z=[{z_start}:{z_end}] planes={z_end - z_start} "
-        f"{mib:.1f}MiB in {dt * 1000:.0f}ms ({mibps:.0f} MiB/s)"
+        f"{mib:.1f}MiB in {dt * 1000:.0f}ms ({mibps:.0f} MiB/s) | {memory_status()}"
     )
-    log_memory(f"{kind} {name} z=[{z_start}:{z_end}]")
 
 
 def _read_roi_slab(

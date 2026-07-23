@@ -3,10 +3,13 @@
 Writes timestamped start/end markers and elapsed times to a dedicated
 log file so users can audit how long each phase takes.
 
-Set the ``CSC_DEBUG`` environment variable (to ``1`` / ``true`` / ``yes`` /
-``on``) before launching to raise the log to DEBUG level.  Debug mode adds
-per-slab timing, throughput, and memory-usage diagnostics, which are useful
-for tracking down slow or memory-hungry exports.
+DEBUG-level diagnostics (the chunk-size decision, per-slab timing/throughput,
+and memory-usage snapshots) are recorded **by default**. They are cheap — a
+per-slab line costs microseconds against slabs that take seconds — and the log
+is truncated per export, so it never accumulates across runs. To silence the
+extra detail and keep only the INFO phase markers, set the ``CSC_DEBUG``
+environment variable to ``0`` / ``false`` / ``no`` / ``off`` (or empty) before
+launching.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import psutil
 
@@ -23,19 +27,52 @@ _perf_logger = logging.getLogger("shifter.perf")
 _perf_logger.propagate = False  # don't duplicate to root logger
 
 _setup_done = False
-_debug_enabled = False
+_debug_enabled = True
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Cached handle for this process so repeated memory snapshots don't re-open it.
+_proc_handle: Any = None
 
-def _env_debug() -> bool:
-    """Return True if the ``CSC_DEBUG`` environment variable is truthy."""
-    return os.environ.get("CSC_DEBUG", "").strip().lower() in _TRUTHY
+
+def _resolve_debug(explicit: bool | None) -> bool:
+    """Decide whether DEBUG diagnostics are on.
+
+    An *explicit* argument wins. Otherwise DEBUG is on unless ``CSC_DEBUG`` is
+    set to a falsy value — i.e. debug is the default and the env var is an
+    opt-out (``CSC_DEBUG=0``), though a truthy value still explicitly enables it.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    val = os.environ.get("CSC_DEBUG")
+    if val is None:
+        return True  # default: on
+    if val.strip().lower() in _TRUTHY:
+        return True
+    # Any other explicit value (0, false, no, off, empty, ...) disables.
+    return False
 
 
 def _fmt_gib(num_bytes: float) -> str:
     """Format a byte count as a compact GiB string."""
     return f"{num_bytes / 1024**3:.2f}GiB"
+
+
+def _proc() -> Any:
+    global _proc_handle
+    if _proc_handle is None:
+        _proc_handle = psutil.Process()
+    return _proc_handle
+
+
+def memory_status() -> str:
+    """Return a compact 'process RSS / system available / % used' string."""
+    vm = psutil.virtual_memory()
+    try:
+        rss = _fmt_gib(_proc().memory_info().rss)
+    except Exception:
+        rss = "n/a"
+    return f"proc_rss={rss} sys_avail={_fmt_gib(vm.available)} ({vm.percent:.0f}% used)"
 
 
 def setup_perf_log(log_dir: str | Path, debug: bool | None = None) -> Path:
@@ -50,12 +87,12 @@ def setup_perf_log(log_dir: str | Path, debug: bool | None = None) -> Path:
     log_dir : str | Path
         Directory to write ``performance_log.txt`` into.
     debug : bool, optional
-        Enable DEBUG-level diagnostics (per-slab timing/throughput and memory
-        snapshots).  When *None* (the default) this is taken from the
-        ``CSC_DEBUG`` environment variable.
+        Force DEBUG-level diagnostics on/off.  When *None* (the default) this is
+        resolved from the ``CSC_DEBUG`` environment variable, which defaults to
+        **on** (set ``CSC_DEBUG=0`` to opt out).
     """
     global _setup_done, _debug_enabled
-    _debug_enabled = _env_debug() if debug is None else bool(debug)
+    _debug_enabled = _resolve_debug(debug)
 
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -112,28 +149,13 @@ def log_debug(message: str) -> None:
 def log_memory(context: str = "", *, level: int = logging.DEBUG) -> None:
     """Log a system + process memory snapshot.
 
-    Records total / used / available system RAM and this process's resident
-    set size (RSS).  Defaults to DEBUG level (suppressed unless debug logging
-    is on); pass ``level=logging.INFO`` for snapshots that should always be
-    recorded (e.g. once at export start).
+    Records this process's resident set size (RSS) and system available RAM.
+    Defaults to DEBUG level; pass ``level=logging.INFO`` for snapshots that
+    should be recorded even when debug is off (e.g. once at export start).
     """
     if not _is_active() or level < _perf_logger.level:
         return
-    vm = psutil.virtual_memory()
-    try:
-        rss = _fmt_gib(psutil.Process().memory_info().rss)
-    except Exception:
-        rss = "n/a"
-    _perf_logger.log(
-        level,
-        "MEM | %s | proc_rss=%s sys_used=%s/%s (%.0f%%) sys_avail=%s",
-        context or "-",
-        rss,
-        _fmt_gib(vm.total - vm.available),
-        _fmt_gib(vm.total),
-        vm.percent,
-        _fmt_gib(vm.available),
-    )
+    _perf_logger.log(level, "MEM | %s | %s", context or "-", memory_status())
 
 
 @contextmanager

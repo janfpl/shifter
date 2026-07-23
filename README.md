@@ -89,16 +89,20 @@ The number of Z-planes per slab is sized from the *currently available* system R
 
 ### Export diagnostics
 
-Every export writes a `performance_log.txt` into the output directory with timestamped start/end markers and elapsed times for each phase. Set the `CSC_DEBUG` environment variable before launching to raise the log to **DEBUG** level, which additionally records the chunk-size decision (and which limit bound it), a memory snapshot at export start, and per-slab timing, throughput (MiB/s), and memory usage — useful for tracking down slow or memory-hungry exports:
+Every export writes a `performance_log.txt` into the output directory with timestamped start/end markers and elapsed times for each phase. By default the log is written at **DEBUG** level, which also records the chunk-size decision (and which limit bound it), a memory snapshot at export start, and a per-slab line with timing, throughput (MiB/s), and memory usage — useful for tracking down slow or memory-hungry exports. The log is rewritten from scratch on each export (it does not accumulate across runs), and the per-slab overhead is negligible against the disk I/O each slab performs.
+
+To keep only the INFO-level phase markers and suppress the extra detail, set `CSC_DEBUG` to a falsy value before launching:
 
 ```bash
-# Windows (cmd)
-set CSC_DEBUG=1
+# Windows (cmd) — disable the extra debug detail
+set CSC_DEBUG=0
 python -m shifter
 
 # macOS / Linux
-CSC_DEBUG=1 python -m shifter
+CSC_DEBUG=0 python -m shifter
 ```
+
+Setting `CSC_DEBUG=1` (or leaving it unset) keeps the debug diagnostics on.
 
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
