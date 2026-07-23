@@ -154,9 +154,13 @@ class ExportWorker(QThread):
                     voxel_z=self.voxel_z,
                     roi=self.roi,
                 )
+            # Hand the slab/pyramid working memory back to the OS now that the
+            # export is done, so it isn't left pinned to the process afterward.
+            release_memory(context="export")
             self.finished.emit(str(meta_path) if not self._cancelled else "")
         except MemoryError:
             log_event("Export aborted: out of memory")
+            release_memory(context="export (after OOM)")
             self.error.emit(
                 "Ran out of memory while exporting.\n\n"
                 "The export streams the volume in Z-slabs sized to fit the "
