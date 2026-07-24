@@ -133,12 +133,47 @@ def compute_chunk_size(
     return chunk_z
 
 
+def _channel_output_bytes(
+    loader: Any,
+    roi: tuple[int, int, int, int, int, int] | None = None,
+    bytes_per_voxel: int = 2,
+) -> int:
+    """Total output bytes for one exported channel: full-res + regenerated pyramids.
+
+    Pyramid levels are regenerated only for H5 exports and are exposed via
+    ``loader.pyramid_levels``. BigTIFF loaders lack that attribute and so
+    contribute full-resolution bytes only, which matches BigTIFF export (no
+    pyramids are written). Sizes are raw/uncompressed (output datasets use no
+    compression), so this closely tracks on-disk size aside from minor HDF5
+    chunk/metadata overhead.
+    """
+    from shifter.h5_utils import compute_pyramid_level_shape
+
+    if roi is not None:
+        rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
+        out_shape: tuple[int, int, int] = (rz_e - rz_s, ry_e - ry_s, rx_e - rx_s)
+    else:
+        out_shape = tuple(loader.shape)
+
+    total = out_shape[0] * out_shape[1] * out_shape[2] * bytes_per_voxel
+    for _name, fw, fh, fd in getattr(loader, "pyramid_levels", []):
+        pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
+        if all(d > 0 for d in pshape):
+            total += pshape[0] * pshape[1] * pshape[2] * bytes_per_voxel
+    return total
+
+
 def estimate_output_sizes(
     loaders: list[Any],
     bytes_per_voxel: int = 2,
     roi: tuple[int, int, int, int, int, int] | None = None,
 ) -> list[int]:
-    """Estimate output file sizes in bytes.
+    """Estimate per-channel output file sizes in bytes.
+
+    Includes the regenerated resolution-pyramid levels for H5 exports. The
+    previous full-resolution-only estimate omitted them and under-reported the
+    total by the pyramid sum (typically ~12-16% for 2x2x2 + 3x3x3 factors); this
+    matches the post-export accounting behind ``bytes_written_gb``.
 
     Parameters
     ----------
@@ -146,19 +181,7 @@ def estimate_output_sizes(
         (z_start, z_end, y_start, y_end, x_start, x_end) crop region.
         If provided, sizes are based on the ROI dimensions.
     """
-    sizes = []
-    if roi is not None:
-        rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
-        roi_nz = rz_e - rz_s
-        roi_ny = ry_e - ry_s
-        roi_nx = rx_e - rx_s
-        for _ in loaders:
-            sizes.append(roi_nz * roi_ny * roi_nx * bytes_per_voxel)
-    else:
-        for loader in loaders:
-            nz, ny, nx = loader.shape
-            sizes.append(nz * ny * nx * bytes_per_voxel)
-    return sizes
+    return [_channel_output_bytes(loader, roi, bytes_per_voxel) for loader in loaders]
 
 
 def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
@@ -250,6 +273,34 @@ def _log_slab_perf(
     log_debug(
         f"slab {kind} {name} z=[{z_start}:{z_end}] planes={z_end - z_start} "
         f"{mib:.1f}MiB in {dt * 1000:.0f}ms ({mibps:.0f} MiB/s) | {memory_status()}"
+    )
+
+
+def _log_pyramid_perf(
+    name: str,
+    fw: int,
+    fh: int,
+    fd: int,
+    timing: dict[str, Any],
+) -> None:
+    """Log a pyramid level's read/compute/write time breakdown (INFO).
+
+    Recorded even with debug off, so a single real export reveals whether
+    pyramid regeneration is bound by disk reads or by the block-average compute
+    — the measurement that decides how (and whether) to optimise it.
+    """
+    read_s = timing["read_s"]
+    compute_s = timing["compute_s"]
+    write_s = timing["write_s"]
+    total_s = read_s + compute_s + write_s
+    onz, ony, onx = timing["out_shape"]
+    read_mibps = (timing["bytes_read"] / 1024**2) / read_s if read_s > 0 else 0.0
+    write_mibps = (timing["bytes_written"] / 1024**2) / write_s if write_s > 0 else 0.0
+    log_event(
+        f"pyramid {name} {fw}x{fh}x{fd} out=({onz},{ony},{onx}) | "
+        f"read={read_s:.1f}s ({read_mibps:.0f} MiB/s) "
+        f"compute={compute_s:.1f}s "
+        f"write={write_s:.1f}s ({write_mibps:.0f} MiB/s) | total={total_s:.1f}s"
     )
 
 
@@ -728,7 +779,11 @@ def export_channel_h5(
                 pyr_chunks = orig_pyr.chunks if orig_pyr.chunks else None
 
                 logger.info("Regenerating pyramid level %s (factors %d\u00d7%d\u00d7%d)", level_name, fw, fh, fd)
-                generate_pyramid_level(out_h5, level_name, fw, fh, fd, chunks=pyr_chunks)
+                timing = generate_pyramid_level(
+                    out_h5, level_name, fw, fh, fd, chunks=pyr_chunks
+                )
+                if timing is not None:
+                    _log_pyramid_perf(level_name, fw, fh, fd, timing)
 
                 pnz, pny, pnx = compute_pyramid_level_shape(
                     (out_nz, out_ny, out_nx), fw, fh, fd
@@ -776,8 +831,6 @@ def run_export_h5(
     Path
         Path to the written metadata JSON file.
     """
-    from shifter.h5_utils import compute_pyramid_level_shape
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -809,21 +862,9 @@ def run_export_h5(
     # (which runs after "Data" is fully written, per channel) writes no
     # planes of its own, so a plane-based total would leave the progress
     # indicator stuck once Data finishes while pyramids are still churning.
-    def _channel_out_shape(loader: Any) -> tuple[int, int, int]:
-        if roi is not None:
-            return (rz_e - rz_s, ry_e - ry_s, rx_e - rx_s)
-        return loader.shape
-
-    def _channel_total_bytes(loader: Any) -> int:
-        out_shape = _channel_out_shape(loader)
-        total = out_shape[0] * out_shape[1] * out_shape[2] * 2
-        for _name, fw, fh, fd in loader.pyramid_levels:
-            pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
-            if all(d > 0 for d in pshape):
-                total += pshape[0] * pshape[1] * pshape[2] * 2
-        return total
-
-    channel_bytes = [_channel_total_bytes(loader) for loader in loaders]
+    # _channel_output_bytes counts full-res + every regenerated pyramid level,
+    # the same accounting the pre-export estimate uses.
+    channel_bytes = [_channel_output_bytes(loader, roi) for loader in loaders]
     total_bytes = sum(channel_bytes)
     global_bytes_done = 0
 

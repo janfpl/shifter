@@ -1874,7 +1874,11 @@ class ChromaticShiftWidget(QWidget):
             )
 
         total_bytes = sum(sizes)
-        lines.append(f"Estimated total output size: {total_bytes / (1024**3):.2f} GB")
+        size_note = " (incl. regenerated pyramids)" if self._input_format == "h5" else ""
+        lines.append(
+            f"Estimated total output size{size_note}: "
+            f"{total_bytes / (1024**3):.2f} GB"
+        )
         lines.append(f"RAM allocation: {ram_pct}%")
 
         ans = QMessageBox.question(

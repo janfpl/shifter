@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +260,17 @@ def generate_pyramid_level(
     chunks : tuple, optional
         Chunk shape for the output dataset.  If None, uses (64, 64, 64)
         clamped to the output dimensions.
+
+    Returns
+    -------
+    dict or None
+        A timing/throughput breakdown for the level with keys ``read_s``,
+        ``compute_s``, ``write_s`` (seconds spent reading ``Data`` slabs,
+        block-averaging, and writing output planes), ``bytes_read``,
+        ``bytes_written``, and ``out_shape``. Returns ``None`` if the level is
+        skipped (a zero output dimension). The breakdown lets callers log where
+        the pyramid phase spends its time (disk reads vs. compute) so the
+        bottleneck can be identified before optimising.
     """
     data = corrected_h5["Data"]
     nz, ny, nx = data.shape
@@ -271,7 +283,7 @@ def generate_pyramid_level(
         logger.warning(
             "Pyramid level %s: output dimensions would be zero, skipping.", level_name
         )
-        return
+        return None
 
     if chunks is None:
         chunks = (min(64, out_nz), min(64, out_ny), min(64, out_nx))
@@ -289,10 +301,32 @@ def generate_pyramid_level(
         chunks=chunks,
     )
 
+    read_s = compute_s = write_s = 0.0
     for oz in range(out_nz):
         iz_start = oz * factor_d
         iz_end = iz_start + factor_d
+
+        t0 = time.perf_counter()
         slab = data[iz_start:iz_end, :, :]
         if not isinstance(slab, np.ndarray):
             slab = np.array(slab)
-        ds[oz, :, :] = block_average_3d(slab, factor_w, factor_h, factor_d)
+        t1 = time.perf_counter()
+        plane = block_average_3d(slab, factor_w, factor_h, factor_d)
+        t2 = time.perf_counter()
+        ds[oz, :, :] = plane
+        t3 = time.perf_counter()
+
+        read_s += t1 - t0
+        compute_s += t2 - t1
+        write_s += t3 - t2
+
+    return {
+        "read_s": read_s,
+        "compute_s": compute_s,
+        "write_s": write_s,
+        # Input planes actually read for this level (whole Data minus the
+        # remainder planes dropped by integer division).
+        "bytes_read": out_nz * factor_d * ny * nx * 2,
+        "bytes_written": out_nz * out_ny * out_nx * 2,
+        "out_shape": (out_nz, out_ny, out_nx),
+    }
