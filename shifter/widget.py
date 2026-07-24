@@ -1836,21 +1836,17 @@ class ChromaticShiftWidget(QWidget):
         existing = [name for name in out_names if (outdir_path / name).exists()]
 
         # A full-volume H5 export copies companion header files
-        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory — but only when
-        # pyramids are written, since those Imaris/BigDataViewer headers describe
-        # a multi-resolution dataset and reference the pyramid levels.
+        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory. With pyramids on
+        # they are copied verbatim; with pyramids off they are rewritten to a
+        # single (full-resolution) level so they still resolve against the
+        # pyramid-less output.
         write_pyramids = self.chk_write_pyramids.isChecked()
         header_files: list[Path] = []
-        skipped_headers: list[Path] = []
         if roi is None and self._input_format == "h5":
-            found = find_companion_header_files(self.loaders[0].path.parent)
-            if write_pyramids:
-                header_files = found
-                existing.extend(
-                    f.name for f in header_files if (outdir_path / f.name).exists()
-                )
-            else:
-                skipped_headers = found
+            header_files = find_companion_header_files(self.loaders[0].path.parent)
+            existing.extend(
+                f.name for f in header_files if (outdir_path / f.name).exists()
+            )
 
         if existing:
             ans = QMessageBox.question(
@@ -1902,16 +1898,10 @@ class ChromaticShiftWidget(QWidget):
             lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
 
         if header_files:
+            note = "" if write_pyramids else " (rewritten to single resolution)"
             lines.append(
-                "\nCompanion header files to copy: "
+                f"\nCompanion header files to copy{note}: "
                 + ", ".join(f.name for f in header_files)
-            )
-        elif skipped_headers:
-            lines.append(
-                "\n⚠ Imaris/BigDataViewer headers will NOT be copied because "
-                "pyramid layers are disabled — those headers need the pyramids. "
-                "The exported .lux.h5 files contain full-resolution Data only "
-                "(open them directly, not via the .ims/_bdv files)."
             )
 
         total_bytes = sum(sizes)

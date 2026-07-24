@@ -91,7 +91,15 @@ Select an output directory and RAM allocation (50-95% of system memory). Choose 
 
 The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
 
-**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. Regenerating them re-reads the full corrected volume once per level after `Data` is written, which is I/O-bound and can dominate export time (on a ~215 GiB/channel volume it was ~85% of the total). Leave it unchecked for the fastest export; tick it only if you need the embedded multiscale layers for fast pyramid rendering. When disabled, the output `.lux.h5` contains only the full-resolution `Data`, the size estimate and `bytes_written_gb` reflect full-resolution only, and any copied Imaris/BigDataViewer companion headers will resolve just the full-resolution data.
+**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. Regenerating them re-reads the full corrected volume once per level after `Data` is written, which is I/O-bound and can dominate export time (on a ~215 GiB/channel volume it was ~85% of the total). Leave it unchecked for the fastest export; tick it only if you need the embedded multiscale layers for fast pyramid rendering. When disabled, the output `.lux.h5` contains only the full-resolution `Data`, and the size estimate / `bytes_written_gb` reflect full-resolution only.
+
+Companion Imaris (`.ims`) and BigDataViewer (`*_bdv.h5`) headers describe a *multi-resolution* dataset and link to the pyramid levels. With pyramids **on** they are copied verbatim; with pyramids **off** they are **rewritten to a single (full-resolution) level** so they still resolve against the pyramid-less output — e.g. for import into the Imaris File Converter, which builds its own pyramids from the full-resolution data. (Copying the original multi-resolution headers next to pyramid-less data would make Imaris/BigDataViewer read the dataset as corrupt.)
+
+To repair a folder that was exported by an older build (multi-resolution headers copied next to pyramid-less data), reduce the headers in place without re-exporting:
+
+```bash
+python -m shifter.fix_headers /path/to/export_folder
+```
 
 ### Export diagnostics
 

@@ -63,6 +63,104 @@ def copy_companion_header_files(
     return copied
 
 
+# --------------------------------------------------------------------------- #
+# Single-resolution companion headers
+#
+# The Imaris (.ims) and BigDataViewer (*_bdv.h5) headers describe a
+# *multi-resolution* dataset: each declares N resolution levels whose data are
+# HDF5 external links into the per-channel .lux.h5 files (``Data``,
+# ``Data_2_2_2``, ...). When an export writes only the full-resolution ``Data``
+# (pyramids disabled), those higher-level links dangle and Imaris /
+# BigDataViewer read the dataset as corrupt. The functions below rewrite a
+# header to keep only the full-resolution level (level 0 -> ``Data``) so it
+# resolves cleanly against pyramid-less output — e.g. for import into the Imaris
+# File Converter, which builds its own pyramids from the full-resolution data.
+# --------------------------------------------------------------------------- #
+
+
+def _reduce_ims_to_single_resolution(ims_path: Path | str) -> bool:
+    """In place, drop all but ``ResolutionLevel 0`` from an Imaris .ims header.
+
+    Returns True if the file was recognised as an Imaris header and processed.
+    """
+    import h5py
+
+    with h5py.File(str(ims_path), "r+") as f:
+        if "DataSet" not in f:
+            return False
+        ds = f["DataSet"]
+        for name in list(ds.keys()):
+            if name.startswith("ResolutionLevel") and name != "ResolutionLevel 0":
+                del ds[name]
+    return True
+
+
+def _reduce_bdv_h5_to_single_resolution(bdv_path: Path | str) -> bool:
+    """In place, reduce a BigDataViewer *_bdv.h5 header to a single level.
+
+    Truncates each setup's ``resolutions``/``subdivisions`` to the first
+    (full-resolution) row and deletes every per-timepoint level group except
+    ``0``. Returns True if the file looked like a BDV header and was processed.
+    """
+    import h5py
+
+    with h5py.File(str(bdv_path), "r+") as f:
+        setups = [k for k in f.keys() if re.fullmatch(r"s\d+", k)]
+        if not setups:
+            return False
+        for s in setups:
+            for arr in ("resolutions", "subdivisions"):
+                key = f"{s}/{arr}"
+                if key in f:
+                    row0 = f[key][:1]
+                    del f[key]
+                    f.create_dataset(key, data=row0)
+        for t in [k for k in f.keys() if re.fullmatch(r"t\d+", k)]:
+            for s in list(f[t].keys()):
+                grp = f[f"{t}/{s}"]
+                for lvl in list(grp.keys()):
+                    if lvl != "0":
+                        del grp[lvl]
+    return True
+
+
+def reduce_header_to_single_resolution(path: Path | str) -> bool:
+    """Reduce a single companion header (.ims / *_bdv.h5) in place to full-res.
+
+    A *_bdv.xml is left unchanged (its resolution info lives in the paired
+    *_bdv.h5). Returns True if the file was recognised and reduced.
+    """
+    name = Path(path).name.lower()
+    try:
+        if name.endswith(".ims"):
+            return _reduce_ims_to_single_resolution(path)
+        if name.endswith("_bdv.h5"):
+            return _reduce_bdv_h5_to_single_resolution(path)
+    except Exception as exc:
+        logger.warning("Could not reduce %s to single resolution: %s", Path(path).name, exc)
+    return False
+
+
+def write_single_resolution_headers(
+    header_files: list[Path], output_dir: Path | str
+) -> list[Path]:
+    """Copy companion headers into *output_dir*, reduced to a single resolution.
+
+    Use instead of :func:`copy_companion_header_files` when the export omits
+    pyramid levels: the .ims and *_bdv.h5 copies are rewritten to reference only
+    the full-resolution ``Data``; a *_bdv.xml is copied verbatim (its resolution
+    info lives in the .h5). Returns the written paths.
+    """
+    output_dir = Path(output_dir)
+    written: list[Path] = []
+    for src in header_files:
+        dst = output_dir / src.name
+        shutil.copy2(src, dst)
+        reduce_header_to_single_resolution(dst)
+        written.append(dst)
+    return written
+
+
 class H5FileManager:
     """Manages open h5py file handles for dask-backed lazy loading.
 

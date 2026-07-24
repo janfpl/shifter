@@ -953,19 +953,22 @@ def run_export_h5(
         from shifter.h5_utils import (
             copy_companion_header_files,
             find_companion_header_files,
+            write_single_resolution_headers,
         )
 
         input_dir = loaders[0].path.parent
         header_files = find_companion_header_files(input_dir)
         if header_files and not write_pyramids:
+            # Pyramids weren't written, so the multi-resolution headers would
+            # link to absent pyramid levels (which Imaris/BigDataViewer read as
+            # corrupt). Rewrite them to reference only the full-resolution Data.
+            written = write_single_resolution_headers(header_files, output_dir)
             log_event(
-                "Skipped companion header files (pyramid layers disabled — the "
-                "Imaris/BigDataViewer headers require the pyramid levels): "
-                + ", ".join(p.name for p in header_files)
+                "Wrote single-resolution companion headers: "
+                + ", ".join(p.name for p in written)
             )
-            metadata["companion_header_files_skipped"] = [
-                p.name for p in header_files
-            ]
+            metadata["companion_header_files"] = [p.name for p in written]
+            metadata["companion_headers_single_resolution"] = True
         elif header_files:
             copied = copy_companion_header_files(header_files, output_dir)
             log_event(

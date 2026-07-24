@@ -480,10 +480,14 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
     mgr = H5FileManager()
     outdir = Path(tempfile.mkdtemp())
     all_ok = True
-    # A companion BigDataViewer header alongside the input; it must NOT be
-    # copied when pyramids are disabled (it references the missing levels).
-    header = files[0].parent / "main_test_bdv.xml"
-    header.write_text("<SpimData></SpimData>")
+    # A multi-resolution BigDataViewer header alongside the input; with pyramids
+    # disabled it must be rewritten to a single (full-resolution) level.
+    header = files[0].parent / "main_test_bdv.h5"
+    with h5py.File(str(header), "w") as hf:
+        hf.create_dataset("s00/resolutions", data=np.array([[1, 1, 1], [2, 2, 2]], dtype=float))
+        hf.create_dataset("s00/subdivisions", data=np.array([[64, 64, 64], [64, 64, 64]], dtype=float))
+        hf["t00000/s00/0/cells"] = h5py.ExternalLink(files[0].name, "Data")
+        hf["t00000/s00/1/cells"] = h5py.ExternalLink(files[0].name, "Data_2_2_2")
     try:
         loaders = [H5Loader(fp, mgr) for fp in files]
         shift_manager = ShiftManager()
@@ -505,12 +509,21 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
         with open(meta_path) as f:
             meta = json.load(f)
 
-        # The companion header must be skipped, not copied.
-        if (outdir / header.name).exists():
-            print(f"  FAIL: companion header {header.name} was copied despite pyramids off")
+        # The companion header must be written AND reduced to a single level.
+        out_header = outdir / header.name
+        if not out_header.exists():
+            print(f"  FAIL: companion header {header.name} was not written")
             all_ok = False
-        if meta.get("companion_header_files_skipped") != [header.name]:
-            print(f"  FAIL: metadata companion_header_files_skipped={meta.get('companion_header_files_skipped')}")
+        else:
+            with h5py.File(str(out_header), "r") as hf:
+                if hf["s00/resolutions"].shape != (1, 3):
+                    print(f"  FAIL: header not reduced (resolutions {hf['s00/resolutions'].shape})")
+                    all_ok = False
+                if list(hf["t00000/s00"].keys()) != ["0"]:
+                    print(f"  FAIL: header still has levels {list(hf['t00000/s00'].keys())}")
+                    all_ok = False
+        if meta.get("companion_headers_single_resolution") is not True:
+            print(f"  FAIL: companion_headers_single_resolution={meta.get('companion_headers_single_resolution')}")
             all_ok = False
 
         # bytes_written must be full-res only and match the full-res estimate.
@@ -540,7 +553,7 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
                 all_ok = False
 
         if all_ok:
-            print("  PASS: pyramids skipped, Data + no headers, sizes full-res only")
+            print("  PASS: pyramids skipped, Data + single-res headers, full-res sizes")
     finally:
         mgr.close_all()
         shutil.rmtree(outdir, ignore_errors=True)
