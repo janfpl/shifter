@@ -1835,14 +1835,22 @@ class ChromaticShiftWidget(QWidget):
 
         existing = [name for name in out_names if (outdir_path / name).exists()]
 
-        # A full-volume H5 export also copies companion header files
-        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory, if present.
+        # A full-volume H5 export copies companion header files
+        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory — but only when
+        # pyramids are written, since those Imaris/BigDataViewer headers describe
+        # a multi-resolution dataset and reference the pyramid levels.
+        write_pyramids = self.chk_write_pyramids.isChecked()
         header_files: list[Path] = []
+        skipped_headers: list[Path] = []
         if roi is None and self._input_format == "h5":
-            header_files = find_companion_header_files(self.loaders[0].path.parent)
-            existing.extend(
-                f.name for f in header_files if (outdir_path / f.name).exists()
-            )
+            found = find_companion_header_files(self.loaders[0].path.parent)
+            if write_pyramids:
+                header_files = found
+                existing.extend(
+                    f.name for f in header_files if (outdir_path / f.name).exists()
+                )
+            else:
+                skipped_headers = found
 
         if existing:
             ans = QMessageBox.question(
@@ -1858,7 +1866,6 @@ class ChromaticShiftWidget(QWidget):
 
         # Build confirmation dialog.
         ram_pct = self.slider_ram.value()
-        write_pyramids = self.chk_write_pyramids.isChecked()
         sizes = estimate_output_sizes(
             self.loaders, roi=roi, include_pyramids=write_pyramids
         )
@@ -1898,6 +1905,13 @@ class ChromaticShiftWidget(QWidget):
             lines.append(
                 "\nCompanion header files to copy: "
                 + ", ".join(f.name for f in header_files)
+            )
+        elif skipped_headers:
+            lines.append(
+                "\n⚠ Imaris/BigDataViewer headers will NOT be copied because "
+                "pyramid layers are disabled — those headers need the pyramids. "
+                "The exported .lux.h5 files contain full-resolution Data only "
+                "(open them directly, not via the .ims/_bdv files)."
             )
 
         total_bytes = sum(sizes)

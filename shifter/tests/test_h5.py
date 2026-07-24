@@ -476,10 +476,14 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
 
 
 def test_export_without_pyramids(files: list[Path]) -> bool:
-    """Verify write_pyramids=False writes Data only and no pyramid layers."""
+    """Verify write_pyramids=False writes Data only, no pyramids, no headers."""
     mgr = H5FileManager()
     outdir = Path(tempfile.mkdtemp())
     all_ok = True
+    # A companion BigDataViewer header alongside the input; it must NOT be
+    # copied when pyramids are disabled (it references the missing levels).
+    header = files[0].parent / "main_test_bdv.xml"
+    header.write_text("<SpimData></SpimData>")
     try:
         loaders = [H5Loader(fp, mgr) for fp in files]
         shift_manager = ShiftManager()
@@ -500,6 +504,14 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
 
         with open(meta_path) as f:
             meta = json.load(f)
+
+        # The companion header must be skipped, not copied.
+        if (outdir / header.name).exists():
+            print(f"  FAIL: companion header {header.name} was copied despite pyramids off")
+            all_ok = False
+        if meta.get("companion_header_files_skipped") != [header.name]:
+            print(f"  FAIL: metadata companion_header_files_skipped={meta.get('companion_header_files_skipped')}")
+            all_ok = False
 
         # bytes_written must be full-res only and match the full-res estimate.
         est_full = sum(estimate_output_sizes(loaders, include_pyramids=False))
@@ -528,10 +540,11 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
                 all_ok = False
 
         if all_ok:
-            print("  PASS: pyramids skipped, Data written, sizes full-res only")
+            print("  PASS: pyramids skipped, Data + no headers, sizes full-res only")
     finally:
         mgr.close_all()
         shutil.rmtree(outdir, ignore_errors=True)
+        header.unlink(missing_ok=True)
 
     return all_ok
 

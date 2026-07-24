@@ -942,6 +942,13 @@ def run_export_h5(
     # Imaris/BigDataViewer header files (.ims, *_bdv.h5, *_bdv.xml) from the
     # input directory alongside the exported data — a ROI-cropped export has
     # different dimensions and can't be opened via the original headers.
+    #
+    # These headers describe a MULTI-resolution dataset and reference the
+    # pyramid levels (Data_W_H_D) via HDF5 external links / relative paths.
+    # When pyramids are disabled the levels don't exist, so copying the headers
+    # would produce a dataset that Imaris / BigDataViewer read as corrupt — skip
+    # them in that case (the full-resolution ``Data`` is still written and can be
+    # opened directly).
     if roi is None:
         from shifter.h5_utils import (
             copy_companion_header_files,
@@ -950,7 +957,16 @@ def run_export_h5(
 
         input_dir = loaders[0].path.parent
         header_files = find_companion_header_files(input_dir)
-        if header_files:
+        if header_files and not write_pyramids:
+            log_event(
+                "Skipped companion header files (pyramid layers disabled — the "
+                "Imaris/BigDataViewer headers require the pyramid levels): "
+                + ", ".join(p.name for p in header_files)
+            )
+            metadata["companion_header_files_skipped"] = [
+                p.name for p in header_files
+            ]
+        elif header_files:
             copied = copy_companion_header_files(header_files, output_dir)
             log_event(
                 "Copied companion header files: "
