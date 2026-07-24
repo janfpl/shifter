@@ -55,7 +55,7 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 - Reads the `Data` dataset as the full-resolution volume
 - Detects and displays resolution pyramid levels (`Data_W_H_D` naming convention) as napari multiscale layers
 - Parses embedded JSON metadata for voxel sizes and channel descriptions
-- On export, pyramids are regenerated for corrected volumes using block averaging
+- On export, pyramids can optionally be regenerated for corrected volumes using block averaging (off by default — see Export)
 
 ## Workflow
 
@@ -69,11 +69,11 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 
 ### 2. Register Channels
 
-Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm, and run.
+Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
 
 Results populate the shift table with X/Y/Z voxel shifts and a confidence score per channel. Confidence is color-coded in the table (green = high, red = low).
 
-The progress bar advances at sub-channel resolution — for Mutual Information it moves through the coarse and fine search passes rather than jumping once per channel — and the status text shows how many channel registrations are done and how many remain.
+The progress bar advances at sub-channel resolution — for Mutual Information it moves through the coarse and fine search passes rather than jumping once per channel — and the status text shows which channel is being registered.
 
 **Preprocessing options:**
 - Background subtraction (percentile-based)
@@ -90,6 +90,8 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. Progress is reported in actual bytes written (not Z-planes), so for Luxendo H5 output the indicator keeps moving through pyramid regeneration instead of appearing to finish early. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, processing details, and the total bytes written (`bytes_written_gb`). ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
 The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
+
+**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. Regenerating them re-reads the full corrected volume once per level after `Data` is written, which is I/O-bound and can dominate export time (on a ~215 GiB/channel volume it was ~85% of the total). Leave it unchecked for the fastest export; tick it only if you need the embedded multiscale layers for fast pyramid rendering. When disabled, the output `.lux.h5` contains only the full-resolution `Data`, the size estimate and `bytes_written_gb` reflect full-resolution only, and any copied Imaris/BigDataViewer companion headers will resolve just the full-resolution data.
 
 ### Export diagnostics
 
@@ -110,7 +112,7 @@ Setting `CSC_DEBUG=1` (or leaving it unset) keeps the debug diagnostics on.
 
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
-- Luxendo H5 input produces H5 output with regenerated resolution pyramids and preserved metadata
+- Luxendo H5 input produces H5 output with preserved metadata and, when the pyramid checkbox is enabled, regenerated resolution pyramids
 
 **Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are copied verbatim into the output directory alongside the corrected data. ROI exports still use the `_corrected_roi` suffix and do not copy these header files, since a cropped sub-volume has different dimensions and can't be opened via the original headers.
 
@@ -144,7 +146,7 @@ Normalizes both volumes to zero mean and unit variance before FFT-based cross-co
 | Parameters | None (beyond search range) |
 | GPU | Supported via CuPy |
 
-Recommended as the default algorithm for most datasets.
+A fast, robust general-purpose option when channels have similar intensity profiles.
 
 ### Mutual Information
 
@@ -158,7 +160,7 @@ Coarse-to-fine exhaustive search maximizing mutual information via joint histogr
 | Parameters | None (beyond search range) |
 | GPU | Supported via CuPy (accelerates histogram computation) |
 
-Use when Phase Cross-Correlation and ZNCC fail due to dissimilar intensity distributions between channels.
+This is the default algorithm. It is the most robust across dissimilar intensity distributions between channels (e.g. different fluorophores), at the cost of speed; install `numba` (recommended) for a large parallel speed-up.
 
 ## GPU Acceleration
 

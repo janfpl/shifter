@@ -119,6 +119,7 @@ class ExportWorker(QThread):
         voxel_z: float,
         input_format: str = "bigtiff",
         roi: tuple[int, int, int, int, int, int] | None = None,
+        write_pyramids: bool = True,
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -129,6 +130,7 @@ class ExportWorker(QThread):
         self.voxel_z = voxel_z
         self.input_format = input_format
         self.roi = roi
+        self.write_pyramids = write_pyramids
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -142,18 +144,30 @@ class ExportWorker(QThread):
                       f"channels={len(self.loaders)} ram%={self.ram_percent} "
                       f"region={region_desc}")
             with timed_operation("Full export (all channels)"):
-                export_fn = run_export_h5 if self.input_format == "h5" else run_export
-                meta_path = export_fn(
-                    self.loaders,
-                    self.shift_manager,
-                    self.output_dir,
-                    self.ram_percent,
+                common_kwargs = dict(
                     progress_callback=lambda done, total: self.progress.emit(done, total),
                     cancel_check=lambda: self._cancelled,
                     voxel_xy=self.voxel_xy,
                     voxel_z=self.voxel_z,
                     roi=self.roi,
                 )
+                if self.input_format == "h5":
+                    meta_path = run_export_h5(
+                        self.loaders,
+                        self.shift_manager,
+                        self.output_dir,
+                        self.ram_percent,
+                        write_pyramids=self.write_pyramids,
+                        **common_kwargs,
+                    )
+                else:
+                    meta_path = run_export(
+                        self.loaders,
+                        self.shift_manager,
+                        self.output_dir,
+                        self.ram_percent,
+                        **common_kwargs,
+                    )
             # Hand the slab/pyramid working memory back to the OS now that the
             # export is done, so it isn't left pinned to the process afterward.
             release_memory(context="export")
@@ -292,13 +306,10 @@ class RegistrationWorker(QThread):
 
         def _emit(idx: int, frac: float) -> None:
             frac = min(1.0, max(0.0, frac))
-            done = idx
-            remaining = n - idx - 1
             self.progress.emit(
                 int((idx + frac) * scale),
                 n * scale,
-                f"Registering channel {idx + 1} of {n} — "
-                f"{done} done, {remaining} remaining",
+                f"Registering channel {idx + 1} of {n}...",
             )
 
         for idx, ch_i in enumerate(self.channels_to_register):
@@ -350,7 +361,7 @@ class RegistrationWorker(QThread):
                       f"confidence={result.confidence:.3f}")
             results.append((ch_i, result))
 
-        self.progress.emit(n * scale, n * scale, f"Registration complete — {n}/{n} done")
+        self.progress.emit(n * scale, n * scale, "Registration complete.")
         return results
 
 
@@ -593,6 +604,10 @@ class ChromaticShiftWidget(QWidget):
         self._algo_options_container.setLayout(self._algo_options_layout)
         lay.addWidget(self._algo_options_container)
 
+        # Default to Mutual Information. Set after the options container exists so
+        # the currentTextChanged handler can toggle option visibility safely.
+        self.combo_algorithm.setCurrentText("Mutual Information")
+
         # Channel selection.
         lay.addWidget(QLabel("Channels to register:"))
         self._reg_channel_checkboxes: list[tuple[int, QCheckBox]] = []
@@ -739,6 +754,15 @@ class ChromaticShiftWidget(QWidget):
         row_ram.addWidget(self.slider_ram)
         row_ram.addWidget(self.lbl_ram)
         lay.addLayout(row_ram)
+
+        # Pyramid regeneration re-reads the whole volume once per level and can
+        # dominate H5 export time, so it is off by default. Tick to write the
+        # low-resolution multiscale layers (needed for fast multiscale viewing).
+        self.chk_write_pyramids = QCheckBox(
+            "Write low-resolution pyramid layers (slower; H5 only)"
+        )
+        self.chk_write_pyramids.setChecked(False)
+        lay.addWidget(self.chk_write_pyramids)
 
         self.btn_export = QPushButton("Apply && Export")
         self.btn_export.clicked.connect(self._on_export)
@@ -1834,7 +1858,10 @@ class ChromaticShiftWidget(QWidget):
 
         # Build confirmation dialog.
         ram_pct = self.slider_ram.value()
-        sizes = estimate_output_sizes(self.loaders, roi=roi)
+        write_pyramids = self.chk_write_pyramids.isChecked()
+        sizes = estimate_output_sizes(
+            self.loaders, roi=roi, include_pyramids=write_pyramids
+        )
         ref_shape = self.loaders[0].shape
 
         lines = ["Shifts to apply:\n"]
@@ -1874,7 +1901,13 @@ class ChromaticShiftWidget(QWidget):
             )
 
         total_bytes = sum(sizes)
-        size_note = " (incl. regenerated pyramids)" if self._input_format == "h5" else ""
+        if self._input_format == "h5":
+            size_note = (
+                " (incl. regenerated pyramids)" if write_pyramids
+                else " (pyramid layers disabled)"
+            )
+        else:
+            size_note = ""
         lines.append(
             f"Estimated total output size{size_note}: "
             f"{total_bytes / (1024**3):.2f} GB"
@@ -1906,6 +1939,7 @@ class ChromaticShiftWidget(QWidget):
             self.spin_voxel_z.value(),
             input_format=self._input_format,
             roi=roi,
+            write_pyramids=write_pyramids,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.finished.connect(self._on_export_finished)
@@ -1963,6 +1997,7 @@ class ChromaticShiftWidget(QWidget):
             self.btn_select_outdir,
             self.btn_export,
             self.slider_ram,
+            self.chk_write_pyramids,
             self.file_table,
             self.shift_table,
             self.btn_run_registration,

@@ -137,15 +137,17 @@ def _channel_output_bytes(
     loader: Any,
     roi: tuple[int, int, int, int, int, int] | None = None,
     bytes_per_voxel: int = 2,
+    include_pyramids: bool = True,
 ) -> int:
     """Total output bytes for one exported channel: full-res + regenerated pyramids.
 
     Pyramid levels are regenerated only for H5 exports and are exposed via
     ``loader.pyramid_levels``. BigTIFF loaders lack that attribute and so
     contribute full-resolution bytes only, which matches BigTIFF export (no
-    pyramids are written). Sizes are raw/uncompressed (output datasets use no
-    compression), so this closely tracks on-disk size aside from minor HDF5
-    chunk/metadata overhead.
+    pyramids are written). When *include_pyramids* is False the pyramid bytes are
+    omitted (used when the pyramid-regeneration step is turned off). Sizes are
+    raw/uncompressed (output datasets use no compression), so this closely tracks
+    on-disk size aside from minor HDF5 chunk/metadata overhead.
     """
     from shifter.h5_utils import compute_pyramid_level_shape
 
@@ -156,10 +158,11 @@ def _channel_output_bytes(
         out_shape = tuple(loader.shape)
 
     total = out_shape[0] * out_shape[1] * out_shape[2] * bytes_per_voxel
-    for _name, fw, fh, fd in getattr(loader, "pyramid_levels", []):
-        pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
-        if all(d > 0 for d in pshape):
-            total += pshape[0] * pshape[1] * pshape[2] * bytes_per_voxel
+    if include_pyramids:
+        for _name, fw, fh, fd in getattr(loader, "pyramid_levels", []):
+            pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
+            if all(d > 0 for d in pshape):
+                total += pshape[0] * pshape[1] * pshape[2] * bytes_per_voxel
     return total
 
 
@@ -167,21 +170,28 @@ def estimate_output_sizes(
     loaders: list[Any],
     bytes_per_voxel: int = 2,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    include_pyramids: bool = True,
 ) -> list[int]:
     """Estimate per-channel output file sizes in bytes.
 
-    Includes the regenerated resolution-pyramid levels for H5 exports. The
-    previous full-resolution-only estimate omitted them and under-reported the
-    total by the pyramid sum (typically ~12-16% for 2x2x2 + 3x3x3 factors); this
-    matches the post-export accounting behind ``bytes_written_gb``.
+    Includes the regenerated resolution-pyramid levels for H5 exports (unless
+    *include_pyramids* is False). The previous full-resolution-only estimate
+    omitted them and under-reported the total by the pyramid sum (typically
+    ~12-16% for 2x2x2 + 3x3x3 factors); this matches the post-export accounting
+    behind ``bytes_written_gb``.
 
     Parameters
     ----------
     roi : tuple, optional
         (z_start, z_end, y_start, y_end, x_start, x_end) crop region.
         If provided, sizes are based on the ROI dimensions.
+    include_pyramids : bool
+        Count regenerated pyramid levels (True) or full-res only (False).
     """
-    return [_channel_output_bytes(loader, roi, bytes_per_voxel) for loader in loaders]
+    return [
+        _channel_output_bytes(loader, roi, bytes_per_voxel, include_pyramids)
+        for loader in loaders
+    ]
 
 
 def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
@@ -641,12 +651,15 @@ def export_channel_h5(
     progress_callback: Any | None = None,
     cancel_check: Any | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    write_pyramids: bool = True,
 ) -> None:
     """Export a single corrected channel to a Luxendo .lux.h5 file.
 
     Writes the shift-corrected ``Data`` dataset, copies the original
-    ``metadata`` dataset verbatim, then regenerates all pyramid levels
-    that existed in the original file.
+    ``metadata`` dataset verbatim, then (when *write_pyramids* is True)
+    regenerates all pyramid levels that existed in the original file.
+    Pyramid regeneration re-reads the full ``Data`` volume once per level and
+    dominates export time on large volumes, so *write_pyramids=False* skips it.
 
     Parameters
     ----------
@@ -700,7 +713,9 @@ def export_channel_h5(
     # Clamp chunk sizes to output dimensions for ROI exports.
     h5_chunks = tuple(min(c, d) for c, d in zip(orig_chunks, (out_nz, out_ny, out_nx)))
 
-    pyramid_levels = detect_pyramid_levels(original_h5)
+    # Empty pyramid list when disabled: this makes both the byte-total below and
+    # the regeneration loop further down no-ops, without special-casing either.
+    pyramid_levels = detect_pyramid_levels(original_h5) if write_pyramids else []
     total_bytes = out_nz * out_ny * out_nx * 2
     for _name, fw, fh, fd in pyramid_levels:
         pnz, pny, pnx = compute_pyramid_level_shape((out_nz, out_ny, out_nx), fw, fh, fd)
@@ -804,6 +819,7 @@ def run_export_h5(
     voxel_xy: float = 1.0,
     voxel_z: float = 1.0,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    write_pyramids: bool = True,
 ) -> Path:
     """Export all H5 channels with corrections applied.
 
@@ -864,7 +880,10 @@ def run_export_h5(
     # indicator stuck once Data finishes while pyramids are still churning.
     # _channel_output_bytes counts full-res + every regenerated pyramid level,
     # the same accounting the pre-export estimate uses.
-    channel_bytes = [_channel_output_bytes(loader, roi) for loader in loaders]
+    channel_bytes = [
+        _channel_output_bytes(loader, roi, include_pyramids=write_pyramids)
+        for loader in loaders
+    ]
     total_bytes = sum(channel_bytes)
     global_bytes_done = 0
 
@@ -887,6 +906,7 @@ def run_export_h5(
             progress_callback=_channel_progress,
             cancel_check=cancel_check,
             roi=roi,
+            write_pyramids=write_pyramids,
         )
         global_bytes_done += channel_bytes[i]
 
@@ -901,9 +921,9 @@ def run_export_h5(
 
         # Add channel_description and pyramid info.
         cd["channel_description"] = loader.channel_description
-        cd["pyramid_levels_regenerated"] = [
-            lvl[0] for lvl in loader.pyramid_levels
-        ]
+        cd["pyramid_levels_regenerated"] = (
+            [lvl[0] for lvl in loader.pyramid_levels] if write_pyramids else []
+        )
 
     vol_shape = ref_shape
     if roi is not None:
@@ -914,6 +934,7 @@ def run_export_h5(
     )
     metadata["input_format"] = "luxendo_h5"
     metadata["voxel_size_source"] = "h5_metadata"
+    metadata["pyramids_written"] = write_pyramids
     metadata["bytes_written"] = total_bytes
     metadata["bytes_written_gb"] = round(total_bytes / (1024**3), 3)
 

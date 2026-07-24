@@ -475,6 +475,67 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
     return all_ok
 
 
+def test_export_without_pyramids(files: list[Path]) -> bool:
+    """Verify write_pyramids=False writes Data only and no pyramid layers."""
+    mgr = H5FileManager()
+    outdir = Path(tempfile.mkdtemp())
+    all_ok = True
+    try:
+        loaders = [H5Loader(fp, mgr) for fp in files]
+        shift_manager = ShiftManager()
+        filenames = [fp.name for fp in files]
+        shift_manager.init_channels(
+            filenames, reference_index=0, colormaps=["green", "magenta", "cyan"]
+        )
+        for ch_i, (dz, dy, dx) in GROUND_TRUTH_SHIFTS.items():
+            shift_manager.set_shift(ch_i, "x", -dx)
+            shift_manager.set_shift(ch_i, "y", -dy)
+            shift_manager.set_shift(ch_i, "z", -dz)
+
+        meta_path = run_export_h5(
+            loaders, shift_manager, outdir,
+            ram_percent=90, voxel_xy=VOXEL_XY, voxel_z=VOXEL_Z,
+            write_pyramids=False,
+        )
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        # bytes_written must be full-res only and match the full-res estimate.
+        est_full = sum(estimate_output_sizes(loaders, include_pyramids=False))
+        if meta.get("bytes_written") != est_full:
+            print(f"  FAIL: bytes_written={meta.get('bytes_written')} != full-res {est_full}")
+            all_ok = False
+        if meta.get("pyramids_written") is not False:
+            print(f"  FAIL: metadata pyramids_written={meta.get('pyramids_written')}")
+            all_ok = False
+
+        # No corrected file may contain a pyramid dataset.
+        for fp in files:
+            out_path = outdir / fp.name
+            with h5py.File(str(out_path), "r") as f:
+                if "Data" not in f:
+                    print(f"  FAIL: {out_path.name} missing Data")
+                    all_ok = False
+                levels = detect_pyramid_levels(f)
+                if levels:
+                    print(f"  FAIL: {out_path.name} unexpectedly has pyramids {levels}")
+                    all_ok = False
+
+        for ch_entry in meta.get("channels", []):
+            if ch_entry.get("pyramid_levels_regenerated"):
+                print(f"  FAIL: channel {ch_entry['channel_index']} lists regenerated pyramids")
+                all_ok = False
+
+        if all_ok:
+            print("  PASS: pyramids skipped, Data written, sizes full-res only")
+    finally:
+        mgr.close_all()
+        shutil.rmtree(outdir, ignore_errors=True)
+
+    return all_ok
+
+
 def run_validation() -> bool:
     """Run all H5 tests and report results."""
     print("=" * 60)
@@ -511,6 +572,10 @@ def run_validation() -> bool:
 
         print("\n--- Test: Export with correction and pyramid regeneration ---")
         if not test_export_and_pyramids(files, ref_data):
+            all_passed = False
+
+        print("\n--- Test: Export with pyramid layers disabled ---")
+        if not test_export_without_pyramids(files):
             all_passed = False
 
     finally:
