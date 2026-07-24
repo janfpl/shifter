@@ -161,6 +161,168 @@ def write_single_resolution_headers(
     return written
 
 
+# --------------------------------------------------------------------------- #
+# ROI companion headers
+#
+# An ROI export writes cropped, ``_corrected_roi``-suffixed .lux.h5 files, so the
+# original headers can't be used as-is: their external links point at the
+# original (full-volume) filenames and their metadata carries the full-volume
+# dimensions/extent. :func:`write_roi_headers` rewrites a copy of each header to
+# (a) point at the ROI output files, (b) carry the ROI's voxel dimensions and a
+# cropped physical extent (preserving the original voxel size), and (c) keep only
+# the full-resolution level when pyramids are disabled.
+# --------------------------------------------------------------------------- #
+
+
+def _ims_char_attr(text: object) -> np.ndarray:
+    """Encode *text* as Imaris' char-array (|S1) attribute format."""
+    return np.frombuffer(str(text).encode("ascii"), dtype="S1").copy()
+
+
+def _ims_read_char_attr(arr: object) -> str:
+    """Decode an Imaris |S1 char-array attribute back to a string."""
+    if isinstance(arr, bytes):
+        return arr.decode("ascii", "replace")
+    if isinstance(arr, str):
+        return arr
+    try:
+        return arr.tobytes().decode("ascii", "replace")  # type: ignore[attr-defined]
+    except Exception:
+        return str(arr)
+
+
+def _set_ims_char_attr(grp: Any, key: str, text: object) -> None:
+    if key in grp.attrs:
+        del grp.attrs[key]
+    grp.attrs.create(key, _ims_char_attr(text))
+
+
+def _remap_ims_external_links(f: Any, rename: Any) -> None:
+    """Rewrite each Channel's ``Data`` external-link filename via *rename*."""
+    import h5py
+
+    ds = f.get("DataSet")
+    if ds is None:
+        return
+    for lvl_name in ds.keys():
+        lvl = ds[lvl_name]
+        for tp_name in lvl.keys():
+            tp = lvl[tp_name]
+            for ch_name in tp.keys():
+                grp = tp[ch_name]
+                link = grp.get("Data", getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    new = rename(link.filename)
+                    if new != link.filename:
+                        path = link.path
+                        del grp["Data"]
+                        grp["Data"] = h5py.ExternalLink(new, path)
+
+
+def _remap_bdv_external_links(f: Any, rename: Any) -> None:
+    """Rewrite each ``cells`` external-link filename via *rename*."""
+    import h5py
+
+    for t in [k for k in f.keys() if re.fullmatch(r"t\d+", k)]:
+        for s in f[t].keys():
+            grp = f[f"{t}/{s}"]
+            for lvl in grp.keys():
+                cell_grp = grp[lvl]
+                link = cell_grp.get("cells", getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    new = rename(link.filename)
+                    if new != link.filename:
+                        path = link.path
+                        del cell_grp["cells"]
+                        cell_grp["cells"] = h5py.ExternalLink(new, path)
+
+
+def _crop_ims_dimensions(
+    f: Any, roi: tuple[int, int, int, int, int, int]
+) -> None:
+    """Set an Imaris header's dimensions/extent to the ROI, preserving voxel size.
+
+    Imaris stores voxel dimensions in ``DataSetInfo/Image`` as X/Y/Z and the
+    physical bounding box as ExtMin{0,1,2}/ExtMax{0,1,2} (axis 0=X, 1=Y, 2=Z),
+    where voxel size = (ExtMax-ExtMin)/N. The ROI keeps the same voxel size, so
+    the new extent is the corresponding sub-box.
+    """
+    z0, z1, y0, y1, x0, x1 = roi
+    img = f.get("DataSetInfo/Image")
+    if img is None:
+        return
+
+    def _read(k: str) -> float:
+        return float(_ims_read_char_attr(img.attrs[k]))
+
+    axes = {0: ("X", x0, x1), 1: ("Y", y0, y1), 2: ("Z", z0, z1)}
+    for i, (dim_name, start, end) in axes.items():
+        n = _read(dim_name)
+        mn = _read(f"ExtMin{i}")
+        mx = _read(f"ExtMax{i}")
+        vox = (mx - mn) / n if n else 0.0
+        _set_ims_char_attr(img, f"ExtMin{i}", f"{mn + start * vox:.6g}")
+        _set_ims_char_attr(img, f"ExtMax{i}", f"{mn + end * vox:.6g}")
+    _set_ims_char_attr(img, "X", x1 - x0)
+    _set_ims_char_attr(img, "Y", y1 - y0)
+    _set_ims_char_attr(img, "Z", z1 - z0)
+
+
+def write_roi_headers(
+    header_files: list[Path],
+    output_dir: Path | str,
+    output_suffix: str,
+    roi: tuple[int, int, int, int, int, int],
+    write_pyramids: bool,
+) -> list[Path]:
+    """Write companion headers matching an ROI-cropped export.
+
+    Each ``.ims`` / ``*_bdv.h5`` is copied, its external links repointed to the
+    ``output_suffix``-named ROI output files, reduced to a single resolution when
+    *write_pyramids* is False, and (for ``.ims``) given the ROI's dimensions and
+    a cropped extent. A ``*_bdv.xml`` is skipped: its ViewSetup dimensions can't
+    be regenerated reliably here, and Imaris (the primary consumer) uses the
+    ``.ims``. Returns the written paths.
+    """
+    import h5py
+
+    from shifter.utils import h5_output_filename
+
+    output_dir = Path(output_dir)
+
+    def rename(filename: str) -> str:
+        return h5_output_filename(filename, output_suffix)
+
+    written: list[Path] = []
+    for src in header_files:
+        name = src.name.lower()
+        dst = output_dir / src.name
+        try:
+            if name.endswith(".ims"):
+                shutil.copy2(src, dst)
+                if not write_pyramids:
+                    _reduce_ims_to_single_resolution(dst)
+                with h5py.File(str(dst), "r+") as f:
+                    _remap_ims_external_links(f, rename)
+                    _crop_ims_dimensions(f, roi)
+                written.append(dst)
+            elif name.endswith("_bdv.h5"):
+                shutil.copy2(src, dst)
+                if not write_pyramids:
+                    _reduce_bdv_h5_to_single_resolution(dst)
+                with h5py.File(str(dst), "r+") as f:
+                    _remap_bdv_external_links(f, rename)
+                written.append(dst)
+            else:
+                logger.info(
+                    "Skipping %s for ROI export (BDV XML dimensions not regenerated).",
+                    src.name,
+                )
+        except Exception as exc:
+            logger.warning("Could not write ROI header %s: %s", src.name, exc)
+    return written
+
+
 class H5FileManager:
     """Manages open h5py file handles for dask-backed lazy loading.
 

@@ -122,7 +122,9 @@ Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
 - Luxendo H5 input produces H5 output with preserved metadata and, when the pyramid checkbox is enabled, regenerated resolution pyramids
 
-**Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are copied verbatim into the output directory alongside the corrected data. ROI exports still use the `_corrected_roi` suffix and do not copy these header files, since a cropped sub-volume has different dimensions and can't be opened via the original headers.
+**Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are written into the output directory alongside the corrected data (copied verbatim with pyramids on, or reduced to a single level with pyramids off — see above).
+
+**ROI exports** use the `_corrected_roi` suffix and now also get companion headers, **regenerated** for the crop: the `.ims` / `*_bdv.h5` external links are repointed to the `_corrected_roi` files, and the Imaris `.ims` is given the ROI's voxel dimensions and a cropped physical extent (voxel size preserved). The BigDataViewer `*_bdv.xml` is not regenerated for ROI (its dimensions can't be rewritten reliably here); Imaris — which uses the `.ims` — is unaffected. As with full-volume, pyramid levels are included only when the pyramid checkbox is ticked.
 
 ## Registration Algorithms
 

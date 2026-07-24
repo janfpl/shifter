@@ -1835,14 +1835,14 @@ class ChromaticShiftWidget(QWidget):
 
         existing = [name for name in out_names if (outdir_path / name).exists()]
 
-        # A full-volume H5 export copies companion header files
-        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory. With pyramids on
-        # they are copied verbatim; with pyramids off they are rewritten to a
-        # single (full-resolution) level so they still resolve against the
-        # pyramid-less output.
+        # An H5 export writes companion header files (.ims, *_bdv.h5, *_bdv.xml)
+        # from the input directory: copied verbatim for a full-volume export with
+        # pyramids; rewritten to a single (full-resolution) level when pyramids
+        # are off; and regenerated with the ROI's dimensions/filenames for an ROI
+        # export.
         write_pyramids = self.chk_write_pyramids.isChecked()
         header_files: list[Path] = []
-        if roi is None and self._input_format == "h5":
+        if self._input_format == "h5":
             header_files = find_companion_header_files(self.loaders[0].path.parent)
             existing.extend(
                 f.name for f in header_files if (outdir_path / f.name).exists()
@@ -1898,9 +1898,14 @@ class ChromaticShiftWidget(QWidget):
             lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
 
         if header_files:
-            note = "" if write_pyramids else " (rewritten to single resolution)"
+            if roi is not None:
+                note = " (regenerated for the ROI)"
+            elif not write_pyramids:
+                note = " (rewritten to single resolution)"
+            else:
+                note = ""
             lines.append(
-                f"\nCompanion header files to copy{note}: "
+                f"\nCompanion header files{note}: "
                 + ", ".join(f.name for f in header_files)
             )
 

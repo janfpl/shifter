@@ -938,44 +938,54 @@ def run_export_h5(
     metadata["bytes_written"] = total_bytes
     metadata["bytes_written_gb"] = round(total_bytes / (1024**3), 3)
 
-    # Full-volume exports keep original filenames, so copy any companion
-    # Imaris/BigDataViewer header files (.ims, *_bdv.h5, *_bdv.xml) from the
-    # input directory alongside the exported data — a ROI-cropped export has
-    # different dimensions and can't be opened via the original headers.
-    #
-    # These headers describe a MULTI-resolution dataset and reference the
-    # pyramid levels (Data_W_H_D) via HDF5 external links / relative paths.
-    # When pyramids are disabled the levels don't exist, so copying the headers
-    # would produce a dataset that Imaris / BigDataViewer read as corrupt — skip
-    # them in that case (the full-resolution ``Data`` is still written and can be
-    # opened directly).
-    if roi is None:
-        from shifter.h5_utils import (
-            copy_companion_header_files,
-            find_companion_header_files,
-            write_single_resolution_headers,
-        )
+    # Write companion Imaris/BigDataViewer header files (.ims, *_bdv.h5,
+    # *_bdv.xml) alongside the exported data. These headers describe a
+    # MULTI-resolution dataset and reference the per-channel data (and pyramid
+    # levels) via HDF5 external links, so they must be reconciled with what was
+    # actually written:
+    #   * full volume + pyramids  -> copy verbatim (headers already match)
+    #   * full volume, no pyramids -> reduce to a single (full-res) level, else
+    #     their links to the absent pyramids make viewers read the data as corrupt
+    #   * ROI                       -> regenerate with the ROI filenames, cropped
+    #     dimensions/extent, and (when pyramids are off) a single level
+    from shifter.h5_utils import (
+        copy_companion_header_files,
+        find_companion_header_files,
+        write_roi_headers,
+        write_single_resolution_headers,
+    )
 
-        input_dir = loaders[0].path.parent
-        header_files = find_companion_header_files(input_dir)
-        if header_files and not write_pyramids:
-            # Pyramids weren't written, so the multi-resolution headers would
-            # link to absent pyramid levels (which Imaris/BigDataViewer read as
-            # corrupt). Rewrite them to reference only the full-resolution Data.
-            written = write_single_resolution_headers(header_files, output_dir)
-            log_event(
-                "Wrote single-resolution companion headers: "
-                + ", ".join(p.name for p in written)
-            )
-            metadata["companion_header_files"] = [p.name for p in written]
-            metadata["companion_headers_single_resolution"] = True
-        elif header_files:
-            copied = copy_companion_header_files(header_files, output_dir)
-            log_event(
-                "Copied companion header files: "
-                + ", ".join(p.name for p in copied)
-            )
-            metadata["companion_header_files"] = [p.name for p in copied]
+    input_dir = loaders[0].path.parent
+    header_files = find_companion_header_files(input_dir)
+    if header_files and roi is not None:
+        written = write_roi_headers(
+            header_files, output_dir, suffix, roi, write_pyramids
+        )
+        log_event(
+            "Wrote ROI companion headers: "
+            + ", ".join(p.name for p in written)
+        )
+        metadata["companion_header_files"] = [p.name for p in written]
+        metadata["companion_headers_roi"] = True
+        metadata["companion_headers_single_resolution"] = not write_pyramids
+    elif header_files and not write_pyramids:
+        # Pyramids weren't written, so the multi-resolution headers would link
+        # to absent pyramid levels (which Imaris/BigDataViewer read as corrupt).
+        # Rewrite them to reference only the full-resolution Data.
+        written = write_single_resolution_headers(header_files, output_dir)
+        log_event(
+            "Wrote single-resolution companion headers: "
+            + ", ".join(p.name for p in written)
+        )
+        metadata["companion_header_files"] = [p.name for p in written]
+        metadata["companion_headers_single_resolution"] = True
+    elif header_files:
+        copied = copy_companion_header_files(header_files, output_dir)
+        log_event(
+            "Copied companion header files: "
+            + ", ".join(p.name for p in copied)
+        )
+        metadata["companion_header_files"] = [p.name for p in copied]
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path
