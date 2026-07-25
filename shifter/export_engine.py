@@ -286,31 +286,23 @@ def _log_slab_perf(
     )
 
 
-def _log_pyramid_perf(
-    name: str,
-    fw: int,
-    fh: int,
-    fd: int,
-    timing: dict[str, Any],
-) -> None:
-    """Log a pyramid level's read/compute/write time breakdown (INFO).
+def _log_pyramid_summary(name: str, summary: dict[str, Any]) -> None:
+    """Log the fused pyramid totals for a channel (INFO).
 
-    Recorded even with debug off, so a single real export reveals whether
-    pyramid regeneration is bound by disk reads or by the block-average compute
-    — the measurement that decides how (and whether) to optimise it.
+    Pyramids are now built from the corrected slabs in memory, so there is no
+    reread of the output: the interesting numbers are compute vs write time and
+    the bytes produced.
     """
-    read_s = timing["read_s"]
-    compute_s = timing["compute_s"]
-    write_s = timing["write_s"]
-    total_s = read_s + compute_s + write_s
-    onz, ony, onx = timing["out_shape"]
-    read_mibps = (timing["bytes_read"] / 1024**2) / read_s if read_s > 0 else 0.0
-    write_mibps = (timing["bytes_written"] / 1024**2) / write_s if write_s > 0 else 0.0
+    compute_s = summary["compute_s"]
+    write_s = summary["write_s"]
+    mib = summary["bytes_written"] / 1024**2
+    write_mibps = mib / write_s if write_s > 0 else 0.0
     log_event(
-        f"pyramid {name} {fw}x{fh}x{fd} out=({onz},{ony},{onx}) | "
-        f"read={read_s:.1f}s ({read_mibps:.0f} MiB/s) "
-        f"compute={compute_s:.1f}s "
-        f"write={write_s:.1f}s ({write_mibps:.0f} MiB/s) | total={total_s:.1f}s"
+        f"pyramids {name} | levels={','.join(summary['levels']) or '-'} "
+        f"compute={compute_s:.1f}s write={write_s:.1f}s ({write_mibps:.0f} MiB/s) "
+        f"wrote={mib:.0f}MiB reread=0B"
+        + (f" | SKIPPED={','.join(summary['skipped'])}" if summary["skipped"] else "")
+        + (f" | INCOMPLETE: {'; '.join(summary['incomplete'])}" if summary["incomplete"] else "")
     )
 
 
@@ -687,9 +679,9 @@ def export_channel_h5(
     import h5py
 
     from shifter.h5_utils import (
+        StreamingPyramidWriter,
         compute_pyramid_level_shape,
         detect_pyramid_levels,
-        generate_pyramid_level,
     )
 
     nz, ny, nx = dask_arr.shape
@@ -732,6 +724,19 @@ def export_channel_h5(
                 chunks=h5_chunks,
             )
 
+            # Pyramids are built from each corrected slab while it is still in
+            # memory, so the output Data is never read back. Datasets are created
+            # here, before the first slab, and fed by the loops below.
+            pyramid_writer = None
+            if pyramid_levels:
+                pyr_chunks = {}
+                for level_name, _fw, _fh, _fd in pyramid_levels:
+                    src = original_h5.get(level_name)
+                    pyr_chunks[level_name] = getattr(src, "chunks", None)
+                pyramid_writer = StreamingPyramidWriter(
+                    out_h5, pyramid_levels, (out_nz, out_ny, out_nx), pyr_chunks
+                )
+
             if roi is not None:
                 # ROI export: read only the needed sub-region.
                 for slab_start in range(0, out_nz, chunk_z):
@@ -746,12 +751,17 @@ def export_channel_h5(
                     )
                     ds[slab_start:slab_end] = slab
 
+                    pyramid_bytes = 0
+                    if pyramid_writer is not None:
+                        pyramid_bytes = pyramid_writer.consume(slab, slab_start)
+
                     _log_slab_perf(
                         "H5-ROI", output_path.name, slab_start, slab_end,
                         slab.nbytes, t0,
                     )
 
-                    bytes_done += slab.nbytes
+                    bytes_done += slab.nbytes + pyramid_bytes
+                    del slab  # release before the next (multi-GiB) allocation
                     if progress_callback:
                         progress_callback(bytes_done, total_bytes)
             else:
@@ -770,12 +780,17 @@ def export_channel_h5(
 
                     ds[out_z_start:out_z_end] = slab
 
+                    pyramid_bytes = 0
+                    if pyramid_writer is not None:
+                        pyramid_bytes = pyramid_writer.consume(slab, out_z_start)
+
                     _log_slab_perf(
                         "H5", output_path.name, out_z_start, out_z_end,
                         slab.nbytes, t0,
                     )
 
-                    bytes_done += slab.nbytes
+                    bytes_done += slab.nbytes + pyramid_bytes
+                    del slab  # release before the next (multi-GiB) allocation
                     if progress_callback:
                         progress_callback(bytes_done, total_bytes)
 
@@ -784,29 +799,11 @@ def export_channel_h5(
                 raw_meta = original_h5["metadata"][()]
                 out_h5.create_dataset("metadata", data=raw_meta)
 
-            # Regenerate pyramid levels.
-            for level_name, fw, fh, fd in pyramid_levels:
-                if cancel_check and cancel_check():
-                    return
-
-                # Match original chunking for this pyramid level.
-                orig_pyr = original_h5[level_name]
-                pyr_chunks = orig_pyr.chunks if orig_pyr.chunks else None
-
-                logger.info("Regenerating pyramid level %s (factors %d\u00d7%d\u00d7%d)", level_name, fw, fh, fd)
-                timing = generate_pyramid_level(
-                    out_h5, level_name, fw, fh, fd, chunks=pyr_chunks
-                )
-                if timing is not None:
-                    _log_pyramid_perf(level_name, fw, fh, fd, timing)
-
-                pnz, pny, pnx = compute_pyramid_level_shape(
-                    (out_nz, out_ny, out_nx), fw, fh, fd
-                )
-                if pnz > 0 and pny > 0 and pnx > 0:
-                    bytes_done += pnz * pny * pnx * 2
-                    if progress_callback:
-                        progress_callback(bytes_done, total_bytes)
+            # Pyramids were built alongside Data, so there is nothing to
+            # regenerate here \u2014 just close them out and report.
+            if pyramid_writer is not None:
+                summary = pyramid_writer.finish()
+                _log_pyramid_summary(output_path.name, summary)
 
 
 def run_export_h5(
