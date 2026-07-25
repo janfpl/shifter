@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,8 @@ COLORMAP_OPTIONS = [
     "inferno",
     "turbo",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class ExportWorker(QThread):
@@ -1979,13 +1982,40 @@ class ChromaticShiftWidget(QWidget):
                     written_gb = f"\nTotal data written: {meta['bytes_written_gb']:.2f} GB"
             except Exception:
                 pass
-            QMessageBox.information(
-                self,
-                "Export Complete",
-                f"All channels exported successfully.\nMetadata: {meta_path}{written_gb}",
+            out_dir = Path(meta_path).parent
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Export Complete")
+            box.setText(
+                f"All channels exported successfully.\n"
+                f"Output folder: {out_dir}\n"
+                f"Metadata: {meta_path}{written_gb}"
             )
+            open_btn = box.addButton("Open", QMessageBox.ActionRole)
+            close_btn = box.addButton("Close", QMessageBox.RejectRole)
+            box.setDefaultButton(close_btn)
+            box.exec_() if hasattr(box, "exec_") else box.exec()
+            if box.clickedButton() is open_btn:
+                self._open_in_file_browser(out_dir)
         else:
             QMessageBox.information(self, "Cancelled", "Export was cancelled.")
+
+    @staticmethod
+    def _open_in_file_browser(path: Path) -> None:
+        """Reveal *path* in the OS file browser (Explorer / Finder / xdg-open)."""
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform.startswith("win"):
+                # os.startfile is Windows-only; opens the folder in Explorer.
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            logger.warning("Could not open %s in file browser: %s", path, exc)
 
     def _on_export_error(self, tb: str) -> None:
         self._set_ui_enabled(True)

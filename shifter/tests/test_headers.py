@@ -20,6 +20,7 @@ import h5py
 import numpy as np
 
 from shifter.h5_utils import (
+    rebuild_ims_header,
     reduce_header_to_single_resolution,
     write_roi_headers,
     write_single_resolution_headers,
@@ -232,7 +233,125 @@ def test_write_roi_headers_skips_xml() -> None:
     assert not (out / xml.name).exists()
 
 
+def _make_multires_ims_with_targets(d: Path, shape_zyx=(80, 60, 40)) -> tuple[Path, str]:
+    """Build an .ims with uint8 attrs plus a REAL .lux.h5 target it links to."""
+    nz, ny, nx = shape_zyx
+    lux = d / "chan.lux.h5"
+    with h5py.File(str(lux), "w") as f:
+        f.create_dataset("Data", data=np.zeros((nz, ny, nx), np.uint16))
+        f.create_dataset(
+            "Data_2_2_2", data=np.zeros((nz // 2, ny // 2, nx // 2), np.uint16)
+        )
+    ims = d / "main_t.ims"
+    with h5py.File(str(ims), "w") as f:
+        for k, v in (
+            ("DataSetDirectoryName", "DataSet"),
+            ("DataSetInfoDirectoryName", "DataSetInfo"),
+            ("ImarisDataSet", "ImarisDataSet"),
+            ("ImarisVersion", "5.5.0"),
+            ("ThumbnailDirectoryName", "Thumbnail"),
+        ):
+            f.attrs.create(k, np.frombuffer(v.encode(), dtype=np.uint8).copy())
+        for lvl, (path, div) in enumerate((("Data", 1), ("Data_2_2_2", 2))):
+            g = f.create_group(f"DataSet/ResolutionLevel {lvl}/TimePoint 0/Channel 0")
+            g["Data"] = h5py.ExternalLink(lux.name, path)
+            g.create_dataset("Histogram", data=np.zeros(256, np.uint64))
+            for a, val in (("ImageSizeX", nx // div), ("ImageSizeY", ny // div),
+                           ("ImageSizeZ", nz // div)):
+                g.attrs.create(a, np.frombuffer(str(val).encode(), dtype=np.uint8).copy())
+        img = f.create_group("DataSetInfo/Image")
+        for a, val in (("X", nx), ("Y", ny), ("Z", nz), ("Unit", "um"),
+                       ("ExtMin0", 0), ("ExtMax0", nx), ("ExtMin1", 0),
+                       ("ExtMax1", ny), ("ExtMin2", 0), ("ExtMax2", nz)):
+            img.attrs.create(a, np.frombuffer(str(val).encode(), dtype=np.uint8).copy())
+        f.create_group("DataSetInfo/TimeInfo")
+        # Imaris Viewer residue that must NOT survive a rebuild.
+        f.create_dataset("Thumbnail/Data", data=np.zeros((4, 4), np.uint8))
+        f.create_group("VolumeMask")
+        f.create_group("DataSetInfo/Log")
+    return ims, lux.name
+
+
+def test_rebuilt_ims_matches_linked_shapes_and_is_uint8() -> None:
+    """Every declared size must equal the shape of the dataset it links to."""
+    d = Path(tempfile.mkdtemp())
+    ims, _ = _make_multires_ims_with_targets(d)
+    out = d / "out.ims"
+    rebuild_ims_header(ims, out, output_shape_zyx=(80, 60, 40))
+
+    with h5py.File(str(out), "r") as f:
+        for lvl in f["DataSet"].keys():
+            ch = f[f"DataSet/{lvl}/TimePoint 0/Channel 0"]
+            # Dereference the link for real and compare to the declaration.
+            linked = ch["Data"]
+            declared = tuple(
+                int(ch.attrs[k].tobytes().decode())
+                for k in ("ImageSizeZ", "ImageSizeY", "ImageSizeX")
+            )
+            assert linked.shape == declared, f"{lvl}: {linked.shape} != {declared}"
+            for k in ("ImageSizeX", "ImageSizeY", "ImageSizeZ"):
+                assert ch.attrs[k].dtype == np.uint8, f"{lvl}/{k} not uint8"
+        img = f["DataSetInfo/Image"]
+        for k in ("X", "Y", "Z"):
+            assert img.attrs[k].dtype == np.uint8
+
+
+def test_rebuilt_ims_drops_imaris_viewer_residue() -> None:
+    """A rebuild must emit only DataSet + DataSetInfo{Channel,Image,TimeInfo}."""
+    d = Path(tempfile.mkdtemp())
+    ims, _ = _make_multires_ims_with_targets(d)
+    out = d / "out.ims"
+    rebuild_ims_header(ims, out, output_shape_zyx=(80, 60, 40))
+    with h5py.File(str(out), "r") as f:
+        assert sorted(f.keys()) == ["DataSet", "DataSetInfo"], sorted(f.keys())
+        assert "Log" not in f["DataSetInfo"]
+        assert "NumberOfDataSets" not in f.attrs
+
+
+def test_rebuilt_ims_single_res_drops_pyramid_levels() -> None:
+    """keep_paths={'Data'} must leave exactly one level, linked to Data."""
+    d = Path(tempfile.mkdtemp())
+    ims, lux_name = _make_multires_ims_with_targets(d)
+    out = d / "out.ims"
+    info = rebuild_ims_header(
+        ims, out, output_shape_zyx=(80, 60, 40), keep_paths={"Data"}
+    )
+    assert info["levels"] == ["ResolutionLevel 0"]
+    with h5py.File(str(out), "r") as f:
+        assert list(f["DataSet"].keys()) == ["ResolutionLevel 0"]
+        ch = f["DataSet/ResolutionLevel 0/TimePoint 0/Channel 0"]
+        assert ch["Data"].shape == (80, 60, 40)  # dereferences to the real target
+        assert ch.get("Data", getlink=True).filename == lux_name
+
+
+def test_rebuilt_roi_ims_declares_crop_everywhere() -> None:
+    """A cropped rebuild must update per-level sizes too, not just Image X/Y/Z."""
+    d = Path(tempfile.mkdtemp())
+    ims, _ = _make_multires_ims_with_targets(d)
+    out = d / "out.ims"
+    roi = (10, 50, 5, 45, 0, 20)  # 40 x 40 x 20 (Z,Y,X)
+    rebuild_ims_header(ims, out, output_shape_zyx=(40, 40, 20), roi=roi,
+                       keep_paths={"Data"})
+    with h5py.File(str(out), "r") as f:
+        ch = f["DataSet/ResolutionLevel 0/TimePoint 0/Channel 0"]
+        assert [int(ch.attrs[k].tobytes().decode())
+                for k in ("ImageSizeX", "ImageSizeY", "ImageSizeZ")] == [20, 40, 40]
+        img = f["DataSetInfo/Image"]
+        assert [int(img.attrs[k].tobytes().decode()) for k in ("X", "Y", "Z")] == [
+            20, 40, 40
+        ]
+        # voxel size preserved (source extent was 1 unit per voxel on each axis)
+        assert float(img.attrs["ExtMin0"].tobytes().decode()) == 0.0
+        assert float(img.attrs["ExtMax0"].tobytes().decode()) == 20.0
+        assert float(img.attrs["ExtMin2"].tobytes().decode()) == 10.0
+        assert float(img.attrs["ExtMax2"].tobytes().decode()) == 50.0
+
+
 _TESTS = [
+    test_rebuilt_ims_matches_linked_shapes_and_is_uint8,
+    test_rebuilt_ims_drops_imaris_viewer_residue,
+    test_rebuilt_ims_single_res_drops_pyramid_levels,
+    test_rebuilt_roi_ims_declares_crop_everywhere,
     test_reduce_ims_keeps_only_level0,
     test_reduce_bdv_keeps_only_level0,
     test_reduce_is_idempotent,

@@ -972,7 +972,9 @@ def run_export_h5(
         # Pyramids weren't written, so the multi-resolution headers would link
         # to absent pyramid levels (which Imaris/BigDataViewer read as corrupt).
         # Rewrite them to reference only the full-resolution Data.
-        written = write_single_resolution_headers(header_files, output_dir)
+        written = write_single_resolution_headers(
+            header_files, output_dir, output_shape_zyx=tuple(ref_shape)
+        )
         log_event(
             "Wrote single-resolution companion headers: "
             + ", ".join(p.name for p in written)
