@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
+
+# Optional per-registration progress hook. Called with a fraction in [0.0, 1.0]
+# indicating how far *this* pairwise registration has progressed. Algorithms
+# call it periodically (e.g. through a mutual-information grid search) so the UI
+# can advance a progress bar within a single registration, not just between
+# channels. May be omitted (None) by callers that don't need it.
+ProgressCallback = Callable[[float], None]
 
 
 @dataclass
@@ -72,6 +80,7 @@ class RegistrationAlgorithm(ABC):
         search_range_xy: int,
         search_range_z: int,
         use_gpu: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         """Detect the integer voxel shift that best aligns *moving_volume*
         to *reference_volume*.
@@ -88,6 +97,11 @@ class RegistrationAlgorithm(ABC):
             Maximum allowed shift magnitude in Z.
         use_gpu : bool
             If True and a GPU is available, run computations on GPU.
+        progress_callback : ProgressCallback, optional
+            If given, called periodically with a fraction in [0.0, 1.0] as this
+            registration progresses. Algorithms with an internal search (e.g.
+            mutual information) report fine-grained progress; single-shot
+            algorithms report completion only.
 
         Returns
         -------

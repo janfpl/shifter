@@ -2,13 +2,13 @@
 
 XY-shift application within each slab is parallelised across CPU cores
 using ``concurrent.futures.ThreadPoolExecutor``.  Performance timestamps
-are emitted via :mod:`chromatic_shift_corrector.perf_logger`.
+are emitted via :mod:`shifter.perf_logger`.
 """
 
 from __future__ import annotations
 
 import logging
-import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,91 +17,182 @@ import numpy as np
 import psutil
 import tifffile
 
-from chromatic_shift_corrector.perf_logger import log_event, timed_operation
-from chromatic_shift_corrector.utils import (
+from shifter.perf_logger import (
+    is_debug_enabled,
+    log_debug,
+    log_event,
+    log_memory,
+    memory_status,
+    timed_operation,
+)
+from shifter.utils import (
     apply_integer_shift_2d,
     build_metadata,
     h5_output_filename,
     save_metadata,
+    worker_count,
 )
 
 if TYPE_CHECKING:
     import dask.array as da
-    from chromatic_shift_corrector.shift_manager import ChannelTransform, ShiftManager
+    from shifter.shift_manager import ChannelTransform, ShiftManager
 
 logger = logging.getLogger(__name__)
 
-# Number of threads for per-plane XY shift (capped to avoid over-subscription).
-_XY_WORKERS = min(os.cpu_count() or 1, 16)
+# Threads for the per-plane XY shift. Uses the shared worker budget, which
+# leaves a few cores free for the OS and the napari UI (see utils.worker_count).
+_XY_WORKERS = worker_count()
+
+
+# --- Chunk-size policy ----------------------------------------------------- #
+# Materialising one export slab via ``np.asarray(dask_arr[read_start:read_end])``
+# transiently holds several full-size copies of the slab in RAM at once: dask
+# reads the source chunks, then ``concatenate3`` allocates a *fresh* output
+# buffer while those inputs are still alive (~2x the slab), and the caller then
+# copies that result into a zero-initialised output slab (another 1x). Budgeting
+# for this many copies keeps the true peak within the RAM allowance rather than
+# the ~2x the old model assumed.
+_SLAB_PEAK_COPIES = 3
+
+# Hard cap on the *output* bytes of a single slab, independent of installed RAM.
+# Export throughput is bound by disk I/O and per-chunk decode, not by how many
+# Z-planes are batched into one read, so there is no speed benefit to building
+# enormous slabs -- only a large, fragile memory footprint. This cap is what
+# prevents a high-RAM machine from sizing a slab at, e.g., 57 GiB and then
+# running out of memory when the system is already loaded.
+_MAX_SLAB_BYTES = 4 * 1024**3
 
 
 def compute_chunk_size(
     xy_shape: tuple[int, int],
-    n_channels: int,
+    n_channels: int = 1,
     ram_percent: int = 90,
     bytes_per_voxel: int = 2,
 ) -> int:
-    """Determine how many Z-planes to process per chunk.
+    """Determine how many Z-planes to process per slab.
 
-    We need to hold *n_channels* input slabs plus *n_channels* output slabs
-    simultaneously. Each slab has shape (chunk_z, Y, X) at *bytes_per_voxel*.
+    The returned ``chunk_z`` is bounded by two independent limits:
+
+    1. **Available RAM.** At most *ram_percent* of the *currently available*
+       system memory (``psutil.virtual_memory().available``, **not** ``.total``)
+       may be consumed by the transient full-size copies made while a slab is
+       read, concatenated by dask, and written. The previous implementation
+       budgeted against total RAM, which is why an export could size a slab at
+       ~57 GiB on a machine that was already >90% full and then crash with an
+       ``ArrayMemoryError``.
+    2. **An absolute slab-size cap** (:data:`_MAX_SLAB_BYTES`) so that even on a
+       machine with hundreds of GiB free, a single slab stays modest. Larger
+       slabs do not export any faster (the pipeline is disk-bound) but multiply
+       peak RAM, GC pressure, and the blast radius of a bad estimate.
+
+    Channels are exported strictly sequentially (see :func:`run_export` /
+    :func:`run_export_h5`), so only one channel's slab is ever resident at a
+    time; *n_channels* therefore no longer scales the budget and is retained
+    only for backward compatibility with existing callers.
 
     Parameters
     ----------
     xy_shape : (int, int)
-        (Y, X) dimensions.
+        (Y, X) dimensions of a single plane.
     n_channels : int
-        Number of channels.
+        Number of channels (unused; kept for backward compatibility).
     ram_percent : int
-        Percentage of system RAM to use (50-95).
+        Percentage of *available* system RAM to use (50-95).
     bytes_per_voxel : int
         Bytes per voxel (2 for uint16).
 
     Returns
     -------
     int
-        Number of Z-planes per processing chunk (>= 1).
+        Number of Z-planes per processing slab (>= 1).
     """
-    total_ram = psutil.virtual_memory().total
-    available = int(total_ram * ram_percent / 100)
+    available = psutil.virtual_memory().available
+    budget = int(available * ram_percent / 100)
 
     ny, nx = xy_shape
-    plane_bytes = ny * nx * bytes_per_voxel
+    plane_bytes = max(1, ny * nx * bytes_per_voxel)
 
-    # Each chunk we need: n_channels * chunk_z planes for reading
-    # + n_channels * chunk_z planes for writing = 2 * n_channels * chunk_z
-    bytes_per_z = 2 * n_channels * plane_bytes
+    # Peak RAM per Z-plane while a slab is read, concatenated, and copied.
+    peak_bytes_per_z = plane_bytes * _SLAB_PEAK_COPIES
+    chunk_z_by_ram = budget // peak_bytes_per_z
+    chunk_z_by_cap = _MAX_SLAB_BYTES // plane_bytes
 
-    chunk_z = max(1, available // bytes_per_z)
+    chunk_z = max(1, int(min(chunk_z_by_ram, chunk_z_by_cap)))
+
+    log_debug(
+        "compute_chunk_size: chunk_z=%d (ram-bound=%d, cap-bound=%d) | "
+        "plane=%.1fMiB slab_out=%.2fGiB est_peak=%.2fGiB | "
+        "budget=%.2fGiB avail=%.2fGiB ram%%=%d n_channels=%d"
+        % (
+            chunk_z, chunk_z_by_ram, chunk_z_by_cap,
+            plane_bytes / 1024**2,
+            chunk_z * plane_bytes / 1024**3,
+            chunk_z * peak_bytes_per_z / 1024**3,
+            budget / 1024**3, available / 1024**3, ram_percent, n_channels,
+        )
+    )
     return chunk_z
+
+
+def _channel_output_bytes(
+    loader: Any,
+    roi: tuple[int, int, int, int, int, int] | None = None,
+    bytes_per_voxel: int = 2,
+    include_pyramids: bool = True,
+) -> int:
+    """Total output bytes for one exported channel: full-res + regenerated pyramids.
+
+    Pyramid levels are regenerated only for H5 exports and are exposed via
+    ``loader.pyramid_levels``. BigTIFF loaders lack that attribute and so
+    contribute full-resolution bytes only, which matches BigTIFF export (no
+    pyramids are written). When *include_pyramids* is False the pyramid bytes are
+    omitted (used when the pyramid-regeneration step is turned off). Sizes are
+    raw/uncompressed (output datasets use no compression), so this closely tracks
+    on-disk size aside from minor HDF5 chunk/metadata overhead.
+    """
+    from shifter.h5_utils import compute_pyramid_level_shape
+
+    if roi is not None:
+        rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
+        out_shape: tuple[int, int, int] = (rz_e - rz_s, ry_e - ry_s, rx_e - rx_s)
+    else:
+        out_shape = tuple(loader.shape)
+
+    total = out_shape[0] * out_shape[1] * out_shape[2] * bytes_per_voxel
+    if include_pyramids:
+        for _name, fw, fh, fd in getattr(loader, "pyramid_levels", []):
+            pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
+            if all(d > 0 for d in pshape):
+                total += pshape[0] * pshape[1] * pshape[2] * bytes_per_voxel
+    return total
 
 
 def estimate_output_sizes(
     loaders: list[Any],
     bytes_per_voxel: int = 2,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    include_pyramids: bool = True,
 ) -> list[int]:
-    """Estimate output file sizes in bytes.
+    """Estimate per-channel output file sizes in bytes.
+
+    Includes the regenerated resolution-pyramid levels for H5 exports (unless
+    *include_pyramids* is False). The previous full-resolution-only estimate
+    omitted them and under-reported the total by the pyramid sum (typically
+    ~12-16% for 2x2x2 + 3x3x3 factors); this matches the post-export accounting
+    behind ``bytes_written_gb``.
 
     Parameters
     ----------
     roi : tuple, optional
         (z_start, z_end, y_start, y_end, x_start, x_end) crop region.
         If provided, sizes are based on the ROI dimensions.
+    include_pyramids : bool
+        Count regenerated pyramid levels (True) or full-res only (False).
     """
-    sizes = []
-    if roi is not None:
-        rz_s, rz_e, ry_s, ry_e, rx_s, rx_e = roi
-        roi_nz = rz_e - rz_s
-        roi_ny = ry_e - ry_s
-        roi_nx = rx_e - rx_s
-        for _ in loaders:
-            sizes.append(roi_nz * roi_ny * roi_nx * bytes_per_voxel)
-    else:
-        for loader in loaders:
-            nz, ny, nx = loader.shape
-            sizes.append(nz * ny * nx * bytes_per_voxel)
-    return sizes
+    return [
+        _channel_output_bytes(loader, roi, bytes_per_voxel, include_pyramids)
+        for loader in loaders
+    ]
 
 
 def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
@@ -122,6 +213,101 @@ def _shift_slab_xy(slab: np.ndarray, sy: int, sx: int) -> np.ndarray:
             list(pool.map(_shift_plane, range(n_planes)))
 
     return slab
+
+
+def _read_full_slab(
+    dask_arr: da.Array,
+    out_z_start: int,
+    out_z_end: int,
+    sz: int,
+) -> np.ndarray:
+    """Read a full-XY Z-slab for a full-volume export, with the Z-shift applied.
+
+    Returns a writable ``(n_planes, ny, nx)`` uint16 array whose planes are the
+    source planes offset by *sz* along Z and zero-padded where the shifted read
+    window falls outside the source volume.
+
+    When the shifted window lies fully inside the volume -- the common interior
+    case, i.e. every slab except the one or two at the shifted Z-boundary -- the
+    materialised dask result is returned directly. This avoids allocating a
+    second full-size slab and copying into it, which previously doubled the peak
+    RAM of the read step. Only boundary slabs (or a slab entirely outside the
+    source range) allocate a zero-filled buffer.
+    """
+    nz, ny, nx = dask_arr.shape
+    n_planes = out_z_end - out_z_start
+
+    in_z_start = out_z_start - sz
+    in_z_end = out_z_end - sz
+    read_start = max(in_z_start, 0)
+    read_end = min(in_z_end, nz)
+
+    if read_start >= read_end:
+        # Entire slab maps outside the source volume -> all zeros.
+        return np.zeros((n_planes, ny, nx), dtype=np.uint16)
+
+    raw = np.asarray(dask_arr[read_start:read_end])
+
+    if read_start == in_z_start and read_end == in_z_end:
+        # No Z-padding needed: the read already covers every output plane, so
+        # return the freshly materialised array directly instead of allocating
+        # and copying into a second full-size slab. This is safe to mutate in
+        # place (the subsequent XY shift does so): computing a dask slice yields
+        # a freshly allocated array, and the production sources (h5py datasets,
+        # zarr stores) always copy out of storage on read, so ``raw`` never
+        # aliases any live buffer the caller still needs.
+        return raw
+
+    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
+    dst_start = read_start - in_z_start
+    slab[dst_start : dst_start + (read_end - read_start)] = raw
+    return slab
+
+
+def _log_slab_perf(
+    kind: str,
+    name: str,
+    z_start: int,
+    z_end: int,
+    nbytes: int,
+    t0: float,
+) -> None:
+    """Emit a DEBUG per-slab timing/throughput line plus a memory snapshot."""
+    if not is_debug_enabled():
+        return
+    dt = time.perf_counter() - t0
+    mib = nbytes / 1024**2
+    mibps = mib / dt if dt > 0 else 0.0
+    # One self-contained line per slab: timing, throughput, and the memory
+    # state at that moment. Folding the memory snapshot in (rather than a
+    # separate MEM line) halves the log volume now that debug is on by default.
+    log_debug(
+        f"slab {kind} {name} z=[{z_start}:{z_end}] planes={z_end - z_start} "
+        f"{mib:.1f}MiB in {dt * 1000:.0f}ms ({mibps:.0f} MiB/s) | {memory_status()}"
+    )
+
+
+def _log_pyramid_summary(name: str, summary: dict[str, Any]) -> None:
+    """Log the fused pyramid totals for a channel (INFO).
+
+    Pyramids are now built from the corrected slabs in memory, so there is no
+    reread of the output: the interesting numbers are compute vs write time and
+    the bytes produced.
+    """
+    from shifter.h5_utils import pyramid_backend
+
+    compute_s = summary["compute_s"]
+    write_s = summary["write_s"]
+    mib = summary["bytes_written"] / 1024**2
+    write_mibps = mib / write_s if write_s > 0 else 0.0
+    log_event(
+        f"pyramids {name} | levels={','.join(summary['levels']) or '-'} "
+        f"backend={pyramid_backend()} "
+        f"compute={compute_s:.1f}s write={write_s:.1f}s ({write_mibps:.0f} MiB/s) "
+        f"wrote={mib:.0f}MiB reread=0B"
+        + (f" | SKIPPED={','.join(summary['skipped'])}" if summary["skipped"] else "")
+        + (f" | INCOMPLETE: {'; '.join(summary['incomplete'])}" if summary["incomplete"] else "")
+    )
 
 
 def _read_roi_slab(
@@ -234,12 +420,19 @@ def _export_channel_roi_tiff(
                     return
 
                 slab_end = min(slab_start + chunk_z, out_nz)
+
+                t0 = time.perf_counter()
                 slab = _read_roi_slab(
                     dask_arr, roi, slab_start, slab_end, sz, sy, sx,
                 )
 
                 for i in range(slab.shape[0]):
                     tw.write(slab[i], photometric="minisblack", contiguous=True)
+
+                _log_slab_perf(
+                    "TIFF-ROI", output_path.name, slab_start, slab_end,
+                    slab.nbytes, t0,
+                )
 
                 bytes_done += slab.nbytes
                 if progress_callback:
@@ -301,35 +494,25 @@ def export_channel(
                     return
 
                 out_z_end = min(out_z_start + chunk_z, nz)
-                n_planes = out_z_end - out_z_start
 
-                # Determine which input Z-planes we need.
-                in_z_start = out_z_start - sz
-                in_z_end = out_z_end - sz
-
-                # Clamp to valid input range and figure out padding.
-                read_start = max(in_z_start, 0)
-                read_end = min(in_z_end, nz)
-
-                if read_start >= read_end:
-                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                else:
-                    raw = np.asarray(dask_arr[read_start:read_end])
-                    slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                    dst_start = read_start - in_z_start
-                    dst_end = dst_start + (read_end - read_start)
-                    slab[dst_start:dst_end] = raw
+                t0 = time.perf_counter()
+                slab = _read_full_slab(dask_arr, out_z_start, out_z_end, sz)
 
                 # Apply XY shifts (parallel across planes).
                 slab = _shift_slab_xy(slab, sy, sx)
 
                 # Write planes.
-                for i in range(n_planes):
+                for i in range(slab.shape[0]):
                     tw.write(
                         slab[i],
                         photometric="minisblack",
                         contiguous=True,
                     )
+
+                _log_slab_perf(
+                    "TIFF", output_path.name, out_z_start, out_z_end,
+                    slab.nbytes, t0,
+                )
 
                 bytes_done += slab.nbytes
                 if progress_callback:
@@ -392,6 +575,12 @@ def run_export(
         suffix = "_corrected"
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
+    log_event(
+        f"TIFF export plan | channels={n_channels} chunk_z={chunk_z} "
+        f"xy=({xy_shape[0]},{xy_shape[1]}) ram%={ram_percent} "
+        f"roi={roi is not None}"
+    )
+    log_memory("TIFF export start", level=logging.INFO)
 
     # Total bytes across all channels for progress reporting.
     if roi is not None:
@@ -458,12 +647,15 @@ def export_channel_h5(
     progress_callback: Any | None = None,
     cancel_check: Any | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    write_pyramids: bool = True,
 ) -> None:
     """Export a single corrected channel to a Luxendo .lux.h5 file.
 
     Writes the shift-corrected ``Data`` dataset, copies the original
-    ``metadata`` dataset verbatim, then regenerates all pyramid levels
-    that existed in the original file.
+    ``metadata`` dataset verbatim, then (when *write_pyramids* is True)
+    regenerates all pyramid levels that existed in the original file.
+    Pyramid regeneration re-reads the full ``Data`` volume once per level and
+    dominates export time on large volumes, so *write_pyramids=False* skips it.
 
     Parameters
     ----------
@@ -490,10 +682,10 @@ def export_channel_h5(
     """
     import h5py
 
-    from chromatic_shift_corrector.h5_utils import (
+    from shifter.h5_utils import (
+        StreamingPyramidWriter,
         compute_pyramid_level_shape,
         detect_pyramid_levels,
-        generate_pyramid_level,
     )
 
     nz, ny, nx = dask_arr.shape
@@ -517,7 +709,9 @@ def export_channel_h5(
     # Clamp chunk sizes to output dimensions for ROI exports.
     h5_chunks = tuple(min(c, d) for c, d in zip(orig_chunks, (out_nz, out_ny, out_nx)))
 
-    pyramid_levels = detect_pyramid_levels(original_h5)
+    # Empty pyramid list when disabled: this makes both the byte-total below and
+    # the regeneration loop further down no-ops, without special-casing either.
+    pyramid_levels = detect_pyramid_levels(original_h5) if write_pyramids else []
     total_bytes = out_nz * out_ny * out_nx * 2
     for _name, fw, fh, fd in pyramid_levels:
         pnz, pny, pnx = compute_pyramid_level_shape((out_nz, out_ny, out_nx), fw, fh, fd)
@@ -534,6 +728,19 @@ def export_channel_h5(
                 chunks=h5_chunks,
             )
 
+            # Pyramids are built from each corrected slab while it is still in
+            # memory, so the output Data is never read back. Datasets are created
+            # here, before the first slab, and fed by the loops below.
+            pyramid_writer = None
+            if pyramid_levels:
+                pyr_chunks = {}
+                for level_name, _fw, _fh, _fd in pyramid_levels:
+                    src = original_h5.get(level_name)
+                    pyr_chunks[level_name] = getattr(src, "chunks", None)
+                pyramid_writer = StreamingPyramidWriter(
+                    out_h5, pyramid_levels, (out_nz, out_ny, out_nx), pyr_chunks
+                )
+
             if roi is not None:
                 # ROI export: read only the needed sub-region.
                 for slab_start in range(0, out_nz, chunk_z):
@@ -541,12 +748,24 @@ def export_channel_h5(
                         return
 
                     slab_end = min(slab_start + chunk_z, out_nz)
+
+                    t0 = time.perf_counter()
                     slab = _read_roi_slab(
                         dask_arr, roi, slab_start, slab_end, sz, sy, sx,
                     )
                     ds[slab_start:slab_end] = slab
 
-                    bytes_done += slab.nbytes
+                    pyramid_bytes = 0
+                    if pyramid_writer is not None:
+                        pyramid_bytes = pyramid_writer.consume(slab, slab_start)
+
+                    _log_slab_perf(
+                        "H5-ROI", output_path.name, slab_start, slab_end,
+                        slab.nbytes, t0,
+                    )
+
+                    bytes_done += slab.nbytes + pyramid_bytes
+                    del slab  # release before the next (multi-GiB) allocation
                     if progress_callback:
                         progress_callback(bytes_done, total_bytes)
             else:
@@ -556,29 +775,26 @@ def export_channel_h5(
                         return
 
                     out_z_end = min(out_z_start + chunk_z, nz)
-                    n_planes = out_z_end - out_z_start
 
-                    in_z_start = out_z_start - sz
-                    in_z_end = out_z_end - sz
-
-                    read_start = max(in_z_start, 0)
-                    read_end = min(in_z_end, nz)
-
-                    if read_start >= read_end:
-                        slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                    else:
-                        raw = np.asarray(dask_arr[read_start:read_end])
-                        slab = np.zeros((n_planes, ny, nx), dtype=np.uint16)
-                        dst_start = read_start - in_z_start
-                        dst_end = dst_start + (read_end - read_start)
-                        slab[dst_start:dst_end] = raw
+                    t0 = time.perf_counter()
+                    slab = _read_full_slab(dask_arr, out_z_start, out_z_end, sz)
 
                     # Apply XY shifts (parallel across planes).
                     slab = _shift_slab_xy(slab, sy, sx)
 
                     ds[out_z_start:out_z_end] = slab
 
-                    bytes_done += slab.nbytes
+                    pyramid_bytes = 0
+                    if pyramid_writer is not None:
+                        pyramid_bytes = pyramid_writer.consume(slab, out_z_start)
+
+                    _log_slab_perf(
+                        "H5", output_path.name, out_z_start, out_z_end,
+                        slab.nbytes, t0,
+                    )
+
+                    bytes_done += slab.nbytes + pyramid_bytes
+                    del slab  # release before the next (multi-GiB) allocation
                     if progress_callback:
                         progress_callback(bytes_done, total_bytes)
 
@@ -587,25 +803,11 @@ def export_channel_h5(
                 raw_meta = original_h5["metadata"][()]
                 out_h5.create_dataset("metadata", data=raw_meta)
 
-            # Regenerate pyramid levels.
-            for level_name, fw, fh, fd in pyramid_levels:
-                if cancel_check and cancel_check():
-                    return
-
-                # Match original chunking for this pyramid level.
-                orig_pyr = original_h5[level_name]
-                pyr_chunks = orig_pyr.chunks if orig_pyr.chunks else None
-
-                logger.info("Regenerating pyramid level %s (factors %d\u00d7%d\u00d7%d)", level_name, fw, fh, fd)
-                generate_pyramid_level(out_h5, level_name, fw, fh, fd, chunks=pyr_chunks)
-
-                pnz, pny, pnx = compute_pyramid_level_shape(
-                    (out_nz, out_ny, out_nx), fw, fh, fd
-                )
-                if pnz > 0 and pny > 0 and pnx > 0:
-                    bytes_done += pnz * pny * pnx * 2
-                    if progress_callback:
-                        progress_callback(bytes_done, total_bytes)
+            # Pyramids were built alongside Data, so there is nothing to
+            # regenerate here \u2014 just close them out and report.
+            if pyramid_writer is not None:
+                summary = pyramid_writer.finish()
+                _log_pyramid_summary(output_path.name, summary)
 
 
 def run_export_h5(
@@ -618,6 +820,7 @@ def run_export_h5(
     voxel_xy: float = 1.0,
     voxel_z: float = 1.0,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    write_pyramids: bool = True,
 ) -> Path:
     """Export all H5 channels with corrections applied.
 
@@ -645,8 +848,6 @@ def run_export_h5(
     Path
         Path to the written metadata JSON file.
     """
-    from chromatic_shift_corrector.h5_utils import compute_pyramid_level_shape
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -667,26 +868,29 @@ def run_export_h5(
         suffix = ""
 
     chunk_z = compute_chunk_size(xy_shape, n_channels, ram_percent)
+    log_event(
+        f"H5 export plan | channels={n_channels} chunk_z={chunk_z} "
+        f"xy=({xy_shape[0]},{xy_shape[1]}) ram%={ram_percent} "
+        f"roi={roi is not None} pyramids={write_pyramids}"
+    )
+    if write_pyramids:
+        # Report up front, not after an hour of work, so a silent fall back to
+        # the slow single-threaded reduction is obvious before the run starts.
+        from shifter.h5_utils import pyramid_backend_status
+
+        log_event(f"Pyramid reduction backend: {pyramid_backend_status()}")
+    log_memory("H5 export start", level=logging.INFO)
 
     # Track progress in bytes rather than Z-planes: pyramid regeneration
     # (which runs after "Data" is fully written, per channel) writes no
     # planes of its own, so a plane-based total would leave the progress
     # indicator stuck once Data finishes while pyramids are still churning.
-    def _channel_out_shape(loader: Any) -> tuple[int, int, int]:
-        if roi is not None:
-            return (rz_e - rz_s, ry_e - ry_s, rx_e - rx_s)
-        return loader.shape
-
-    def _channel_total_bytes(loader: Any) -> int:
-        out_shape = _channel_out_shape(loader)
-        total = out_shape[0] * out_shape[1] * out_shape[2] * 2
-        for _name, fw, fh, fd in loader.pyramid_levels:
-            pshape = compute_pyramid_level_shape(out_shape, fw, fh, fd)
-            if all(d > 0 for d in pshape):
-                total += pshape[0] * pshape[1] * pshape[2] * 2
-        return total
-
-    channel_bytes = [_channel_total_bytes(loader) for loader in loaders]
+    # _channel_output_bytes counts full-res + every regenerated pyramid level,
+    # the same accounting the pre-export estimate uses.
+    channel_bytes = [
+        _channel_output_bytes(loader, roi, include_pyramids=write_pyramids)
+        for loader in loaders
+    ]
     total_bytes = sum(channel_bytes)
     global_bytes_done = 0
 
@@ -709,6 +913,7 @@ def run_export_h5(
             progress_callback=_channel_progress,
             cancel_check=cancel_check,
             roi=roi,
+            write_pyramids=write_pyramids,
         )
         global_bytes_done += channel_bytes[i]
 
@@ -723,9 +928,9 @@ def run_export_h5(
 
         # Add channel_description and pyramid info.
         cd["channel_description"] = loader.channel_description
-        cd["pyramid_levels_regenerated"] = [
-            lvl[0] for lvl in loader.pyramid_levels
-        ]
+        cd["pyramid_levels_regenerated"] = (
+            [lvl[0] for lvl in loader.pyramid_levels] if write_pyramids else []
+        )
 
     vol_shape = ref_shape
     if roi is not None:
@@ -736,28 +941,60 @@ def run_export_h5(
     )
     metadata["input_format"] = "luxendo_h5"
     metadata["voxel_size_source"] = "h5_metadata"
+    metadata["pyramids_written"] = write_pyramids
     metadata["bytes_written"] = total_bytes
     metadata["bytes_written_gb"] = round(total_bytes / (1024**3), 3)
 
-    # Full-volume exports keep original filenames, so copy any companion
-    # Imaris/BigDataViewer header files (.ims, *_bdv.h5, *_bdv.xml) from the
-    # input directory alongside the exported data — a ROI-cropped export has
-    # different dimensions and can't be opened via the original headers.
-    if roi is None:
-        from chromatic_shift_corrector.h5_utils import (
-            copy_companion_header_files,
-            find_companion_header_files,
-        )
+    # Write companion Imaris/BigDataViewer header files (.ims, *_bdv.h5,
+    # *_bdv.xml) alongside the exported data. These headers describe a
+    # MULTI-resolution dataset and reference the per-channel data (and pyramid
+    # levels) via HDF5 external links, so they must be reconciled with what was
+    # actually written:
+    #   * full volume + pyramids  -> copy verbatim (headers already match)
+    #   * full volume, no pyramids -> reduce to a single (full-res) level, else
+    #     their links to the absent pyramids make viewers read the data as corrupt
+    #   * ROI                       -> regenerate with the ROI filenames, cropped
+    #     dimensions/extent, and (when pyramids are off) a single level
+    from shifter.h5_utils import (
+        copy_companion_header_files,
+        find_companion_header_files,
+        write_roi_headers,
+        write_single_resolution_headers,
+    )
 
-        input_dir = loaders[0].path.parent
-        header_files = find_companion_header_files(input_dir)
-        if header_files:
-            copied = copy_companion_header_files(header_files, output_dir)
-            log_event(
-                "Copied companion header files: "
-                + ", ".join(p.name for p in copied)
-            )
-            metadata["companion_header_files"] = [p.name for p in copied]
+    input_dir = loaders[0].path.parent
+    header_files = find_companion_header_files(input_dir)
+    if header_files and roi is not None:
+        written = write_roi_headers(
+            header_files, output_dir, suffix, roi, write_pyramids
+        )
+        log_event(
+            "Wrote ROI companion headers: "
+            + ", ".join(p.name for p in written)
+        )
+        metadata["companion_header_files"] = [p.name for p in written]
+        metadata["companion_headers_roi"] = True
+        metadata["companion_headers_single_resolution"] = not write_pyramids
+    elif header_files and not write_pyramids:
+        # Pyramids weren't written, so the multi-resolution headers would link
+        # to absent pyramid levels (which Imaris/BigDataViewer read as corrupt).
+        # Rewrite them to reference only the full-resolution Data.
+        written = write_single_resolution_headers(
+            header_files, output_dir, output_shape_zyx=tuple(ref_shape)
+        )
+        log_event(
+            "Wrote single-resolution companion headers: "
+            + ", ".join(p.name for p in written)
+        )
+        metadata["companion_header_files"] = [p.name for p in written]
+        metadata["companion_headers_single_resolution"] = True
+    elif header_files:
+        copied = copy_companion_header_files(header_files, output_dir)
+        log_event(
+            "Copied companion header files: "
+            + ", ".join(p.name for p in copied)
+        )
+        metadata["companion_header_files"] = [p.name for p in copied]
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path

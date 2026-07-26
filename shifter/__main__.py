@@ -1,11 +1,11 @@
-"""Allow running as `python -m chromatic_shift_corrector`."""
+"""Allow running as `python -m shifter`."""
 
 import sys
 
 try:
-    from chromatic_shift_corrector._qt_setup import ensure_qt
+    from shifter._qt_setup import ensure_qt
     ensure_qt()
-    from chromatic_shift_corrector.main import main
+    from shifter.main import main
     main()
 except ImportError as e:
     if "Qt" in str(e) or "QtBindingsNotFoundError" in type(e).__name__:

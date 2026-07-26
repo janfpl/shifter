@@ -118,7 +118,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2.  Set up performance logging
     # ------------------------------------------------------------------
-    from chromatic_shift_corrector.perf_logger import setup_perf_log, timed_operation, log_event
+    from shifter.perf_logger import setup_perf_log, timed_operation, log_event
 
     log_path = setup_perf_log(outdir)
     log_event(f"Benchmark started | volume shape={shape} "
@@ -140,7 +140,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4.  Benchmark each registration algorithm
     # ------------------------------------------------------------------
-    from chromatic_shift_corrector.registration import ALGORITHM_REGISTRY
+    from shifter.registration import ALGORITHM_REGISTRY
 
     print("\n=== Registration benchmarks ===")
 
@@ -169,8 +169,8 @@ def main() -> None:
     print("\n=== Export benchmark (BigTIFF) ===")
 
     import dask.array as da
-    from chromatic_shift_corrector.shift_manager import ShiftManager, ChannelTransform
-    from chromatic_shift_corrector.export_engine import export_channel, compute_chunk_size
+    from shifter.shift_manager import ShiftManager, ChannelTransform
+    from shifter.export_engine import export_channel, compute_chunk_size
 
     export_dir = outdir / "exported"
     export_dir.mkdir()

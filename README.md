@@ -14,12 +14,28 @@ conda activate shifter
 pip install -e .
 ```
 
-> **Note:** Installing `numba` via conda is recommended because it provides pre-built
-> binaries for `numba` and its dependency `llvmlite`. Installing these via pip may fail
-> on macOS and other platforms due to build toolchain incompatibilities. If you skip the
-> conda numba install, mutual-information registration will still work but will use a
-> slower pure-NumPy fallback. You can also install numba as a pip extra with
-> `pip install -e ".[numba]"`, though this may require additional build dependencies.
+> **Install `numba` — it is strongly recommended, not cosmetic.** It parallelises two
+> hot paths across CPU cores. On a measured 431 GiB two-channel export, pyramid
+> generation took **103 s per channel with numba versus 631 s without (6.1×)**, and
+> mutual-information registration is likewise far slower on the pure-NumPy fallback.
+> Results are bit-identical either way — only the speed differs.
+>
+> Install it via conda (as in the command above) because conda ships pre-built binaries
+> for `numba` and its dependency `llvmlite`; installing via pip may fail on macOS and
+> other platforms due to build toolchain incompatibilities. The pip extra
+> `pip install -e ".[numba]"` also works but may require additional build dependencies.
+>
+> To confirm it is active in the environment you actually run the app from:
+>
+> ```bash
+> conda activate shifter
+> python -c "import numba; print(numba.__version__)"
+> ```
+>
+> Every export also logs the backend in use — look for
+> `Pyramid reduction backend: numba (N threads)` near the top of
+> `performance_log.txt`. If it instead reads `numpy (single-threaded fallback …)`, the
+> line names the underlying error.
 
 For GPU acceleration (optional, requires **CUDA Toolkit 12.6**):
 
@@ -36,7 +52,7 @@ Requires Python 3.12.
 Launch the application:
 
 ```bash
-python -m chromatic_shift_corrector
+python -m shifter
 ```
 
 This opens a napari viewer with the Chromatic Shift Corrector widget docked on the right.
@@ -55,7 +71,7 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 - Reads the `Data` dataset as the full-resolution volume
 - Detects and displays resolution pyramid levels (`Data_W_H_D` naming convention) as napari multiscale layers
 - Parses embedded JSON metadata for voxel sizes and channel descriptions
-- On export, pyramids are regenerated for corrected volumes using block averaging
+- On export, pyramids are regenerated for corrected volumes using block averaging (on by default; can be disabled — see Export)
 
 ## Workflow
 
@@ -69,13 +85,17 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 
 ### 2. Register Channels
 
-Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm, and run.
+Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
 
 Results populate the shift table with X/Y/Z voxel shifts and a confidence score per channel. Confidence is color-coded in the table (green = high, red = low).
+
+The progress bar advances at sub-channel resolution — for Mutual Information it moves through the coarse and fine search passes rather than jumping once per channel — and the status text shows which channel is being registered.
 
 **Preprocessing options:**
 - Background subtraction (percentile-based)
 - Gaussian smoothing
+
+When registration finishes it releases the working memory it allocated (several full-precision copies of the sub-volume) back to the OS — running a garbage collection, freeing GPU/pinned memory pools when the GPU path was used, and trimming the process heap. This keeps the resident footprint from lingering at its peak, which also matters for a subsequent export: slab sizing is based on *available* RAM, so memory the process is still hoarding would otherwise shrink the export's budget. The performance log records a before/after memory snapshot (written to the output directory if one is selected, otherwise the input data directory) so you can see how much was reclaimed.
 
 ### 3. Adjust Shifts
 
@@ -85,11 +105,76 @@ Shifts can be edited manually via spinboxes in the shift table. Use the preview 
 
 Select an output directory and RAM allocation (50-95% of system memory). Choose whether to export the **full volume** or **ROI only** (crops to the current ROI rectangle and Z range). The export streams corrected volumes in Z-slab chunks, writing one file per channel. Progress is reported in actual bytes written (not Z-planes), so for Luxendo H5 output the indicator keeps moving through pyramid regeneration instead of appearing to finish early. A `correction_metadata.json` sidecar is written alongside the output files containing all shift parameters, voxel sizes, processing details, and the total bytes written (`bytes_written_gb`). ROI exports include the crop bounds in the metadata and use a `_corrected_roi` filename suffix.
 
+The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
+
+**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **on by default**. Every level is built from each corrected slab while it is still in memory — the written `Data` is **never read back** — and the reduction is parallelised across CPU cores, so the pyramid phase is now a modest addition rather than the dominant cost.
+
+Measured on a 431 GiB two-channel export (3099 × 6979 × 5347, five pyramid levels, 32-core machine):
+
+| Build | Pyramid compute / channel | Total export |
+|---|---|---|
+| Original (re-read `Data` once per level) | 3 h 52 m | **8 h 53 m** |
+| Streaming, single-threaded numpy | 631 s | **44.8 m** |
+| Streaming + numba (current) | **103 s** | **28.6 m** |
+| Pyramids disabled (floor) | — | 21.3 m |
+
+That is **18.7× faster than the original build**, and pyramids now cost ~7 min on top of the 21.3 min pyramids-off floor (they used to cost 23.5 min). Roughly 80% of the remaining runtime is disk I/O.
+
+Untick the box for the fastest possible export when only full resolution is needed — the output `.lux.h5` then contains just `Data`, the size estimate and `bytes_written_gb` reflect full resolution only, and the companion headers are rewritten to describe a single resolution level.
+
+Three properties make this exact and fast:
+
+- Sums are accumulated as **integers** rather than `float64` (integer floor division of the block sum is identical to truncating the float mean for uint16 input).
+- Where one level's factors divide another's (the usual 2/4/8 ladder), the coarser level is derived from the finer level's **unrounded sums** instead of from the full-resolution slab again.
+- The XY reduction is **parallelised across CPU cores with numba** when it is installed. This is safe precisely because the sums are integers — addition is associative and commutative and the accumulator cannot overflow, so evaluation order does not change the result. **Without numba the reduction falls back to a single-threaded numpy path measured 6.1× slower** (results are identical either way), so check the log line `Pyramid reduction backend:` — it states which backend is in use and, when numba is missing, why.
+
+Setting `CSC_PYRAMID_GPU=1` runs the XY reduction on the GPU via CuPy instead. This copies each slab to the device, so it only helps when the GPU is otherwise idle and the CPU is the bottleneck; numba is the better default. The chosen backend is recorded in `performance_log.txt` (`backend=numba|gpu|numpy`).
+
+### CPU usage
+
+Parallel work — pyramid generation, per-plane XY shifts, FFT-based registration, and the mutual-information grid search — uses **all logical cores except four**, which are left free so the OS and the napari UI stay responsive. The reservation is capped at half the machine, so smaller systems still get useful parallelism (32 cores → 28 workers, 16 → 12, 8 → 4, 4 → 2). On Linux the count respects the process's CPU affinity mask, so a restricted core set is honoured.
+
+Two environment variables override this:
+
+```bash
+CSC_MAX_WORKERS=16     # use exactly this many worker threads
+CSC_RESERVED_CORES=8   # leave this many cores free instead of 4
+```
+
+The count in effect is recorded at the top of `performance_log.txt` (`CPU cores: N available, using M worker threads`).
+
+Companion Imaris (`.ims`) and BigDataViewer (`*_bdv.h5`) headers describe a *multi-resolution* dataset and link to the pyramid levels. With pyramids **on** they are copied verbatim; with pyramids **off** they are **rewritten to a single (full-resolution) level** so they still resolve against the pyramid-less output — e.g. for import into the Imaris File Converter, which builds its own pyramids from the full-resolution data. (Copying the original multi-resolution headers next to pyramid-less data would make Imaris/BigDataViewer read the dataset as corrupt.)
+
+To repair a folder that was exported by an older build (multi-resolution headers copied next to pyramid-less data), reduce the headers in place without re-exporting:
+
+```bash
+python -m shifter.fix_headers /path/to/export_folder
+```
+
+### Export diagnostics
+
+Every export writes a `performance_log.txt` into the output directory with timestamped start/end markers and elapsed times for each phase. By default the log is written at **DEBUG** level, which also records the chunk-size decision (and which limit bound it), a memory snapshot at export start, and a per-slab line with timing, throughput (MiB/s), and memory usage — useful for tracking down slow or memory-hungry exports. The log is rewritten from scratch on each export (it does not accumulate across runs), and the per-slab overhead is negligible against the disk I/O each slab performs.
+
+To keep only the INFO-level phase markers and suppress the extra detail, set `CSC_DEBUG` to a falsy value before launching:
+
+```bash
+# Windows (cmd) — disable the extra debug detail
+set CSC_DEBUG=0
+python -m shifter
+
+# macOS / Linux
+CSC_DEBUG=0 python -m shifter
+```
+
+Setting `CSC_DEBUG=1` (or leaving it unset) keeps the debug diagnostics on.
+
 Output format matches the input format:
 - BigTIFF input produces BigTIFF output, using a `_corrected` filename suffix
-- Luxendo H5 input produces H5 output with regenerated resolution pyramids and preserved metadata
+- Luxendo H5 input produces H5 output with preserved metadata and, when the pyramid checkbox is enabled, regenerated resolution pyramids
 
-**Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are copied verbatim into the output directory alongside the corrected data. ROI exports still use the `_corrected_roi` suffix and do not copy these header files, since a cropped sub-volume has different dimensions and can't be opened via the original headers.
+**Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are written into the output directory alongside the corrected data (copied verbatim with pyramids on, or reduced to a single level with pyramids off — see above).
+
+**ROI exports** use the `_corrected_roi` suffix and now also get companion headers, **regenerated** for the crop: the `.ims` / `*_bdv.h5` external links are repointed to the `_corrected_roi` files, and the Imaris `.ims` is given the ROI's voxel dimensions and a cropped physical extent (voxel size preserved). The BigDataViewer `*_bdv.xml` is not regenerated for ROI (its dimensions can't be rewritten reliably here); Imaris — which uses the `.ims` — is unaffected. As with full-volume, pyramid levels are included only when the pyramid checkbox is ticked.
 
 ## Registration Algorithms
 
@@ -121,7 +206,7 @@ Normalizes both volumes to zero mean and unit variance before FFT-based cross-co
 | Parameters | None (beyond search range) |
 | GPU | Supported via CuPy |
 
-Recommended as the default algorithm for most datasets.
+A fast, robust general-purpose option when channels have similar intensity profiles.
 
 ### Mutual Information
 
@@ -135,7 +220,7 @@ Coarse-to-fine exhaustive search maximizing mutual information via joint histogr
 | Parameters | None (beyond search range) |
 | GPU | Supported via CuPy (accelerates histogram computation) |
 
-Use when Phase Cross-Correlation and ZNCC fail due to dissimilar intensity distributions between channels.
+This is the default algorithm. It is the most robust across dissimilar intensity distributions between channels (e.g. different fluorophores), at the cost of speed; install `numba` (recommended) for a large parallel speed-up.
 
 ## GPU Acceleration
 
@@ -184,5 +269,5 @@ Ensure the path points to your CUDA 12.6 installation.
 - psutil (>=5.9)
 - qtpy (>=2.3)
 - matplotlib (>=3.5)
-- numba (optional, for faster mutual-information registration; install via conda)
+- numba (recommended: parallelises pyramid generation and mutual-information registration; install via conda)
 - CuPy (optional, for GPU acceleration)

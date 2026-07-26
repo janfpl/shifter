@@ -10,7 +10,8 @@ import logging
 
 import numpy as np
 
-from chromatic_shift_corrector.registration.base import (
+from shifter.registration.base import (
+    ProgressCallback,
     RegistrationAlgorithm,
     RegistrationResult,
 )
@@ -22,6 +23,16 @@ ALGORITHM_NAME = "Mutual Information"
 _MI_BINS = 64
 _COARSE_STEP = 5
 _FINE_RADIUS = 5
+
+# Target number of progress updates emitted per search phase (coarse, fine).
+# The coarse pass reports across [0.0, 0.5] and the fine pass across [0.5, 1.0].
+_PROGRESS_BATCHES = 24
+
+
+def _report(progress_callback: ProgressCallback | None, fraction: float) -> None:
+    """Call *progress_callback* with a clamped fraction in [0, 1], if provided."""
+    if progress_callback is not None:
+        progress_callback(min(1.0, max(0.0, fraction)))
 
 # ---------------------------------------------------------------------------
 # Try to import numba; fall back gracefully if unavailable.
@@ -184,6 +195,36 @@ try:
             )
         return mi_values
 
+    def _grid_search_batched(
+        ref: np.ndarray,
+        mov: np.ndarray,
+        shifts: np.ndarray,
+        bins: int,
+        progress_callback: ProgressCallback | None,
+        f0: float,
+        f1: float,
+    ) -> np.ndarray:
+        """Evaluate MI over *shifts* in batches, reporting progress in [f0, f1].
+
+        Splitting the (otherwise single) parallel njit call into a handful of
+        batches lets us emit progress between them. MI per shift is independent,
+        so the concatenated result is identical to evaluating every shift in one
+        call — only the reporting granularity changes.
+        """
+        n = shifts.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        if n == 0:
+            return out
+        n_batches = min(_PROGRESS_BATCHES, n)
+        for b in range(n_batches):
+            a = (b * n) // n_batches
+            c = ((b + 1) * n) // n_batches
+            if c <= a:
+                continue
+            out[a:c] = _parallel_grid_search(ref, mov, shifts[a:c], bins)
+            _report(progress_callback, f0 + (f1 - f0) * (c / n))
+        return out
+
     _HAVE_NUMBA = True
     logger.debug("numba available – parallel MI grid search enabled")
 
@@ -292,17 +333,20 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         search_range_xy: int,
         search_range_z: int,
         use_gpu: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         if use_gpu:
             try:
                 return self._register_gpu(
-                    reference_volume, moving_volume, search_range_xy, search_range_z
+                    reference_volume, moving_volume, search_range_xy, search_range_z,
+                    progress_callback,
                 )
             except Exception as exc:
                 logger.warning("GPU MI registration failed (%s), falling back to CPU", exc)
 
         return self._register_cpu(
-            reference_volume, moving_volume, search_range_xy, search_range_z
+            reference_volume, moving_volume, search_range_xy, search_range_z,
+            progress_callback,
         )
 
     # ------------------------------------------------------------------ #
@@ -315,13 +359,14 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         mov: np.ndarray,
         sr_xy: int,
         sr_z: int,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         ref_f = np.ascontiguousarray(ref, dtype=np.float64)
         mov_f = np.ascontiguousarray(mov, dtype=np.float64)
 
         if _HAVE_NUMBA:
-            return self._register_cpu_numba(ref_f, mov_f, sr_xy, sr_z)
-        return self._register_cpu_serial(ref_f, mov_f, sr_xy, sr_z)
+            return self._register_cpu_numba(ref_f, mov_f, sr_xy, sr_z, progress_callback)
+        return self._register_cpu_serial(ref_f, mov_f, sr_xy, sr_z, progress_callback)
 
     def _register_cpu_numba(
         self,
@@ -329,11 +374,14 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         mov: np.ndarray,
         sr_xy: int,
         sr_z: int,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         """Numba-accelerated parallel coarse-to-fine MI search."""
-        # ---- coarse pass (parallel) ------------------------------------
+        # ---- coarse pass (parallel, batched for progress) --------------
         coarse_shifts = _build_shifts_array(sr_xy, sr_z, _COARSE_STEP)
-        coarse_mi = _parallel_grid_search(ref, mov, coarse_shifts, _MI_BINS)
+        coarse_mi = _grid_search_batched(
+            ref, mov, coarse_shifts, _MI_BINS, progress_callback, 0.0, 0.5
+        )
 
         best_idx = int(np.argmax(coarse_mi))
         best_shift = (
@@ -342,12 +390,14 @@ class MutualInformationRegistration(RegistrationAlgorithm):
             int(coarse_shifts[best_idx, 2]),
         )
 
-        # ---- fine pass (parallel) --------------------------------------
+        # ---- fine pass (parallel, batched for progress) ----------------
         fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         fine_shifts = _build_fine_shifts_array(best_shift, fine_radius, sr_xy, sr_z)
 
         if fine_shifts.shape[0] > 0:
-            fine_mi = _parallel_grid_search(ref, mov, fine_shifts, _MI_BINS)
+            fine_mi = _grid_search_batched(
+                ref, mov, fine_shifts, _MI_BINS, progress_callback, 0.5, 1.0
+            )
             fine_best_idx = int(np.argmax(fine_mi))
             best_shift = (
                 int(fine_shifts[fine_best_idx, 0]),
@@ -357,6 +407,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
             peak_mi = float(fine_mi[fine_best_idx])
             all_mi = np.concatenate([coarse_mi, fine_mi])
         else:
+            _report(progress_callback, 1.0)
             peak_mi = float(coarse_mi[best_idx])
             all_mi = coarse_mi
 
@@ -377,18 +428,23 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         mov: np.ndarray,
         sr_xy: int,
         sr_z: int,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         """Pure-numpy serial fallback (no numba)."""
         # ---- coarse pass ------------------------------------------------
         coarse_step = _COARSE_STEP
         best_shift, mi_values = self._grid_search(
-            ref, mov, sr_xy, sr_z, coarse_step
+            ref, mov, sr_xy, sr_z, coarse_step, progress_callback, 0.0, 0.5
         )
 
         # ---- fine pass --------------------------------------------------
         fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         fine_shifts: list[tuple[int, int, int, float]] = []
         bz, by, bx = best_shift
+        # Report progress across [0.5, 1.0] as we walk the fine neighbourhood.
+        fine_total = max(1, (2 * fine_radius + 1) ** 3)
+        report_every = max(1, fine_total // _PROGRESS_BATCHES)
+        fine_seen = 0
         for dz in range(bz - fine_radius, bz + fine_radius + 1):
             if abs(dz) > sr_z:
                 continue
@@ -398,12 +454,17 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                 for dx in range(bx - fine_radius, bx + fine_radius + 1):
                     if abs(dx) > sr_xy:
                         continue
+                    fine_seen += 1
+                    if fine_seen % report_every == 0:
+                        _report(progress_callback, 0.5 + 0.5 * (fine_seen / fine_total))
                     overlap = _overlapping_regions(ref, mov, dz, dy, dx)
                     if overlap is None:
                         continue
                     mi = _compute_mi(overlap[0], overlap[1])
                     fine_shifts.append((dz, dy, dx, mi))
                     mi_values.append(mi)
+
+        _report(progress_callback, 1.0)
 
         if fine_shifts:
             best = max(fine_shifts, key=lambda t: t[3])
@@ -430,15 +491,31 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         sr_xy: int,
         sr_z: int,
         step: int,
+        progress_callback: ProgressCallback | None = None,
+        f0: float = 0.0,
+        f1: float = 1.0,
     ) -> tuple[tuple[int, int, int], list[float]]:
-        """Exhaustive grid search and return (best_shift, all_mi_values)."""
+        """Exhaustive grid search and return (best_shift, all_mi_values).
+
+        Reports progress across [f0, f1] as the search walks the grid.
+        """
         best_mi = -np.inf
         best_shift = (0, 0, 0)
         mi_values: list[float] = []
 
-        for dz in range(-sr_z, sr_z + 1, step):
-            for dy in range(-sr_xy, sr_xy + 1, step):
-                for dx in range(-sr_xy, sr_xy + 1, step):
+        zs = range(-sr_z, sr_z + 1, step)
+        ys = range(-sr_xy, sr_xy + 1, step)
+        xs = range(-sr_xy, sr_xy + 1, step)
+        total = max(1, len(zs) * len(ys) * len(xs))
+        report_every = max(1, total // _PROGRESS_BATCHES)
+        seen = 0
+
+        for dz in zs:
+            for dy in ys:
+                for dx in xs:
+                    seen += 1
+                    if seen % report_every == 0:
+                        _report(progress_callback, f0 + (f1 - f0) * (seen / total))
                     overlap = _overlapping_regions(ref, mov, dz, dy, dx)
                     if overlap is None:
                         continue
@@ -448,6 +525,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                         best_mi = mi
                         best_shift = (dz, dy, dx)
 
+        _report(progress_callback, f1)
         return best_shift, mi_values
 
     @staticmethod
@@ -474,6 +552,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         mov: np.ndarray,
         sr_xy: int,
         sr_z: int,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         """GPU-accelerated MI registration.
 
@@ -511,15 +590,25 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                 return None
             return rg[rz0:rz1, ry0:ry1, rx0:rx1], mg[mz0:mz1, my0:my1, mx0:mx1]
 
-        # Coarse search.
+        # Coarse search (progress across [0.0, 0.5]).
         best_mi = -np.inf
         best_shift = (0, 0, 0)
         mi_values: list[float] = []
         step = _COARSE_STEP
 
-        for dz in range(-sr_z, sr_z + 1, step):
-            for dy in range(-sr_xy, sr_xy + 1, step):
-                for dx in range(-sr_xy, sr_xy + 1, step):
+        zs = range(-sr_z, sr_z + 1, step)
+        ys = range(-sr_xy, sr_xy + 1, step)
+        xs = range(-sr_xy, sr_xy + 1, step)
+        coarse_total = max(1, len(zs) * len(ys) * len(xs))
+        coarse_every = max(1, coarse_total // _PROGRESS_BATCHES)
+        coarse_seen = 0
+
+        for dz in zs:
+            for dy in ys:
+                for dx in xs:
+                    coarse_seen += 1
+                    if coarse_seen % coarse_every == 0:
+                        _report(progress_callback, 0.5 * (coarse_seen / coarse_total))
                     ov = _overlap_gpu(ref_g, mov_g, dz, dy, dx)
                     if ov is None:
                         continue
@@ -529,9 +618,12 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                         best_mi = mi
                         best_shift = (dz, dy, dx)
 
-        # Fine search.
+        # Fine search (progress across [0.5, 1.0]).
         fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         bz, by, bx = best_shift
+        fine_total = max(1, (2 * fine_radius + 1) ** 3)
+        fine_every = max(1, fine_total // _PROGRESS_BATCHES)
+        fine_seen = 0
         for dz in range(bz - fine_radius, bz + fine_radius + 1):
             if abs(dz) > sr_z:
                 continue
@@ -541,6 +633,9 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                 for dx in range(bx - fine_radius, bx + fine_radius + 1):
                     if abs(dx) > sr_xy:
                         continue
+                    fine_seen += 1
+                    if fine_seen % fine_every == 0:
+                        _report(progress_callback, 0.5 + 0.5 * (fine_seen / fine_total))
                     ov = _overlap_gpu(ref_g, mov_g, dz, dy, dx)
                     if ov is None:
                         continue
@@ -550,6 +645,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                         best_mi = mi
                         best_shift = (dz, dy, dx)
 
+        _report(progress_callback, 1.0)
         confidence = self._compute_confidence(best_mi, mi_values)
 
         return RegistrationResult(

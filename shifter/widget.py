@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import traceback
 from pathlib import Path
 from typing import Any
@@ -35,39 +37,41 @@ from qtpy.QtWidgets import (
     QButtonGroup,
 )
 
-from chromatic_shift_corrector.data_loader import (
+from shifter.data_loader import (
     BigTIFFLoader,
     H5Loader,
     scan_bigtiff_files,
     validate_channels,
     z_dimensions_summary,
 )
-from chromatic_shift_corrector.export_engine import (
+from shifter.export_engine import (
     compute_chunk_size,
     estimate_output_sizes,
     run_export,
     run_export_h5,
 )
-from chromatic_shift_corrector.perf_logger import (
+from shifter.perf_logger import (
     setup_perf_log,
     timed_operation,
     log_event,
+    log_memory,
 )
-from chromatic_shift_corrector.h5_utils import (
+from shifter.memory import release_memory
+from shifter.h5_utils import (
     H5FileManager,
     find_companion_header_files,
     scan_h5_files,
 )
-from chromatic_shift_corrector.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
-from chromatic_shift_corrector.preview_engine import extract_subvolume, generate_preview
-from chromatic_shift_corrector.shift_manager import ShiftManager
-from chromatic_shift_corrector.utils import (
+from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
+from shifter.preview_engine import extract_subvolume, generate_preview
+from shifter.shift_manager import ShiftManager
+from shifter.utils import (
     DEFAULT_COLORMAPS,
     MAX_CHANNELS,
     h5_output_filename,
     parse_voxel_size_from_xml,
 )
-from chromatic_shift_corrector.registration import (
+from shifter.registration import (
     ALGORITHM_REGISTRY,
     MAX_SEARCH_RANGE,
     CONFIDENCE_HIGH,
@@ -96,6 +100,8 @@ COLORMAP_OPTIONS = [
     "turbo",
 ]
 
+logger = logging.getLogger(__name__)
+
 
 class ExportWorker(QThread):
     """Background thread for full-volume export (BigTIFF or H5)."""
@@ -116,6 +122,7 @@ class ExportWorker(QThread):
         voxel_z: float,
         input_format: str = "bigtiff",
         roi: tuple[int, int, int, int, int, int] | None = None,
+        write_pyramids: bool = True,
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -126,6 +133,7 @@ class ExportWorker(QThread):
         self.voxel_z = voxel_z
         self.input_format = input_format
         self.roi = roi
+        self.write_pyramids = write_pyramids
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -139,19 +147,53 @@ class ExportWorker(QThread):
                       f"channels={len(self.loaders)} ram%={self.ram_percent} "
                       f"region={region_desc}")
             with timed_operation("Full export (all channels)"):
-                export_fn = run_export_h5 if self.input_format == "h5" else run_export
-                meta_path = export_fn(
-                    self.loaders,
-                    self.shift_manager,
-                    self.output_dir,
-                    self.ram_percent,
+                common_kwargs = dict(
                     progress_callback=lambda done, total: self.progress.emit(done, total),
                     cancel_check=lambda: self._cancelled,
                     voxel_xy=self.voxel_xy,
                     voxel_z=self.voxel_z,
                     roi=self.roi,
                 )
+                if self.input_format == "h5":
+                    meta_path = run_export_h5(
+                        self.loaders,
+                        self.shift_manager,
+                        self.output_dir,
+                        self.ram_percent,
+                        write_pyramids=self.write_pyramids,
+                        **common_kwargs,
+                    )
+                else:
+                    meta_path = run_export(
+                        self.loaders,
+                        self.shift_manager,
+                        self.output_dir,
+                        self.ram_percent,
+                        **common_kwargs,
+                    )
+            # Hand the slab/pyramid working memory back to the OS now that the
+            # export is done, so it isn't left pinned to the process afterward.
+            release_memory(context="export")
             self.finished.emit(str(meta_path) if not self._cancelled else "")
+        except MemoryError:
+            log_event("Export aborted: out of memory")
+            release_memory(context="export (after OOM)")
+            self.error.emit(
+                "Ran out of memory while exporting.\n\n"
+                "The export streams the volume in Z-slabs sized to fit the "
+                "selected RAM allocation, but the system had less free memory "
+                "than expected — other applications, cached data, or the "
+                "napari viewer itself all consume RAM that isn't available to "
+                "the export.\n\n"
+                "Try one of the following:\n"
+                "  • Lower the RAM allocation slider before exporting "
+                "(smaller slabs use less peak memory)\n"
+                "  • Close other applications to free up RAM\n"
+                "  • Export a smaller ROI instead of the full volume\n\n"
+                "A performance_log.txt has been written to the output folder. "
+                "Re-running with the CSC_DEBUG=1 environment variable set adds "
+                "detailed per-slab memory and timing diagnostics to it."
+            )
         except Exception:
             self.error.emit(traceback.format_exc())
 
@@ -178,6 +220,7 @@ class RegistrationWorker(QThread):
         background_subtraction: bool,
         gaussian_smoothing: bool,
         use_gpu: bool,
+        log_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.loaders = loaders
@@ -193,12 +236,27 @@ class RegistrationWorker(QThread):
         self.background_subtraction = background_subtraction
         self.gaussian_smoothing = gaussian_smoothing
         self.use_gpu = use_gpu
+        self.log_dir = log_dir
 
     def run(self) -> None:
+        # Route registration diagnostics to a performance_log.txt when we have a
+        # directory to write it into; guarded so a read-only location never
+        # breaks registration itself.
+        if self.log_dir is not None:
+            try:
+                setup_perf_log(self.log_dir)
+            except Exception:
+                pass
         try:
             results = self._run_registration()
+            # Registration allocates several float64 copies of the sub-volume;
+            # once done they are unreferenced but the allocator hoards the pages,
+            # which also shrinks the next export's RAM budget. Hand them back.
+            release_memory(use_gpu=self.use_gpu, context="registration")
             self.finished.emit(results)
         except MemoryError:
+            # Reclaim what we can so the app stays usable after an OOM.
+            release_memory(use_gpu=self.use_gpu, context="registration (after OOM)")
             self.error.emit(
                 "Ran out of memory while registering this sub-volume. "
                 "Large ROIs and Z ranges require several full-precision "
@@ -217,6 +275,7 @@ class RegistrationWorker(QThread):
                   f"channels={self.channels_to_register} "
                   f"search_xy={self.search_range_xy} search_z={self.search_range_z} "
                   f"gpu={self.use_gpu}")
+        log_memory("registration start", level=logging.INFO)
 
         # Extract reference sub-volume.
         ref_loader = self.loaders[self.reference_index]
@@ -238,13 +297,27 @@ class RegistrationWorker(QThread):
         algo_cls = ALGORITHM_REGISTRY[self.algorithm_name]
         algo = algo_cls(**self.algorithm_kwargs)
 
-        total = len(self.channels_to_register)
+        # Instantiate algorithm.
+        n = len(self.channels_to_register)
         results = []
+
+        # Progress is tracked at sub-channel resolution: each channel spans one
+        # unit, and the algorithm reports a fraction within it, so the bar keeps
+        # moving during a single (possibly long) mutual-information search rather
+        # than jumping once per channel. ``scale`` gives the bar smooth steps.
+        scale = 1000
+
+        def _emit(idx: int, frac: float) -> None:
+            frac = min(1.0, max(0.0, frac))
+            self.progress.emit(
+                int((idx + frac) * scale),
+                n * scale,
+                f"Registering channel {idx + 1} of {n}...",
+            )
 
         for idx, ch_i in enumerate(self.channels_to_register):
             loader = self.loaders[ch_i]
-            ch_name = Path(loader.dask_array.name).name if hasattr(loader.dask_array, 'name') else f"channel {ch_i}"
-            self.progress.emit(idx, total, f"Registering channel {idx + 1}/{total}...")
+            _emit(idx, 0.0)
 
             # Extract moving sub-volume.
             mov_vol = extract_subvolume(
@@ -261,6 +334,9 @@ class RegistrationWorker(QThread):
                 use_gpu=self.use_gpu,
             )
 
+            # Advance the bar within this channel as the algorithm searches.
+            channel_cb = lambda frac, _idx=idx: _emit(_idx, frac)
+
             # Run registration with GPU OOM fallback.
             with timed_operation(f"Registration channel {ch_i} ({self.algorithm_name})"):
                 try:
@@ -268,6 +344,7 @@ class RegistrationWorker(QThread):
                         ref_vol, mov_vol,
                         self.search_range_xy, self.search_range_z,
                         use_gpu=self.use_gpu,
+                        progress_callback=channel_cb,
                     )
                 except Exception:
                     # If GPU fails (e.g. OOM), retry on CPU.
@@ -276,16 +353,18 @@ class RegistrationWorker(QThread):
                             ref_vol, mov_vol,
                             self.search_range_xy, self.search_range_z,
                             use_gpu=False,
+                            progress_callback=channel_cb,
                         )
                     else:
                         raise
 
+            _emit(idx, 1.0)
             log_event(f"Registration channel {ch_i} result: "
                       f"shift=({result.shift_z},{result.shift_y},{result.shift_x}) "
                       f"confidence={result.confidence:.3f}")
             results.append((ch_i, result))
 
-        self.progress.emit(total, total, "Registration complete.")
+        self.progress.emit(n * scale, n * scale, "Registration complete.")
         return results
 
 
@@ -528,6 +607,10 @@ class ChromaticShiftWidget(QWidget):
         self._algo_options_container.setLayout(self._algo_options_layout)
         lay.addWidget(self._algo_options_container)
 
+        # Default to Mutual Information. Set after the options container exists so
+        # the currentTextChanged handler can toggle option visibility safely.
+        self.combo_algorithm.setCurrentText("Mutual Information")
+
         # Channel selection.
         lay.addWidget(QLabel("Channels to register:"))
         self._reg_channel_checkboxes: list[tuple[int, QCheckBox]] = []
@@ -675,6 +758,19 @@ class ChromaticShiftWidget(QWidget):
         row_ram.addWidget(self.lbl_ram)
         lay.addLayout(row_ram)
 
+        # Pyramids are built from each corrected slab in memory (no reread) and
+        # the reduction is parallelised, so on a measured 431 GiB export they
+        # cost ~7 min on top of a ~21 min pyramids-off floor. That is cheap
+        # enough to write them by default: the multiscale layers give fast
+        # zoomed-out viewing and keep the Imaris/BigDataViewer companion headers
+        # matching the data without a single-resolution rewrite. Untick for the
+        # fastest possible export when only full resolution is needed.
+        self.chk_write_pyramids = QCheckBox(
+            "Write low-resolution pyramid layers (H5 only)"
+        )
+        self.chk_write_pyramids.setChecked(True)
+        lay.addWidget(self.chk_write_pyramids)
+
         self.btn_export = QPushButton("Apply && Export")
         self.btn_export.clicked.connect(self._on_export)
         lay.addWidget(self.btn_export)
@@ -820,7 +916,7 @@ class ChromaticShiftWidget(QWidget):
     def _try_autofill_h5_voxel(self, h5_path: Path) -> None:
         """Try to auto-fill voxel sizes from H5 metadata."""
         try:
-            from chromatic_shift_corrector.h5_utils import parse_h5_metadata
+            from shifter.h5_utils import parse_h5_metadata
             import h5py
 
             with h5py.File(str(h5_path), "r") as f:
@@ -1286,6 +1382,16 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_reg_progress.setText("Starting registration...")
         self.lbl_reg_result.setVisible(False)
 
+        # Where to write registration diagnostics (performance_log.txt): the
+        # chosen output directory if one is set, else the input data directory.
+        outdir_text = self.lbl_outdir.text().strip()
+        if outdir_text:
+            reg_log_dir: Path | None = Path(outdir_text)
+        elif self.loaders:
+            reg_log_dir = self.loaders[ref_idx].path.parent
+        else:
+            reg_log_dir = None
+
         self._registration_worker = RegistrationWorker(
             loaders=self.loaders,
             reference_index=ref_idx,
@@ -1300,6 +1406,7 @@ class ChromaticShiftWidget(QWidget):
             background_subtraction=self.chk_bg_sub.isChecked(),
             gaussian_smoothing=self.chk_gaussian.isChecked(),
             use_gpu=gpu_available(),
+            log_dir=reg_log_dir,
         )
         self._registration_worker.progress.connect(self._on_reg_progress)
         self._registration_worker.finished.connect(self._on_reg_finished)
@@ -1478,7 +1585,7 @@ class ChromaticShiftWidget(QWidget):
             )
 
         # Generate shifted previews and add as layers.
-        from chromatic_shift_corrector.utils import apply_integer_shift
+        from shifter.utils import apply_integer_shift
 
         shifted_volumes: list[np.ndarray] = []
         colormaps: list[str] = []
@@ -1611,7 +1718,7 @@ class ChromaticShiftWidget(QWidget):
         if self._suppress_mip_update or not self._raw_subvolumes:
             return
 
-        from chromatic_shift_corrector.utils import apply_integer_shift
+        from shifter.utils import apply_integer_shift
 
         shifted: list[np.ndarray] = []
         for i, raw in enumerate(self._raw_subvolumes):
@@ -1735,10 +1842,14 @@ class ChromaticShiftWidget(QWidget):
 
         existing = [name for name in out_names if (outdir_path / name).exists()]
 
-        # A full-volume H5 export also copies companion header files
-        # (.ims, *_bdv.h5, *_bdv.xml) from the input directory, if present.
+        # An H5 export writes companion header files (.ims, *_bdv.h5, *_bdv.xml)
+        # from the input directory: copied verbatim for a full-volume export with
+        # pyramids; rewritten to a single (full-resolution) level when pyramids
+        # are off; and regenerated with the ROI's dimensions/filenames for an ROI
+        # export.
+        write_pyramids = self.chk_write_pyramids.isChecked()
         header_files: list[Path] = []
-        if roi is None and self._input_format == "h5":
+        if self._input_format == "h5":
             header_files = find_companion_header_files(self.loaders[0].path.parent)
             existing.extend(
                 f.name for f in header_files if (outdir_path / f.name).exists()
@@ -1758,7 +1869,9 @@ class ChromaticShiftWidget(QWidget):
 
         # Build confirmation dialog.
         ram_pct = self.slider_ram.value()
-        sizes = estimate_output_sizes(self.loaders, roi=roi)
+        sizes = estimate_output_sizes(
+            self.loaders, roi=roi, include_pyramids=write_pyramids
+        )
         ref_shape = self.loaders[0].shape
 
         lines = ["Shifts to apply:\n"]
@@ -1792,13 +1905,29 @@ class ChromaticShiftWidget(QWidget):
             lines.append(f"Output dimensions: {ref_shape[2]}x{ref_shape[1]}x{ref_shape[0]} (XYZ)")
 
         if header_files:
+            if roi is not None:
+                note = " (regenerated for the ROI)"
+            elif not write_pyramids:
+                note = " (rewritten to single resolution)"
+            else:
+                note = ""
             lines.append(
-                "\nCompanion header files to copy: "
+                f"\nCompanion header files{note}: "
                 + ", ".join(f.name for f in header_files)
             )
 
         total_bytes = sum(sizes)
-        lines.append(f"Estimated total output size: {total_bytes / (1024**3):.2f} GB")
+        if self._input_format == "h5":
+            size_note = (
+                " (incl. regenerated pyramids)" if write_pyramids
+                else " (pyramid layers disabled)"
+            )
+        else:
+            size_note = ""
+        lines.append(
+            f"Estimated total output size{size_note}: "
+            f"{total_bytes / (1024**3):.2f} GB"
+        )
         lines.append(f"RAM allocation: {ram_pct}%")
 
         ans = QMessageBox.question(
@@ -1826,6 +1955,7 @@ class ChromaticShiftWidget(QWidget):
             self.spin_voxel_z.value(),
             input_format=self._input_format,
             roi=roi,
+            write_pyramids=write_pyramids,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.finished.connect(self._on_export_finished)
@@ -1849,20 +1979,47 @@ class ChromaticShiftWidget(QWidget):
         if meta_path:
             written_gb = ""
             try:
-                from chromatic_shift_corrector.utils import load_metadata
+                from shifter.utils import load_metadata
 
                 meta = load_metadata(Path(meta_path))
                 if "bytes_written_gb" in meta:
                     written_gb = f"\nTotal data written: {meta['bytes_written_gb']:.2f} GB"
             except Exception:
                 pass
-            QMessageBox.information(
-                self,
-                "Export Complete",
-                f"All channels exported successfully.\nMetadata: {meta_path}{written_gb}",
+            out_dir = Path(meta_path).parent
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Export Complete")
+            box.setText(
+                f"All channels exported successfully.\n"
+                f"Output folder: {out_dir}\n"
+                f"Metadata: {meta_path}{written_gb}"
             )
+            open_btn = box.addButton("Open", QMessageBox.ActionRole)
+            close_btn = box.addButton("Close", QMessageBox.RejectRole)
+            box.setDefaultButton(close_btn)
+            box.exec_() if hasattr(box, "exec_") else box.exec()
+            if box.clickedButton() is open_btn:
+                self._open_in_file_browser(out_dir)
         else:
             QMessageBox.information(self, "Cancelled", "Export was cancelled.")
+
+    @staticmethod
+    def _open_in_file_browser(path: Path) -> None:
+        """Reveal *path* in the OS file browser (Explorer / Finder / xdg-open)."""
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform.startswith("win"):
+                # os.startfile is Windows-only; opens the folder in Explorer.
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            logger.warning("Could not open %s in file browser: %s", path, exc)
 
     def _on_export_error(self, tb: str) -> None:
         self._set_ui_enabled(True)
@@ -1883,6 +2040,7 @@ class ChromaticShiftWidget(QWidget):
             self.btn_select_outdir,
             self.btn_export,
             self.slider_ram,
+            self.chk_write_pyramids,
             self.file_table,
             self.shift_table,
             self.btn_run_registration,

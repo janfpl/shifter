@@ -12,7 +12,7 @@ load-export pipeline, and validates:
 
 Run via::
 
-    python -m chromatic_shift_corrector.tests.test_h5
+    python -m shifter.tests.test_h5
 """
 
 from __future__ import annotations
@@ -26,16 +26,16 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from chromatic_shift_corrector.data_loader import H5Loader, validate_channels
-from chromatic_shift_corrector.export_engine import run_export_h5
-from chromatic_shift_corrector.h5_utils import (
+from shifter.data_loader import H5Loader, validate_channels
+from shifter.export_engine import estimate_output_sizes, run_export_h5
+from shifter.h5_utils import (
     H5FileManager,
     block_average_3d,
     detect_pyramid_levels,
     parse_h5_metadata,
     scan_h5_files,
 )
-from chromatic_shift_corrector.shift_manager import ShiftManager
+from shifter.shift_manager import ShiftManager
 
 # Test parameters.
 VOLUME_SHAPE = (100, 256, 256)  # (Z, Y, X)
@@ -281,6 +281,50 @@ def test_h5_loader(files: list[Path]) -> bool:
     return all_ok
 
 
+def test_estimate_includes_pyramids(files: list[Path]) -> bool:
+    """Verify estimate_output_sizes counts pyramid levels, not just full-res."""
+    mgr = H5FileManager()
+    all_ok = True
+    try:
+        loaders = [H5Loader(fp, mgr) for fp in files]
+        nz, ny, nx = VOLUME_SHAPE
+
+        # Independent expected: full-res + Data_2_2_2 + Data_3_3_3 per channel.
+        per_channel = (
+            nz * ny * nx * 2
+            + (nz // 2) * (ny // 2) * (nx // 2) * 2
+            + (nz // 3) * (ny // 3) * (nx // 3) * 2
+        )
+        expected = per_channel * len(loaders)
+        got = sum(estimate_output_sizes(loaders))
+        if got != expected:
+            print(f"  FAIL: estimate={got}, expected {expected}")
+            all_ok = False
+        else:
+            print(f"  PASS: estimate includes pyramids ({got / 1024**2:.1f} MiB)")
+
+        # Must strictly exceed a full-res-only estimate (proves pyramids counted).
+        full_only = nz * ny * nx * 2 * len(loaders)
+        if got <= full_only:
+            print(f"  FAIL: estimate {got} did not exceed full-res-only {full_only}")
+            all_ok = False
+
+        # A loader without pyramid_levels (e.g. BigTIFF) estimates full-res only.
+        class _NoPyrLoader:
+            shape = (10, 20, 30)
+
+        stub = estimate_output_sizes([_NoPyrLoader()])[0]
+        if stub != 10 * 20 * 30 * 2:
+            print(f"  FAIL: no-pyramid estimate={stub}, expected {10 * 20 * 30 * 2}")
+            all_ok = False
+    finally:
+        mgr.close_all()
+
+    if all_ok:
+        print("  PASS: estimate_output_sizes pyramid accounting correct")
+    return all_ok
+
+
 def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
     """Test full H5 export with shift correction and pyramid regeneration."""
     mgr = H5FileManager()
@@ -321,6 +365,15 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
         if meta.get("voxel_size_source") != "h5_metadata":
             print(f"  FAIL: metadata voxel_size_source={meta.get('voxel_size_source')}")
             all_ok = False
+
+        # Pre-export estimate must match the post-export bytes_written (both
+        # count full-res + regenerated pyramids).
+        est_total = sum(estimate_output_sizes(loaders))
+        if est_total != meta.get("bytes_written"):
+            print(f"  FAIL: estimate {est_total} != metadata bytes_written {meta.get('bytes_written')}")
+            all_ok = False
+        else:
+            print("  PASS: pre-export estimate matches metadata bytes_written")
 
         # Check corrected files. Full-volume H5 export keeps the original
         # filename (no suffix) so companion Imaris/BigDataViewer headers
@@ -422,6 +475,93 @@ def test_export_and_pyramids(files: list[Path], ref_data: np.ndarray) -> bool:
     return all_ok
 
 
+def test_export_without_pyramids(files: list[Path]) -> bool:
+    """Verify write_pyramids=False writes Data only, no pyramids, no headers."""
+    mgr = H5FileManager()
+    outdir = Path(tempfile.mkdtemp())
+    all_ok = True
+    # A multi-resolution BigDataViewer header alongside the input; with pyramids
+    # disabled it must be rewritten to a single (full-resolution) level.
+    header = files[0].parent / "main_test_bdv.h5"
+    with h5py.File(str(header), "w") as hf:
+        hf.create_dataset("s00/resolutions", data=np.array([[1, 1, 1], [2, 2, 2]], dtype=float))
+        hf.create_dataset("s00/subdivisions", data=np.array([[64, 64, 64], [64, 64, 64]], dtype=float))
+        hf["t00000/s00/0/cells"] = h5py.ExternalLink(files[0].name, "Data")
+        hf["t00000/s00/1/cells"] = h5py.ExternalLink(files[0].name, "Data_2_2_2")
+    try:
+        loaders = [H5Loader(fp, mgr) for fp in files]
+        shift_manager = ShiftManager()
+        filenames = [fp.name for fp in files]
+        shift_manager.init_channels(
+            filenames, reference_index=0, colormaps=["green", "magenta", "cyan"]
+        )
+        for ch_i, (dz, dy, dx) in GROUND_TRUTH_SHIFTS.items():
+            shift_manager.set_shift(ch_i, "x", -dx)
+            shift_manager.set_shift(ch_i, "y", -dy)
+            shift_manager.set_shift(ch_i, "z", -dz)
+
+        meta_path = run_export_h5(
+            loaders, shift_manager, outdir,
+            ram_percent=90, voxel_xy=VOXEL_XY, voxel_z=VOXEL_Z,
+            write_pyramids=False,
+        )
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        # The companion header must be written AND reduced to a single level.
+        out_header = outdir / header.name
+        if not out_header.exists():
+            print(f"  FAIL: companion header {header.name} was not written")
+            all_ok = False
+        else:
+            with h5py.File(str(out_header), "r") as hf:
+                if hf["s00/resolutions"].shape != (1, 3):
+                    print(f"  FAIL: header not reduced (resolutions {hf['s00/resolutions'].shape})")
+                    all_ok = False
+                if list(hf["t00000/s00"].keys()) != ["0"]:
+                    print(f"  FAIL: header still has levels {list(hf['t00000/s00'].keys())}")
+                    all_ok = False
+        if meta.get("companion_headers_single_resolution") is not True:
+            print(f"  FAIL: companion_headers_single_resolution={meta.get('companion_headers_single_resolution')}")
+            all_ok = False
+
+        # bytes_written must be full-res only and match the full-res estimate.
+        est_full = sum(estimate_output_sizes(loaders, include_pyramids=False))
+        if meta.get("bytes_written") != est_full:
+            print(f"  FAIL: bytes_written={meta.get('bytes_written')} != full-res {est_full}")
+            all_ok = False
+        if meta.get("pyramids_written") is not False:
+            print(f"  FAIL: metadata pyramids_written={meta.get('pyramids_written')}")
+            all_ok = False
+
+        # No corrected file may contain a pyramid dataset.
+        for fp in files:
+            out_path = outdir / fp.name
+            with h5py.File(str(out_path), "r") as f:
+                if "Data" not in f:
+                    print(f"  FAIL: {out_path.name} missing Data")
+                    all_ok = False
+                levels = detect_pyramid_levels(f)
+                if levels:
+                    print(f"  FAIL: {out_path.name} unexpectedly has pyramids {levels}")
+                    all_ok = False
+
+        for ch_entry in meta.get("channels", []):
+            if ch_entry.get("pyramid_levels_regenerated"):
+                print(f"  FAIL: channel {ch_entry['channel_index']} lists regenerated pyramids")
+                all_ok = False
+
+        if all_ok:
+            print("  PASS: pyramids skipped, Data + single-res headers, full-res sizes")
+    finally:
+        mgr.close_all()
+        shutil.rmtree(outdir, ignore_errors=True)
+        header.unlink(missing_ok=True)
+
+    return all_ok
+
+
 def run_validation() -> bool:
     """Run all H5 tests and report results."""
     print("=" * 60)
@@ -452,8 +592,16 @@ def run_validation() -> bool:
         if not test_h5_loader(files):
             all_passed = False
 
+        print("\n--- Test: Output size estimate (pyramids included) ---")
+        if not test_estimate_includes_pyramids(files):
+            all_passed = False
+
         print("\n--- Test: Export with correction and pyramid regeneration ---")
         if not test_export_and_pyramids(files, ref_data):
+            all_passed = False
+
+        print("\n--- Test: Export with pyramid layers disabled ---")
+        if not test_export_without_pyramids(files):
             all_passed = False
 
     finally:

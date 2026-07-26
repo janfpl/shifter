@@ -9,12 +9,12 @@ for the heavy number-crunching).
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from chromatic_shift_corrector.registration.base import (
+from shifter.registration.base import (
+    ProgressCallback,
     RegistrationAlgorithm,
     RegistrationResult,
 )
@@ -74,18 +74,27 @@ class ZNCCRegistration(RegistrationAlgorithm):
         search_range_xy: int,
         search_range_z: int,
         use_gpu: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
+        # ZNCC's primary path is a single FFT cross-correlation with no internal
+        # search loop to subdivide, so it reports completion only.
         if use_gpu:
             try:
-                return self._register_gpu(
+                result = self._register_gpu(
                     reference_volume, moving_volume, search_range_xy, search_range_z
                 )
+                if progress_callback is not None:
+                    progress_callback(1.0)
+                return result
             except Exception as exc:
                 logger.warning("GPU ZNCC failed (%s), falling back to CPU", exc)
 
-        return self._register_cpu(
+        result = self._register_cpu(
             reference_volume, moving_volume, search_range_xy, search_range_z
         )
+        if progress_callback is not None:
+            progress_callback(1.0)
+        return result
 
     # ------------------------------------------------------------------ #
     # CPU — FFT-based approach (multithreaded)
@@ -122,17 +131,20 @@ class ZNCCRegistration(RegistrationAlgorithm):
     ) -> RegistrationResult:
         """FFT-based ZNCC: cross-correlate in Fourier space, then normalise.
 
-        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        Spreads the FFT across the shared worker budget, which leaves a few
+        cores free for the OS and the napari UI (see ``utils.worker_count``).
         """
         from scipy.fft import fftn, ifftn
+
+        from shifter.utils import worker_count
 
         ref_zm = ref - ref.mean()
         mov_zm = mov - mov.mean()
 
-        # Cross-correlation via FFT — use all CPU cores.
-        F_ref = fftn(ref_zm, workers=-1)
-        F_mov = fftn(mov_zm, workers=-1)
-        cc = np.real(ifftn(F_ref * np.conj(F_mov), workers=-1))
+        n_workers = worker_count()
+        F_ref = fftn(ref_zm, workers=n_workers)
+        F_mov = fftn(mov_zm, workers=n_workers)
+        cc = np.real(ifftn(F_ref * np.conj(F_mov), workers=n_workers))
 
         # Normalise by product of standard deviations and volume size.
         n = ref.size
@@ -193,7 +205,9 @@ class ZNCCRegistration(RegistrationAlgorithm):
             for dx in range(-sr_xy, sr_xy + 1)
         ]
 
-        n_workers = min(os.cpu_count() or 1, len(candidates))
+        from shifter.utils import worker_count
+
+        n_workers = worker_count(maximum=len(candidates))
 
         def _eval_shift(args):
             dz, dy, dx = args

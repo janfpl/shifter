@@ -79,12 +79,12 @@ def _fit_window_to_screen(viewer) -> None:
 
 
 def main() -> None:
-    from chromatic_shift_corrector._qt_setup import ensure_qt
+    from shifter._qt_setup import ensure_qt
     ensure_qt()
 
     import napari
 
-    from chromatic_shift_corrector.widget import ChromaticShiftWidget
+    from shifter.widget import ChromaticShiftWidget
 
     viewer = napari.Viewer(title="Chromatic Shift Corrector", show=False)
     _set_default_font()

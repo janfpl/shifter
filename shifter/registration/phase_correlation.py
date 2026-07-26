@@ -6,7 +6,8 @@ import logging
 
 import numpy as np
 
-from chromatic_shift_corrector.registration.base import (
+from shifter.registration.base import (
+    ProgressCallback,
     RegistrationAlgorithm,
     RegistrationResult,
 )
@@ -39,18 +40,27 @@ class PhaseCorrelation(RegistrationAlgorithm):
         search_range_xy: int,
         search_range_z: int,
         use_gpu: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
+        # Phase correlation is a single FFT-based step with no internal search
+        # loop to subdivide, so it reports completion only.
         if use_gpu:
             try:
-                return self._register_gpu(
+                result = self._register_gpu(
                     reference_volume, moving_volume, search_range_xy, search_range_z
                 )
+                if progress_callback is not None:
+                    progress_callback(1.0)
+                return result
             except Exception as exc:
                 logger.warning("GPU phase correlation failed (%s), falling back to CPU", exc)
 
-        return self._register_cpu(
+        result = self._register_cpu(
             reference_volume, moving_volume, search_range_xy, search_range_z
         )
+        if progress_callback is not None:
+            progress_callback(1.0)
+        return result
 
     # ------------------------------------------------------------------ #
     # CPU path
@@ -105,12 +115,16 @@ class PhaseCorrelation(RegistrationAlgorithm):
     ) -> RegistrationResult:
         """Masked FFT-based cross-correlation with search range enforcement.
 
-        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        Spreads the FFT across the shared worker budget, which leaves a few
+        cores free for the OS and the napari UI (see ``utils.worker_count``).
         """
         from scipy.fft import fftn, ifftn
 
-        F_ref = fftn(ref, workers=-1)
-        F_mov = fftn(mov, workers=-1)
+        from shifter.utils import worker_count
+
+        n_workers = worker_count()
+        F_ref = fftn(ref, workers=n_workers)
+        F_mov = fftn(mov, workers=n_workers)
 
         if self.normalization == "phase":
             cross_power = F_ref * np.conj(F_mov)
@@ -119,7 +133,7 @@ class PhaseCorrelation(RegistrationAlgorithm):
         else:
             cross_power = F_ref * np.conj(F_mov)
 
-        cc = np.real(ifftn(cross_power, workers=-1))
+        cc = np.real(ifftn(cross_power, workers=n_workers))
 
         # Build mask for allowed shifts.
         shape = ref.shape
