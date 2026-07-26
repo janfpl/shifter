@@ -174,7 +174,19 @@ Output format matches the input format:
 
 **Luxendo H5 full-volume exports keep the original filenames unchanged** (no suffix), so that companion Imaris/BigDataViewer header files continue to work. If the input directory contains an Imaris `.ims` header and/or a BigDataViewer `*_bdv.h5` / `*_bdv.xml` pair (these reference the per-channel `.lux.h5` files by their literal filenames via HDF5 external links / relative XML paths), they are written into the output directory alongside the corrected data (copied verbatim with pyramids on, or reduced to a single level with pyramids off — see above).
 
-**ROI exports** use the `_corrected_roi` suffix and now also get companion headers, **regenerated** for the crop: the `.ims` / `*_bdv.h5` external links are repointed to the `_corrected_roi` files, and the Imaris `.ims` is given the ROI's voxel dimensions and a cropped physical extent (voxel size preserved). The BigDataViewer `*_bdv.xml` is not regenerated for ROI (its dimensions can't be rewritten reliably here); Imaris — which uses the `.ims` — is unaffected. As with full-volume, pyramid levels are included only when the pyramid checkbox is ticked.
+**ROI exports** use the `_corrected_roi` suffix and now also get companion headers, **regenerated** for the crop: the `.ims` / `*_bdv.h5` external links are repointed to the `_corrected_roi` files, and the Imaris `.ims` is given the ROI's voxel dimensions and a cropped physical extent (voxel size preserved). The BigDataViewer `*_bdv.xml` is regenerated too — see below. As with full-volume, pyramid levels are included only when the pyramid checkbox is ticked.
+
+### BigDataViewer XML
+
+A BigDataViewer dataset is a **pair**: the `*_bdv.h5` holds the resolution tables and links to the pixel data, and the `*_bdv.xml` is the entry point Fiji/BigDataViewer actually opens. The two are therefore written together or not at all — an `.h5` without its `.xml` cannot be opened, so it is never left behind on its own.
+
+The XML is rewritten from the source rather than authored from scratch; only what is unambiguous is touched and everything else (voxel size, channel/tile/angle attributes, timepoints, extra transforms) is carried through verbatim:
+
+* **`ViewSetup/size`** is set to the exported voxel dimensions — unchanged for a full-volume export, the crop's `X Y Z` for an ROI. `voxelSize` is left alone: a crop resamples nothing.
+* **`ImageLoader/hdf5`** is repointed at the `*_bdv.h5` as written, as a bare relative name, so a source that referenced its H5 by a nested path cannot end up pointing back at the original raw data.
+* **`ViewRegistration`** gains a pure-translation `ViewTransform` of `(x0, y0, z0)` voxels for an ROI, so the crop keeps its true position inside the specimen instead of being drawn at the full volume's origin. The offset is in voxel units and is appended as the *last* transform, which is the one SpimData applies *first* — matching the Luxendo spec's `affine_to_sample` convention, where the transform maps image (voxel) coordinates into sample space and the voxel size is treated as `(1, 1, 1)`. The composition is verified numerically before the file is committed.
+
+If any of that cannot be done safely — the document is not SpimData, has no `ViewSetup`/`ViewRegistration` entries, or declares a size that does not match the exported volume — **neither** file is written and the reason is logged. A header that looks plausible but misplaces the data is worse than no header.
 
 ## Registration Algorithms
 

@@ -34,6 +34,7 @@ from shifter.h5_utils import (
     detect_pyramid_levels,
     parse_h5_metadata,
     scan_h5_files,
+    validate_bdv_xml,
 )
 from shifter.shift_manager import ShiftManager
 
@@ -481,13 +482,39 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
     outdir = Path(tempfile.mkdtemp())
     all_ok = True
     # A multi-resolution BigDataViewer header alongside the input; with pyramids
-    # disabled it must be rewritten to a single (full-resolution) level.
+    # disabled it must be rewritten to a single (full-resolution) level. BDV
+    # datasets are an H5/XML pair, so the XML has to be there too — an H5 on its
+    # own is deliberately not written.
     header = files[0].parent / "main_test_bdv.h5"
+    header_xml = files[0].parent / "main_test_bdv.xml"
     with h5py.File(str(header), "w") as hf:
         hf.create_dataset("s00/resolutions", data=np.array([[1, 1, 1], [2, 2, 2]], dtype=float))
         hf.create_dataset("s00/subdivisions", data=np.array([[64, 64, 64], [64, 64, 64]], dtype=float))
         hf["t00000/s00/0/cells"] = h5py.ExternalLink(files[0].name, "Data")
         hf["t00000/s00/1/cells"] = h5py.ExternalLink(files[0].name, "Data_2_2_2")
+    nz, ny, nx = VOLUME_SHAPE
+    header_xml.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<SpimData version="0.2">\n'
+        '  <BasePath type="relative">.</BasePath>\n'
+        "  <SequenceDescription>\n"
+        '    <ImageLoader format="bdv.hdf5">\n'
+        f'      <hdf5 type="relative">{header.name}</hdf5>\n'
+        "    </ImageLoader>\n"
+        "    <ViewSetups><ViewSetup><id>0</id><name>0</name>"
+        f"<size>{nx} {ny} {nz}</size>"
+        "<voxelSize><unit>micron</unit><size>1.0 1.0 1.0</size></voxelSize>"
+        "</ViewSetup></ViewSetups>\n"
+        '    <Timepoints type="range"><first>0</first><last>0</last></Timepoints>\n'
+        "  </SequenceDescription>\n"
+        "  <ViewRegistrations>\n"
+        '    <ViewRegistration timepoint="0" setup="0"><ViewTransform type="affine">'
+        "<name>calibration</name>"
+        "<affine>1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0</affine>"
+        "</ViewTransform></ViewRegistration>\n"
+        "  </ViewRegistrations>\n"
+        "</SpimData>\n"
+    )
     try:
         loaders = [H5Loader(fp, mgr) for fp in files]
         shift_manager = ShiftManager()
@@ -522,6 +549,16 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
                 if list(hf["t00000/s00"].keys()) != ["0"]:
                     print(f"  FAIL: header still has levels {list(hf['t00000/s00'].keys())}")
                     all_ok = False
+        # The XML half of the pair must be written and internally consistent.
+        out_xml = outdir / header_xml.name
+        if not out_xml.exists():
+            print(f"  FAIL: companion header {header_xml.name} was not written")
+            all_ok = False
+        else:
+            problems = validate_bdv_xml(out_xml, expected_shape_zyx=VOLUME_SHAPE)
+            if problems:
+                print(f"  FAIL: BDV XML problems: {problems}")
+                all_ok = False
         if meta.get("companion_headers_single_resolution") is not True:
             print(f"  FAIL: companion_headers_single_resolution={meta.get('companion_headers_single_resolution')}")
             all_ok = False
@@ -558,6 +595,7 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
         mgr.close_all()
         shutil.rmtree(outdir, ignore_errors=True)
         header.unlink(missing_ok=True)
+        header_xml.unlink(missing_ok=True)
 
     return all_ok
 

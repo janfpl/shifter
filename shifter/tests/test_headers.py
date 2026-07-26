@@ -20,13 +20,100 @@ import h5py
 import numpy as np
 
 from shifter.h5_utils import (
+    BdvXmlError,
     rebuild_ims_header,
     reduce_header_to_single_resolution,
+    validate_bdv_xml,
+    write_bdv_xml,
     write_roi_headers,
     write_single_resolution_headers,
 )
 
 _LEVEL_PATHS = ["Data", "Data_2_2_2", "Data_4_4_4"]
+
+# A SpimData document shaped like the ones BigDataViewer writes: the setup's
+# calibration transform is listed LAST (it consumes raw voxel indices), which is
+# the ordering the crop-offset translation has to slot into.
+_BDV_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<SpimData version="0.2">
+  <BasePath type="relative">.</BasePath>
+  <SequenceDescription>
+    <ImageLoader format="bdv.hdf5">
+      <hdf5 type="relative">{h5_name}</hdf5>
+    </ImageLoader>
+    <ViewSetups>
+      <ViewSetup>
+        <id>0</id>
+        <name>channel 0</name>
+        <size>{nx} {ny} {nz}</size>
+        <voxelSize>
+          <unit>micron</unit>
+          <size>0.406 0.406 2.0</size>
+        </voxelSize>
+        <attributes>
+          <illumination>0</illumination>
+          <channel>0</channel>
+          <tile>0</tile>
+          <angle>0</angle>
+        </attributes>
+      </ViewSetup>
+      <Attributes name="channel">
+        <Channel><id>0</id><name>0</name></Channel>
+      </Attributes>
+    </ViewSetups>
+    <Timepoints type="range">
+      <first>0</first>
+      <last>0</last>
+    </Timepoints>
+    <MissingViews />
+  </SequenceDescription>
+  <ViewRegistrations>
+    <ViewRegistration timepoint="0" setup="0">
+      <ViewTransform type="affine">
+        <name>calibration</name>
+        <affine>0.406 0.0 0.0 100.0 0.0 0.406 0.0 200.0 0.0 0.0 2.0 300.0</affine>
+      </ViewTransform>
+    </ViewRegistration>
+  </ViewRegistrations>
+</SpimData>
+"""
+
+
+def _make_bdv_xml(
+    path: Path, h5_name: str, shape_zyx: tuple[int, int, int] = (16, 16, 16)
+) -> None:
+    nz, ny, nx = shape_zyx
+    path.write_text(
+        _BDV_XML_TEMPLATE.format(h5_name=h5_name, nx=nx, ny=ny, nz=nz)
+    )
+
+
+def _bdv_model(xml_path: Path, setup: str = "0") -> np.ndarray:
+    """Compose a ViewRegistration's transforms the way SpimData does."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(str(xml_path)).getroot()
+    model = np.eye(4)
+    for reg in root.findall("./ViewRegistrations/ViewRegistration"):
+        if reg.get("setup") != setup:
+            continue
+        for transform in reg.findall("ViewTransform"):
+            m = np.eye(4)
+            m[:3, :] = np.array(
+                [float(v) for v in transform.find("affine").text.split()]
+            ).reshape(3, 4)
+            model = model @ m
+    return model
+
+
+def _xml_sizes(xml_path: Path) -> list[tuple[int, int, int]]:
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(str(xml_path)).getroot()
+    return [
+        tuple(int(v) for v in setup.find("size").text.split())
+        for setup in root.findall("./SequenceDescription/ViewSetups/ViewSetup")
+    ]
 
 
 def _s1(text: object) -> np.ndarray:
@@ -133,7 +220,7 @@ def test_write_single_resolution_headers_copies_and_reduces() -> None:
     xml = src_dir / "main_test_bdv.xml"
     _make_ims(ims, "chan.lux.h5")
     _make_bdv(bdv, "chan.lux.h5")
-    xml.write_text("<SpimData/>")
+    _make_bdv_xml(xml, bdv.name)
 
     written = write_single_resolution_headers([ims, bdv, xml], out_dir)
     assert {p.name for p in written} == {ims.name, bdv.name, xml.name}
@@ -147,8 +234,9 @@ def test_write_single_resolution_headers_copies_and_reduces() -> None:
         assert len([k for k in f["DataSet"].keys() if k.startswith("Resolution")]) == 3
     with h5py.File(str(out_dir / bdv.name), "r") as f:
         assert f["s00/resolutions"].shape == (1, 3)
-    # xml copied verbatim.
-    assert (out_dir / xml.name).read_text() == "<SpimData/>"
+    # The XML still describes the full volume and still points at its H5.
+    assert _xml_sizes(out_dir / xml.name) == [(16, 16, 16)]
+    assert validate_bdv_xml(out_dir / xml.name) == []
 
 
 def _read_ims_attr(grp, key: str) -> str:
@@ -212,8 +300,10 @@ def test_write_roi_headers_bdv_remaps() -> None:
     src = Path(tempfile.mkdtemp())
     out = Path(tempfile.mkdtemp())
     bdv = src / "main_test_bdv.h5"
+    xml = src / "main_test_bdv.xml"
     _make_bdv(bdv, "chan.lux.h5", levels=3)
-    write_roi_headers([bdv], out, "_corrected_roi", (0, 4, 0, 8, 0, 8),
+    _make_bdv_xml(xml, bdv.name)
+    write_roi_headers([bdv, xml], out, "_corrected_roi", (0, 4, 0, 8, 0, 8),
                       write_pyramids=False)
     with h5py.File(str(out / bdv.name), "r") as f:
         assert list(f["t00000/s00"].keys()) == ["0"]
@@ -222,15 +312,133 @@ def test_write_roi_headers_bdv_remaps() -> None:
         assert link.path == "Data"
 
 
-def test_write_roi_headers_skips_xml() -> None:
+# --------------------------------------------------------------------------- #
+# BigDataViewer XML
+# --------------------------------------------------------------------------- #
+
+
+def test_write_roi_headers_writes_xml_with_crop_size_and_offset() -> None:
+    """A ROI export must produce a BDV XML declaring the crop, placed correctly."""
+    src = Path(tempfile.mkdtemp())
+    out = Path(tempfile.mkdtemp())
+    bdv = src / "main_test_bdv.h5"
+    xml = src / "main_test_bdv.xml"
+    _make_bdv(bdv, "chan.lux.h5", levels=3)
+    _make_bdv_xml(xml, bdv.name, shape_zyx=(16, 16, 16))
+
+    roi = (2, 10, 3, 11, 4, 12)  # z0,z1, y0,y1, x0,x1 -> 8 x 8 x 8
+    written = write_roi_headers([bdv, xml], out, "_corrected_roi", roi,
+                                write_pyramids=False, input_shape_zyx=(16, 16, 16))
+    assert {p.name for p in written} == {bdv.name, xml.name}
+
+    dst_xml = out / xml.name
+    assert _xml_sizes(dst_xml) == [(8, 8, 8)]
+    assert validate_bdv_xml(dst_xml, expected_shape_zyx=(8, 8, 8)) == []
+
+    # Voxel (0,0,0) of the crop must land where voxel (4,3,2) of the full
+    # volume did — i.e. the crop keeps its position inside the specimen.
+    full_model = _bdv_model(xml)
+    crop_model = _bdv_model(dst_xml)
+    crop_origin = crop_model @ np.array([0.0, 0.0, 0.0, 1.0])
+    expected = full_model @ np.array([4.0, 3.0, 2.0, 1.0])
+    assert np.allclose(crop_origin, expected), (crop_origin, expected)
+    # The linear part is untouched: a crop resamples nothing.
+    assert np.allclose(crop_model[:3, :3], full_model[:3, :3])
+
+
+def test_roi_xml_keeps_voxel_size_and_timepoints() -> None:
+    import xml.etree.ElementTree as ET
+
     src = Path(tempfile.mkdtemp())
     out = Path(tempfile.mkdtemp())
     xml = src / "main_test_bdv.xml"
-    xml.write_text("<SpimData/>")
-    written = write_roi_headers([xml], out, "_corrected_roi", (0, 1, 0, 1, 0, 1),
-                                write_pyramids=False)
+    _make_bdv_xml(xml, "main_test_bdv.h5")
+    write_bdv_xml(xml, out / xml.name, output_shape_zyx=(4, 4, 4),
+                  roi=(0, 4, 0, 4, 0, 4), h5_filename="main_test_bdv.h5")
+
+    root = ET.parse(str(out / xml.name)).getroot()
+    setup = root.find("./SequenceDescription/ViewSetups/ViewSetup")
+    assert setup.find("voxelSize/size").text == "0.406 0.406 2.0"
+    assert setup.find("attributes/channel").text == "0"
+    tps = root.find("./SequenceDescription/Timepoints")
+    assert (tps.find("first").text, tps.find("last").text) == ("0", "0")
+
+
+def test_bdv_xml_repoints_nested_h5_reference_to_flat_output() -> None:
+    """A nested <hdf5> path must not keep pointing outside a flat output folder."""
+    src = Path(tempfile.mkdtemp())
+    out = Path(tempfile.mkdtemp())
+    xml = src / "main_test_bdv.xml"
+    _make_bdv_xml(xml, "raw/stack_1/main_test_bdv.h5")
+    write_bdv_xml(xml, out / xml.name, h5_filename="main_test_bdv.h5")
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(str(out / xml.name)).getroot()
+    element = root.find("./SequenceDescription/ImageLoader/hdf5")
+    assert element.text == "main_test_bdv.h5"
+    assert element.get("type") == "relative"
+
+
+def test_bdv_xml_rejects_setup_of_different_size() -> None:
+    src = Path(tempfile.mkdtemp())
+    out = Path(tempfile.mkdtemp())
+    xml = src / "main_test_bdv.xml"
+    _make_bdv_xml(xml, "main_test_bdv.h5", shape_zyx=(16, 16, 16))
+    try:
+        write_bdv_xml(xml, out / xml.name, output_shape_zyx=(8, 8, 8),
+                      input_shape_zyx=(32, 32, 32), roi=(0, 8, 0, 8, 0, 8))
+    except BdvXmlError:
+        pass
+    else:
+        raise AssertionError("expected BdvXmlError for a mismatched ViewSetup size")
+
+
+def test_bdv_pair_is_complete_or_wholly_absent() -> None:
+    """An unusable XML must take the H5 down with it — never leave half a pair."""
+    src = Path(tempfile.mkdtemp())
+    out = Path(tempfile.mkdtemp())
+    bdv = src / "main_test_bdv.h5"
+    xml = src / "main_test_bdv.xml"
+    _make_bdv(bdv, "chan.lux.h5", levels=3)
+    xml.write_text("<SpimData/>")  # parses, but has no ViewSetups
+
+    written = write_roi_headers([bdv, xml], out, "_corrected_roi",
+                                (0, 4, 0, 8, 0, 8), write_pyramids=False)
     assert written == []
+    assert not (out / bdv.name).exists()
     assert not (out / xml.name).exists()
+
+
+def test_bdv_h5_without_xml_is_omitted() -> None:
+    """BigDataViewer opens the XML, so an H5 alone is a dataset nobody can open."""
+    src = Path(tempfile.mkdtemp())
+    out = Path(tempfile.mkdtemp())
+    bdv = src / "main_test_bdv.h5"
+    _make_bdv(bdv, "chan.lux.h5", levels=3)
+    written = write_single_resolution_headers([bdv], out)
+    assert written == []
+    assert not (out / bdv.name).exists()
+
+
+def test_validate_bdv_xml_flags_missing_h5_and_wrong_size() -> None:
+    d = Path(tempfile.mkdtemp())
+    xml = d / "main_test_bdv.xml"
+    _make_bdv_xml(xml, "absent_bdv.h5", shape_zyx=(16, 16, 16))
+    problems = validate_bdv_xml(xml, expected_shape_zyx=(8, 8, 8))
+    assert any("does not exist" in p for p in problems), problems
+    assert any("declares size" in p for p in problems), problems
+
+
+def test_validate_bdv_xml_flags_setup_without_h5_group() -> None:
+    d = Path(tempfile.mkdtemp())
+    bdv = d / "main_test_bdv.h5"
+    xml = d / "main_test_bdv.xml"
+    with h5py.File(str(bdv), "w") as f:  # setup s01, but the XML declares id 0
+        f.create_dataset("s01/resolutions", data=np.ones((1, 3)))
+    _make_bdv_xml(xml, bdv.name)
+    problems = validate_bdv_xml(xml)
+    assert any("no matching setup group" in p for p in problems), problems
 
 
 def _make_multires_ims_with_targets(d: Path, shape_zyx=(80, 60, 40)) -> tuple[Path, str]:
@@ -360,7 +568,14 @@ _TESTS = [
     test_write_roi_headers_ims_crops_and_remaps,
     test_write_roi_headers_ims_keeps_levels_with_pyramids,
     test_write_roi_headers_bdv_remaps,
-    test_write_roi_headers_skips_xml,
+    test_write_roi_headers_writes_xml_with_crop_size_and_offset,
+    test_roi_xml_keeps_voxel_size_and_timepoints,
+    test_bdv_xml_repoints_nested_h5_reference_to_flat_output,
+    test_bdv_xml_rejects_setup_of_different_size,
+    test_bdv_pair_is_complete_or_wholly_absent,
+    test_bdv_h5_without_xml_is_omitted,
+    test_validate_bdv_xml_flags_missing_h5_and_wrong_size,
+    test_validate_bdv_xml_flags_setup_without_h5_group,
 ]
 
 

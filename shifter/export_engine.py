@@ -954,7 +954,9 @@ def run_export_h5(
     #   * full volume, no pyramids -> reduce to a single (full-res) level, else
     #     their links to the absent pyramids make viewers read the data as corrupt
     #   * ROI                       -> regenerate with the ROI filenames, cropped
-    #     dimensions/extent, and (when pyramids are off) a single level
+    #     dimensions/extent, a BigDataViewer XML carrying the crop's sizes and a
+    #     translation that keeps the crop at its true position in the specimen,
+    #     and (when pyramids are off) a single level
     from shifter.h5_utils import (
         copy_companion_header_files,
         find_companion_header_files,
@@ -966,7 +968,8 @@ def run_export_h5(
     header_files = find_companion_header_files(input_dir)
     if header_files and roi is not None:
         written = write_roi_headers(
-            header_files, output_dir, suffix, roi, write_pyramids
+            header_files, output_dir, suffix, roi, write_pyramids,
+            input_shape_zyx=tuple(ref_shape),
         )
         log_event(
             "Wrote ROI companion headers: "

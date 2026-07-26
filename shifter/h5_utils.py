@@ -152,30 +152,37 @@ def write_single_resolution_headers(
     Use instead of :func:`copy_companion_header_files` when the export omits
     pyramid levels. The .ims and *_bdv.h5 are **rebuilt from scratch** on the
     manufacturer's structure (see :func:`rebuild_ims_header`) rather than reduced
-    in place, so the result is compact and carries no Imaris Viewer residue; a
-    *_bdv.xml is copied verbatim (its resolution info lives in the .h5).
-    Returns the written paths.
+    in place, so the result is compact and carries no Imaris Viewer residue. The
+    BigDataViewer ``*_bdv.h5`` / ``*_bdv.xml`` pair is written as a unit (see
+    :func:`write_bdv_pair`) — the XML is the entry point BigDataViewer actually
+    opens, so an H5 without it is useless. Returns the written paths.
     """
     output_dir = Path(output_dir)
+    ims_files, bdv_pairs = group_companion_header_files(header_files)
+
     written: list[Path] = []
-    for src in header_files:
+    for src in ims_files:
         dst = output_dir / src.name
-        name = src.name.lower()
         try:
-            if name.endswith(".ims"):
-                rebuild_ims_header(
-                    src, dst, output_shape_zyx=output_shape_zyx, keep_paths={"Data"}
-                )
-            elif name.endswith("_bdv.h5"):
-                rebuild_bdv_h5_header(src, dst, keep_paths={"Data"})
-            else:
-                # *_bdv.xml carries no resolution table; copy verbatim.
-                shutil.copy2(src, dst)
+            rebuild_ims_header(
+                src, dst, output_shape_zyx=output_shape_zyx, keep_paths={"Data"}
+            )
             written.append(dst)
         except Exception as exc:
             logger.warning(
                 "Could not write single-resolution header %s: %s", src.name, exc
             )
+
+    for stem, pair in sorted(bdv_pairs.items()):
+        written.extend(
+            write_bdv_pair(
+                pair.get("h5"),
+                pair.get("xml"),
+                output_dir,
+                keep_paths={"Data"},
+                output_shape_zyx=output_shape_zyx,
+            )
+        )
     return written
 
 
@@ -298,15 +305,19 @@ def write_roi_headers(
     output_suffix: str,
     roi: tuple[int, int, int, int, int, int],
     write_pyramids: bool,
+    input_shape_zyx: tuple[int, int, int] | None = None,
 ) -> list[Path]:
     """Write companion headers matching an ROI-cropped export.
 
-    Each ``.ims`` / ``*_bdv.h5`` is copied, its external links repointed to the
-    ``output_suffix``-named ROI output files, reduced to a single resolution when
-    *write_pyramids* is False, and (for ``.ims``) given the ROI's dimensions and
-    a cropped extent. A ``*_bdv.xml`` is skipped: its ViewSetup dimensions can't
-    be regenerated reliably here, and Imaris (the primary consumer) uses the
-    ``.ims``. Returns the written paths.
+    Each ``.ims`` / ``*_bdv.h5`` is rebuilt with its external links repointed to
+    the ``output_suffix``-named ROI output files, reduced to a single resolution
+    when *write_pyramids* is False, and (for ``.ims``) given the ROI's dimensions
+    and a cropped extent. The ``*_bdv.h5`` / ``*_bdv.xml`` pair is written
+    together — the XML gets the crop's ViewSetup sizes and a translation
+    transform placing the crop at its true position in the specimen — or, if the
+    XML cannot be rewritten safely, neither file is written. *input_shape_zyx* is
+    the uncropped ``(nz, ny, nx)``; when given, a ViewSetup declaring a different
+    size is rejected rather than silently relabelled. Returns the written paths.
     """
     from shifter.utils import h5_output_filename
 
@@ -319,33 +330,469 @@ def write_roi_headers(
     out_shape = (z1 - z0, y1 - y0, x1 - x0)
     keep_paths = None if write_pyramids else {"Data"}
 
+    ims_files, bdv_pairs = group_companion_header_files(header_files)
+
     written: list[Path] = []
-    for src in header_files:
-        name = src.name.lower()
+    for src in ims_files:
         dst = output_dir / src.name
         try:
-            if name.endswith(".ims"):
-                # Rebuilding (rather than editing a copy) updates *every*
-                # dimension declaration: DataSetInfo/Image X/Y/Z, the cropped
-                # physical extent, and each level's own ImageSizeX/Y/Z derived
-                # from that level's downsample factors — so no part of the
-                # header contradicts the data it links to.
-                rebuild_ims_header(
-                    src, dst, rename=rename, output_shape_zyx=out_shape,
-                    roi=roi, keep_paths=keep_paths,
-                )
-                written.append(dst)
-            elif name.endswith("_bdv.h5"):
-                rebuild_bdv_h5_header(src, dst, rename=rename, keep_paths=keep_paths)
-                written.append(dst)
-            else:
-                logger.info(
-                    "Skipping %s for ROI export (BDV XML dimensions not regenerated).",
-                    src.name,
-                )
+            # Rebuilding (rather than editing a copy) updates *every*
+            # dimension declaration: DataSetInfo/Image X/Y/Z, the cropped
+            # physical extent, and each level's own ImageSizeX/Y/Z derived
+            # from that level's downsample factors — so no part of the
+            # header contradicts the data it links to.
+            rebuild_ims_header(
+                src, dst, rename=rename, output_shape_zyx=out_shape,
+                roi=roi, keep_paths=keep_paths,
+            )
+            written.append(dst)
         except Exception as exc:
             logger.warning("Could not write ROI header %s: %s", src.name, exc)
+
+    for stem, pair in sorted(bdv_pairs.items()):
+        written.extend(
+            write_bdv_pair(
+                pair.get("h5"),
+                pair.get("xml"),
+                output_dir,
+                keep_paths=keep_paths,
+                rename=rename,
+                output_shape_zyx=out_shape,
+                input_shape_zyx=input_shape_zyx,
+                roi=roi,
+            )
+        )
     return written
+
+
+# --------------------------------------------------------------------------- #
+# BigDataViewer XML
+#
+# A BigDataViewer dataset is a *pair*: the ``*_bdv.h5`` holds the resolution
+# tables and the links to the pixel data, and the ``*_bdv.xml`` is the entry
+# point — Fiji/BigDataViewer opens the XML, not the H5. Writing one without the
+# other produces a dataset that cannot be opened, so the two are always written
+# (or omitted) together, see :func:`write_bdv_pair`.
+#
+# The XML is *rewritten from the source*, never authored from scratch: only the
+# elements whose meaning is unambiguous are touched, everything else is carried
+# through verbatim. Anything unrecognised aborts the pair rather than producing
+# a header that looks plausible but misplaces the data.
+#
+# Two things change for an export:
+#
+#   * ``ViewSetup/size`` — the voxel dimensions of the exported volume. For a
+#     full-volume export these are unchanged; for an ROI they become the crop's
+#     X Y Z. ``voxelSize`` is *not* touched: a crop resamples nothing.
+#   * ``ViewRegistration`` — a crop starting at voxel (x0, y0, z0) makes that
+#     voxel the new (0, 0, 0), so without compensation the crop would be drawn
+#     at the full volume's origin instead of at its true position inside the
+#     specimen. A pure-translation ``ViewTransform`` by (x0, y0, z0) restores it.
+#
+# Transform order matters and is easy to get backwards. SpimData composes a
+# registration's transforms as ``model = t[0] * t[1] * ... * t[n]``, so the
+# transform listed *last* is applied *first* to the voxel coordinates (this is
+# why "calibration", which consumes raw pixel indices, is conventionally the
+# last entry). The crop offset is in voxels, so it must likewise be applied
+# first, i.e. **appended** as the final ViewTransform:
+#
+#     model_crop = model_src ∘ translate(x0, y0, z0)
+#
+# That is also the convention the Luxendo image spec uses for its own
+# ``affine_to_sample``: the transform maps image (voxel) coordinates into sample
+# space, and a viewer applying it treats the voxel size as (1, 1, 1). An offset
+# in voxels therefore belongs on the image-coordinate side of the affine, which
+# is exactly where appending puts it. :func:`write_bdv_xml` verifies the
+# composition numerically before committing the file rather than trusting the
+# argument above.
+# --------------------------------------------------------------------------- #
+
+
+class BdvXmlError(RuntimeError):
+    """A ``*_bdv.xml`` could not be rewritten safely; the pair must be omitted."""
+
+
+def group_companion_header_files(
+    header_files: list[Path],
+) -> tuple[list[Path], dict[str, dict[str, Path]]]:
+    """Split *header_files* into ``.ims`` files and BigDataViewer pairs.
+
+    Returns ``(ims_files, {stem: {"h5": path, "xml": path}})`` where *stem* is
+    the shared filename stem of a ``*_bdv.h5`` / ``*_bdv.xml`` pair. A pair with
+    a missing half is still reported (with only the key it has) so the caller can
+    refuse it explicitly instead of silently emitting an unusable half-dataset.
+    """
+    ims_files: list[Path] = []
+    pairs: dict[str, dict[str, Path]] = {}
+    for path in header_files:
+        name = path.name.lower()
+        if name.endswith(".ims"):
+            ims_files.append(path)
+        elif name.endswith(".h5"):
+            pairs.setdefault(path.name[: -len(".h5")].lower(), {})["h5"] = path
+        elif name.endswith(".xml"):
+            pairs.setdefault(path.name[: -len(".xml")].lower(), {})["xml"] = path
+    return ims_files, pairs
+
+
+def _affine_from_text(text: str) -> np.ndarray:
+    """Parse a BDV ``<affine>`` (12 row-major numbers) into a 4x4 matrix."""
+    values = [float(v) for v in text.split()]
+    if len(values) != 12:
+        raise BdvXmlError(
+            f"<affine> has {len(values)} numbers, expected 12 (row-major 3x4)"
+        )
+    m = np.eye(4, dtype=np.float64)
+    m[:3, :] = np.asarray(values, dtype=np.float64).reshape(3, 4)
+    return m
+
+
+def _affine_to_text(matrix: np.ndarray) -> str:
+    """Render a 4x4 matrix as a BDV ``<affine>`` body (12 row-major numbers)."""
+    return " ".join(f"{v:.10g}" for v in matrix[:3, :].reshape(-1))
+
+
+def _compose_view_transforms(matrices: list[np.ndarray]) -> np.ndarray:
+    """Compose ``t[0] * t[1] * ... * t[n]``, SpimData's registration model."""
+    model = np.eye(4, dtype=np.float64)
+    for m in matrices:
+        model = model @ m
+    return model
+
+
+def _registration_matrices(registration: Any) -> list[np.ndarray]:
+    """Return the 4x4 matrices of a ``<ViewRegistration>``, in document order."""
+    matrices: list[np.ndarray] = []
+    for transform in registration.findall("ViewTransform"):
+        affine = transform.find("affine")
+        if affine is None or not (affine.text or "").strip():
+            raise BdvXmlError("a <ViewTransform> has no <affine> body")
+        matrices.append(_affine_from_text(affine.text))
+    return matrices
+
+
+def _parse_size_xyz(text: str | None) -> tuple[int, int, int]:
+    """Parse a BDV ``<size>`` body (``X Y Z``) into a tuple of ints."""
+    parts = (text or "").split()
+    if len(parts) != 3:
+        raise BdvXmlError(f"<size> is {text!r}, expected three numbers 'X Y Z'")
+    try:
+        return tuple(int(float(p)) for p in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise BdvXmlError(f"<size> is {text!r}, expected three numbers") from exc
+
+
+def write_bdv_xml(
+    src_xml: Path | str,
+    dst_xml: Path | str,
+    *,
+    output_shape_zyx: tuple[int, int, int] | None = None,
+    input_shape_zyx: tuple[int, int, int] | None = None,
+    roi: tuple[int, int, int, int, int, int] | None = None,
+    h5_filename: str | None = None,
+) -> dict[str, Any]:
+    """Rewrite a BigDataViewer XML to describe an exported (optionally cropped) volume.
+
+    Parameters
+    ----------
+    output_shape_zyx : tuple, optional
+        ``(nz, ny, nx)`` actually written. Every ``ViewSetup/size`` is set to
+        ``nx ny nz``. Left alone when None.
+    input_shape_zyx : tuple, optional
+        ``(nz, ny, nx)`` of the source volume. When given, a ``ViewSetup`` whose
+        declared size differs is rejected: it describes something other than what
+        was exported (a different tile or angle), and rewriting its size would
+        misdescribe it.
+    roi : tuple, optional
+        ``(z0, z1, y0, y1, x0, x1)``. Appends a pure-translation
+        ``ViewTransform`` of ``(x0, y0, z0)`` voxels to every
+        ``ViewRegistration`` so the crop keeps its world position.
+    h5_filename : str, optional
+        Filename written into ``ImageLoader/hdf5``. Always set explicitly (as a
+        bare relative name) when given, so a source that referenced the H5 by a
+        nested path does not keep pointing outside a flat output folder.
+
+    Raises
+    ------
+    BdvXmlError
+        If the document is not a SpimData XML or lacks the elements this
+        rewrite depends on. The caller must then omit the whole BDV pair.
+    """
+    import xml.etree.ElementTree as ET
+
+    src_xml = Path(src_xml)
+    dst_xml = Path(dst_xml)
+
+    try:
+        tree = ET.parse(str(src_xml))
+    except ET.ParseError as exc:
+        raise BdvXmlError(f"{src_xml.name}: not parseable as XML ({exc})") from exc
+
+    root = tree.getroot()
+    if root.tag != "SpimData":
+        raise BdvXmlError(
+            f"{src_xml.name}: root element is <{root.tag}>, expected <SpimData>"
+        )
+
+    # --- image loader -------------------------------------------------------
+    if h5_filename is not None:
+        hdf5_elements = root.findall("./SequenceDescription/ImageLoader/hdf5")
+        if not hdf5_elements:
+            raise BdvXmlError(
+                f"{src_xml.name}: no <SequenceDescription><ImageLoader><hdf5> element "
+                "to point at the exported .h5"
+            )
+        for element in hdf5_elements:
+            element.set("type", "relative")
+            element.text = h5_filename
+
+    # --- view setups --------------------------------------------------------
+    setups = root.findall("./SequenceDescription/ViewSetups/ViewSetup")
+    if not setups:
+        raise BdvXmlError(f"{src_xml.name}: no <ViewSetup> entries")
+
+    setup_ids: list[str] = []
+    for setup in setups:
+        id_element = setup.find("id")
+        setup_id = (id_element.text or "").strip() if id_element is not None else ""
+        setup_ids.append(setup_id)
+
+        size_element = setup.find("size")
+        if size_element is None:
+            raise BdvXmlError(
+                f"{src_xml.name}: ViewSetup {setup_id or '?'} has no <size> element"
+            )
+        try:
+            current = _parse_size_xyz(size_element.text)
+        except BdvXmlError as exc:
+            raise BdvXmlError(f"{src_xml.name}: ViewSetup {setup_id or '?'}: {exc}") from exc
+
+        if input_shape_zyx is not None:
+            nz, ny, nx = input_shape_zyx
+            if current != (nx, ny, nz):
+                raise BdvXmlError(
+                    f"{src_xml.name}: ViewSetup {setup_id or '?'} declares size "
+                    f"{current[0]} {current[1]} {current[2]} (X Y Z) but the exported "
+                    f"volume is {nx} {ny} {nz}; refusing to rewrite a setup that "
+                    "describes different data"
+                )
+
+        if output_shape_zyx is not None:
+            nz, ny, nx = output_shape_zyx
+            size_element.text = f"{nx} {ny} {nz}"
+
+    # --- view registrations -------------------------------------------------
+    registrations = root.findall("./ViewRegistrations/ViewRegistration")
+    n_translated = 0
+    if roi is not None:
+        if not registrations:
+            raise BdvXmlError(
+                f"{src_xml.name}: no <ViewRegistration> entries, so the crop offset "
+                "cannot be applied"
+            )
+        z0, _z1, y0, _y1, x0, _x1 = roi
+        offset = np.eye(4, dtype=np.float64)
+        offset[:3, 3] = (x0, y0, z0)
+
+        for registration in registrations:
+            try:
+                before = _registration_matrices(registration)
+            except BdvXmlError as exc:
+                raise BdvXmlError(f"{src_xml.name}: {exc}") from exc
+            if not before:
+                raise BdvXmlError(
+                    f"{src_xml.name}: a <ViewRegistration> carries no <ViewTransform>"
+                )
+
+            # Appended, i.e. applied *first* — the offset is in voxels and must
+            # act on voxel coordinates, before the existing calibration/affine.
+            transform = ET.SubElement(registration, "ViewTransform")
+            transform.set("type", "affine")
+            name = ET.SubElement(transform, "name")
+            name.text = "ROI crop offset"
+            affine = ET.SubElement(transform, "affine")
+            affine.text = _affine_to_text(offset)
+
+            # Prove the composition rather than trusting the argument for it.
+            expected = _compose_view_transforms(before) @ offset
+            actual = _compose_view_transforms(_registration_matrices(registration))
+            if not np.allclose(expected, actual, rtol=1e-9, atol=1e-9):
+                raise BdvXmlError(
+                    f"{src_xml.name}: crop-offset composition check failed"
+                )
+            n_translated += 1
+
+    # --- atomic write -------------------------------------------------------
+    ET.indent(tree, space="  ")
+    tmp_path = dst_xml.with_name(dst_xml.name + ".tmp")
+    tree.write(str(tmp_path), encoding="UTF-8", xml_declaration=True)
+    os.replace(str(tmp_path), str(dst_xml))
+
+    return {
+        "setups": setup_ids,
+        "registrations_translated": n_translated,
+        "h5_filename": h5_filename,
+    }
+
+
+def validate_bdv_xml(
+    xml_path: Path | str,
+    *,
+    expected_shape_zyx: tuple[int, int, int] | None = None,
+) -> list[str]:
+    """Return human-readable problems with a written BDV XML (empty = OK).
+
+    Checks that the XML parses, that the H5 it names exists **relative to the
+    XML's own directory**, that every ``ViewSetup`` id has a matching ``sNN``
+    group in that H5, and that the declared sizes match what was exported.
+    """
+    import xml.etree.ElementTree as ET
+
+    xml_path = Path(xml_path)
+    problems: list[str] = []
+
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except ET.ParseError as exc:
+        return [f"{xml_path.name}: not parseable as XML ({exc})"]
+
+    if root.tag != "SpimData":
+        problems.append(f"{xml_path.name}: root element is <{root.tag}>, not <SpimData>")
+
+    setup_ids: list[str] = []
+    for setup in root.findall("./SequenceDescription/ViewSetups/ViewSetup"):
+        id_element = setup.find("id")
+        setup_id = (id_element.text or "").strip() if id_element is not None else ""
+        setup_ids.append(setup_id)
+        size_element = setup.find("size")
+        if size_element is None:
+            problems.append(f"{xml_path.name}: ViewSetup {setup_id or '?'} has no <size>")
+            continue
+        if expected_shape_zyx is not None:
+            try:
+                size = _parse_size_xyz(size_element.text)
+            except BdvXmlError as exc:
+                problems.append(f"{xml_path.name}: ViewSetup {setup_id or '?'}: {exc}")
+                continue
+            nz, ny, nx = expected_shape_zyx
+            if size != (nx, ny, nz):
+                problems.append(
+                    f"{xml_path.name}: ViewSetup {setup_id or '?'} declares size "
+                    f"{size[0]} {size[1]} {size[2]} but the export is {nx} {ny} {nz} (X Y Z)"
+                )
+    if not setup_ids:
+        problems.append(f"{xml_path.name}: no <ViewSetup> entries")
+
+    for element in root.findall("./SequenceDescription/ImageLoader/hdf5"):
+        referenced = (element.text or "").strip()
+        if not referenced:
+            problems.append(f"{xml_path.name}: <hdf5> element is empty")
+            continue
+        target = (xml_path.parent / referenced).resolve()
+        if not target.is_file():
+            problems.append(
+                f"{xml_path.name}: references {referenced}, which does not exist "
+                f"next to the XML"
+            )
+            continue
+        problems.extend(_validate_bdv_setup_groups(xml_path, target, setup_ids))
+
+    return problems
+
+
+def _validate_bdv_setup_groups(
+    xml_path: Path, h5_path: Path, setup_ids: list[str]
+) -> list[str]:
+    """Check every ``ViewSetup`` id has a matching ``sNN`` group in *h5_path*."""
+    import h5py
+
+    problems: list[str] = []
+    try:
+        with h5py.File(str(h5_path), "r") as f:
+            groups = {k for k in f.keys() if re.fullmatch(r"s\d+", k)}
+    except Exception as exc:  # unreadable/locked file
+        return [f"{xml_path.name}: could not read {h5_path.name}: {exc}"]
+
+    for setup_id in setup_ids:
+        if not setup_id.isdigit():
+            problems.append(f"{xml_path.name}: ViewSetup id {setup_id!r} is not numeric")
+            continue
+        if f"s{int(setup_id):02d}" not in groups:
+            problems.append(
+                f"{xml_path.name}: ViewSetup {setup_id} has no matching setup group "
+                f"in {h5_path.name} (has {sorted(groups) or 'none'})"
+            )
+    return problems
+
+
+def write_bdv_pair(
+    src_h5: Path | None,
+    src_xml: Path | None,
+    output_dir: Path | str,
+    *,
+    keep_paths: set[str] | None = None,
+    rename: Any = None,
+    output_shape_zyx: tuple[int, int, int] | None = None,
+    input_shape_zyx: tuple[int, int, int] | None = None,
+    roi: tuple[int, int, int, int, int, int] | None = None,
+) -> list[Path]:
+    """Write a matched ``*_bdv.h5`` / ``*_bdv.xml`` pair, or neither.
+
+    BigDataViewer opens the XML and reaches the pixels through the H5, so half a
+    pair is not a partial success — it is a dataset that cannot be opened, and an
+    H5 left behind next to a stale XML is worse still. If either half cannot be
+    written (a missing source, an unrecognised XML schema, a failed rebuild) both
+    are omitted, the reason is logged, and an empty list is returned.
+    """
+    output_dir = Path(output_dir)
+
+    if src_h5 is None or src_xml is None:
+        missing, present = (
+            ("_bdv.h5", src_xml) if src_h5 is None else ("_bdv.xml", src_h5)
+        )
+        logger.warning(
+            "BDV pair omitted: %s has no matching %s, and BigDataViewer needs both.",
+            present.name if present is not None else "?", missing,
+        )
+        return []
+
+    dst_h5 = output_dir / src_h5.name
+    dst_xml = output_dir / src_xml.name
+
+    try:
+        rebuild_bdv_h5_header(src_h5, dst_h5, rename=rename, keep_paths=keep_paths)
+    except Exception as exc:
+        logger.warning("BDV pair omitted: could not write %s: %s", src_h5.name, exc)
+        _unlink_quietly(dst_h5)
+        return []
+
+    try:
+        write_bdv_xml(
+            src_xml,
+            dst_xml,
+            output_shape_zyx=output_shape_zyx,
+            input_shape_zyx=input_shape_zyx,
+            roi=roi,
+            h5_filename=dst_h5.name,
+        )
+        problems = validate_bdv_xml(dst_xml, expected_shape_zyx=output_shape_zyx)
+        if problems:
+            raise BdvXmlError("; ".join(problems))
+    except Exception as exc:
+        logger.warning("BDV pair omitted: could not write %s: %s", src_xml.name, exc)
+        _unlink_quietly(dst_xml)
+        _unlink_quietly(dst_h5)
+        return []
+
+    return [dst_h5, dst_xml]
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Remove *path* if present, ignoring failures (used on the abort path)."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 class H5FileManager:
