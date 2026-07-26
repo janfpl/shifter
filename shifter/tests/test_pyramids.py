@@ -274,7 +274,58 @@ def test_streaming_matches_reference_under_numba() -> None:
     _check(vol, levels, [4, 9, 37], "numba backend")
 
 
+def test_worker_count_leaves_cores_free() -> None:
+    """The shared budget reserves cores, and degrades sanely on small machines."""
+    import os
+    from unittest import mock
+
+    from shifter import utils
+
+    expected = {1: 1, 2: 1, 4: 2, 8: 4, 16: 12, 32: 28, 64: 60, 128: 124}
+    for total, want in expected.items():
+        with mock.patch.object(utils, "available_cpu_count", return_value=total):
+            got = utils.worker_count()
+            assert got == want, f"{total} cores -> {got}, expected {want}"
+            assert got >= 1
+            assert got <= total
+
+    # Explicit overrides win.
+    prev = dict(os.environ)
+    try:
+        os.environ["CSC_MAX_WORKERS"] = "6"
+        assert utils.worker_count() == 6
+        del os.environ["CSC_MAX_WORKERS"]
+        os.environ["CSC_RESERVED_CORES"] = "8"
+        with mock.patch.object(utils, "available_cpu_count", return_value=32):
+            assert utils.worker_count() == 24
+        # A nonsense value must not crash or produce < 1.
+        os.environ["CSC_MAX_WORKERS"] = "not-a-number"
+        assert utils.worker_count() >= 1
+    finally:
+        os.environ.clear()
+        os.environ.update(prev)
+
+
+def test_numba_thread_limit_applied() -> None:
+    """numba's active thread count is clamped to the worker budget."""
+    from shifter import h5_utils as hu
+
+    if not hu._HAVE_NUMBA_PYRAMID:
+        return
+    import numba
+
+    from shifter.utils import worker_count
+
+    hu._numba_threads_set = False
+    hu._ensure_numba_threads()
+    active = numba.get_num_threads()
+    assert active == max(1, min(worker_count(), numba.config.NUMBA_NUM_THREADS))
+    assert active <= numba.config.NUMBA_NUM_THREADS
+
+
 _TESTS = [
+    test_worker_count_leaves_cores_free,
+    test_numba_thread_limit_applied,
     test_parallel_backend_is_bit_identical_to_numpy,
     test_streaming_matches_reference_under_numba,
     test_export_never_rereads_output_for_pyramids,

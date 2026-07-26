@@ -115,12 +115,16 @@ class PhaseCorrelation(RegistrationAlgorithm):
     ) -> RegistrationResult:
         """Masked FFT-based cross-correlation with search range enforcement.
 
-        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        Spreads the FFT across the shared worker budget, which leaves a few
+        cores free for the OS and the napari UI (see ``utils.worker_count``).
         """
         from scipy.fft import fftn, ifftn
 
-        F_ref = fftn(ref, workers=-1)
-        F_mov = fftn(mov, workers=-1)
+        from shifter.utils import worker_count
+
+        n_workers = worker_count()
+        F_ref = fftn(ref, workers=n_workers)
+        F_mov = fftn(mov, workers=n_workers)
 
         if self.normalization == "phase":
             cross_power = F_ref * np.conj(F_mov)
@@ -129,7 +133,7 @@ class PhaseCorrelation(RegistrationAlgorithm):
         else:
             cross_power = F_ref * np.conj(F_mov)
 
-        cc = np.real(ifftn(cross_power, workers=-1))
+        cc = np.real(ifftn(cross_power, workers=n_workers))
 
         # Build mask for allowed shifts.
         shape = ref.shape

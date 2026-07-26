@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,68 @@ from shifter import __version__
 DEFAULT_COLORMAPS = ["green", "magenta", "cyan", "yellow", "red", "blue"]
 
 MAX_CHANNELS = 6
+
+# --------------------------------------------------------------------------- #
+# CPU worker policy
+#
+# Registration and export both saturate the CPU. Taking every core makes the
+# napari UI unresponsive and starves the OS (and anything else the acquisition
+# machine is doing), so leave a few cores free by default and use the rest.
+# --------------------------------------------------------------------------- #
+
+#: Cores deliberately left free for the OS / UI / other work.
+DEFAULT_RESERVED_CORES = 4
+
+
+def available_cpu_count() -> int:
+    """Number of logical CPUs this process may actually run on.
+
+    Prefers the scheduler affinity mask where the platform provides it (Linux,
+    containers with a restricted CPU set), which can be far smaller than the
+    machine's total core count. Falls back to ``os.cpu_count()`` elsewhere
+    (including Windows).
+    """
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def worker_count(minimum: int = 1, maximum: int | None = None) -> int:
+    """Threads to use for parallel work, leaving :data:`DEFAULT_RESERVED_CORES` free.
+
+    The reservation is itself capped at half the machine, so small machines
+    still get useful parallelism: 32 cores -> 28 workers, 8 -> 4, 4 -> 2, 2 -> 1.
+
+    Overrides (both optional):
+      * ``CSC_MAX_WORKERS``    - use exactly this many workers.
+      * ``CSC_RESERVED_CORES`` - leave this many cores free instead of 4.
+    """
+    override = _env_int("CSC_MAX_WORKERS")
+    if override is not None and override > 0:
+        return max(minimum, override if maximum is None else min(override, maximum))
+
+    total = available_cpu_count()
+    reserved = _env_int("CSC_RESERVED_CORES")
+    if reserved is None or reserved < 0:
+        reserved = DEFAULT_RESERVED_CORES
+    # Never reserve more than half the machine.
+    reserved = min(reserved, max(0, total // 2))
+
+    count = max(minimum, total - reserved)
+    if maximum is not None:
+        count = min(count, maximum)
+    return count
 
 
 def apply_integer_shift(arr: np.ndarray, shift_zyx: tuple[int, int, int]) -> np.ndarray:

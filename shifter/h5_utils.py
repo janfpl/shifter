@@ -588,6 +588,31 @@ try:  # pragma: no cover - exercised only when numba is installed
 except Exception:  # numba missing or failed to compile
     _HAVE_NUMBA_PYRAMID = False
 
+_numba_threads_set = False
+
+
+def _ensure_numba_threads() -> None:
+    """Limit numba's thread pool to the shared worker budget (once per process).
+
+    ``numba.set_num_threads`` applies to every parallel region, so this also
+    bounds the mutual-information grid search. The cap is the pool size numba
+    established at import (``NUMBA_NUM_THREADS``); we can only go at or below it.
+    """
+    global _numba_threads_set
+    if _numba_threads_set or not _HAVE_NUMBA_PYRAMID:
+        return
+    _numba_threads_set = True
+    try:
+        from shifter.utils import worker_count
+
+        n = max(1, min(worker_count(), numba.config.NUMBA_NUM_THREADS))
+        numba.set_num_threads(n)
+        logger.info(
+            "numba threads: %d of %d available", n, numba.config.NUMBA_NUM_THREADS
+        )
+    except Exception as exc:  # never let thread tuning break the export
+        logger.warning("Could not set numba thread count: %s", exc)
+
 
 def _pyramid_gpu_enabled() -> bool:
     """True when the caller opted into the CuPy XY reduction."""
@@ -645,6 +670,7 @@ def _block_sum_xy(
             return out
 
     if big_enough and _HAVE_NUMBA_PYRAMID:
+        _ensure_numba_threads()
         out = np.zeros((n, oh, ow), dtype=sum_dtype)
         # Numba indexes only inside the trimmed region, so no copy is needed
         # even when the factors do not divide the plane dimensions.

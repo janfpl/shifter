@@ -9,7 +9,6 @@ for the heavy number-crunching).
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -132,17 +131,20 @@ class ZNCCRegistration(RegistrationAlgorithm):
     ) -> RegistrationResult:
         """FFT-based ZNCC: cross-correlate in Fourier space, then normalise.
 
-        Uses ``workers=-1`` to spread the FFT across all available CPU cores.
+        Spreads the FFT across the shared worker budget, which leaves a few
+        cores free for the OS and the napari UI (see ``utils.worker_count``).
         """
         from scipy.fft import fftn, ifftn
+
+        from shifter.utils import worker_count
 
         ref_zm = ref - ref.mean()
         mov_zm = mov - mov.mean()
 
-        # Cross-correlation via FFT — use all CPU cores.
-        F_ref = fftn(ref_zm, workers=-1)
-        F_mov = fftn(mov_zm, workers=-1)
-        cc = np.real(ifftn(F_ref * np.conj(F_mov), workers=-1))
+        n_workers = worker_count()
+        F_ref = fftn(ref_zm, workers=n_workers)
+        F_mov = fftn(mov_zm, workers=n_workers)
+        cc = np.real(ifftn(F_ref * np.conj(F_mov), workers=n_workers))
 
         # Normalise by product of standard deviations and volume size.
         n = ref.size
@@ -203,7 +205,9 @@ class ZNCCRegistration(RegistrationAlgorithm):
             for dx in range(-sr_xy, sr_xy + 1)
         ]
 
-        n_workers = min(os.cpu_count() or 1, len(candidates))
+        from shifter.utils import worker_count
+
+        n_workers = worker_count(maximum=len(candidates))
 
         def _eval_shift(args):
             dz, dy, dx = args

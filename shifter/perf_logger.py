@@ -121,7 +121,16 @@ def setup_perf_log(log_dir: str | Path, debug: bool | None = None) -> Path:
     _setup_done = True
 
     _perf_logger.info("Performance log initialised (debug=%s)", _debug_enabled)
-    _perf_logger.info("CPU cores: %d", os.cpu_count() or 1)
+    try:
+        from shifter.utils import available_cpu_count, worker_count
+
+        _perf_logger.info(
+            "CPU cores: %d available, using %d worker threads",
+            available_cpu_count(),
+            worker_count(),
+        )
+    except Exception:
+        _perf_logger.info("CPU cores: %d", os.cpu_count() or 1)
     vm = psutil.virtual_memory()
     _perf_logger.info(
         "System RAM: total=%s available=%s",

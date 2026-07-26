@@ -8,7 +8,6 @@ are emitted via :mod:`shifter.perf_logger`.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,6 +30,7 @@ from shifter.utils import (
     build_metadata,
     h5_output_filename,
     save_metadata,
+    worker_count,
 )
 
 if TYPE_CHECKING:
@@ -39,8 +39,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Number of threads for per-plane XY shift (capped to avoid over-subscription).
-_XY_WORKERS = min(os.cpu_count() or 1, 16)
+# Threads for the per-plane XY shift. Uses the shared worker budget, which
+# leaves a few cores free for the OS and the napari UI (see utils.worker_count).
+_XY_WORKERS = worker_count()
 
 
 # --- Chunk-size policy ----------------------------------------------------- #

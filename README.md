@@ -101,6 +101,19 @@ Three properties make this exact and fast:
 
 Setting `CSC_PYRAMID_GPU=1` runs the XY reduction on the GPU via CuPy instead. This copies each slab to the device, so it only helps when the GPU is otherwise idle and the CPU is the bottleneck; numba is the better default. The chosen backend is recorded in `performance_log.txt` (`backend=numba|gpu|numpy`).
 
+### CPU usage
+
+Parallel work — pyramid generation, per-plane XY shifts, FFT-based registration, and the mutual-information grid search — uses **all logical cores except four**, which are left free so the OS and the napari UI stay responsive. The reservation is capped at half the machine, so smaller systems still get useful parallelism (32 cores → 28 workers, 16 → 12, 8 → 4, 4 → 2). On Linux the count respects the process's CPU affinity mask, so a restricted core set is honoured.
+
+Two environment variables override this:
+
+```bash
+CSC_MAX_WORKERS=16     # use exactly this many worker threads
+CSC_RESERVED_CORES=8   # leave this many cores free instead of 4
+```
+
+The count in effect is recorded at the top of `performance_log.txt` (`CPU cores: N available, using M worker threads`).
+
 Companion Imaris (`.ims`) and BigDataViewer (`*_bdv.h5`) headers describe a *multi-resolution* dataset and link to the pyramid levels. With pyramids **on** they are copied verbatim; with pyramids **off** they are **rewritten to a single (full-resolution) level** so they still resolve against the pyramid-less output — e.g. for import into the Imaris File Converter, which builds its own pyramids from the full-resolution data. (Copying the original multi-resolution headers next to pyramid-less data would make Imaris/BigDataViewer read the dataset as corrupt.)
 
 To repair a folder that was exported by an older build (multi-resolution headers copied next to pyramid-less data), reduce the headers in place without re-exporting:
