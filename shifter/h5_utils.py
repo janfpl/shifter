@@ -585,8 +585,10 @@ try:  # pragma: no cover - exercised only when numba is installed
                     out[p, oy, ox] += acc
 
     _HAVE_NUMBA_PYRAMID = True
-except Exception:  # numba missing or failed to compile
+    _NUMBA_UNAVAILABLE_REASON = ""
+except Exception as _exc:  # numba missing or failed to load
     _HAVE_NUMBA_PYRAMID = False
+    _NUMBA_UNAVAILABLE_REASON = f"{type(_exc).__name__}: {_exc}"
 
 _numba_threads_set = False
 
@@ -650,6 +652,27 @@ def pyramid_backend() -> str:
     if _pyramid_gpu_enabled():
         return "gpu"
     return "numba" if _HAVE_NUMBA_PYRAMID else "numpy"
+
+
+def pyramid_backend_status() -> str:
+    """Human-readable backend line, explaining any fall back to plain numpy.
+
+    Falling back is silent otherwise, which hides a large performance loss: the
+    single-threaded numpy reduction is several times slower than the numba one.
+    """
+    backend = pyramid_backend()
+    if backend == "numba":
+        try:
+            return f"numba ({numba.get_num_threads()} threads)"
+        except Exception:
+            return "numba"
+    if backend == "gpu":
+        return "gpu (CuPy; CSC_PYRAMID_GPU=1)"
+    reason = _NUMBA_UNAVAILABLE_REASON or "numba not available"
+    return (
+        f"numpy (single-threaded fallback — numba unavailable: {reason}; "
+        "install numba for a multi-core pyramid reduction)"
+    )
 
 
 def _block_sum_xy(

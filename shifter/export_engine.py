@@ -871,8 +871,14 @@ def run_export_h5(
     log_event(
         f"H5 export plan | channels={n_channels} chunk_z={chunk_z} "
         f"xy=({xy_shape[0]},{xy_shape[1]}) ram%={ram_percent} "
-        f"roi={roi is not None}"
+        f"roi={roi is not None} pyramids={write_pyramids}"
     )
+    if write_pyramids:
+        # Report up front, not after an hour of work, so a silent fall back to
+        # the slow single-threaded reduction is obvious before the run starts.
+        from shifter.h5_utils import pyramid_backend_status
+
+        log_event(f"Pyramid reduction backend: {pyramid_backend_status()}")
     log_memory("H5 export start", level=logging.INFO)
 
     # Track progress in bytes rather than Z-planes: pyramid regeneration
