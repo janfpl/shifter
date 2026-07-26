@@ -898,11 +898,18 @@ def run_export_h5(
         if progress_callback:
             progress_callback(global_bytes_done + done, total_bytes)
 
+    # Record what the export actually wrote, per channel, so the companion
+    # headers can be repointed from fact rather than from a filename rule. A
+    # rule cannot see a link that names a nested source path, which would either
+    # dangle or — the silent failure — resolve back to the uncorrected raw data.
+    source_to_output: dict[str, str] = {}
+
     for i, (loader, transform) in enumerate(
         zip(loaders, shift_manager.transforms)
     ):
         out_name = h5_output_filename(transform.filename, suffix)
         out_path = output_dir / out_name
+        source_to_output[str(loader.path)] = out_name
 
         export_channel_h5(
             loader.dask_array,
@@ -958,46 +965,102 @@ def run_export_h5(
     #     translation that keeps the crop at its true position in the specimen,
     #     and (when pyramids are off) a single level
     from shifter.h5_utils import (
+        ExternalLinkMap,
         copy_companion_header_files,
         find_companion_header_files,
+        quarantine_header,
+        validate_headers,
         write_roi_headers,
         write_single_resolution_headers,
     )
 
     input_dir = loaders[0].path.parent
     header_files = find_companion_header_files(input_dir)
+    link_map = ExternalLinkMap(source_to_output, header_dir=input_dir)
+    if link_map.ambiguous_basenames:
+        log_event(
+            "Companion headers: ambiguous source basenames "
+            + ", ".join(sorted(link_map.ambiguous_basenames))
+            + " — links matching them will be refused rather than guessed"
+        )
+
+    written: list[Path] = []
+    kind = ""
     if header_files and roi is not None:
         written = write_roi_headers(
             header_files, output_dir, suffix, roi, write_pyramids,
-            input_shape_zyx=tuple(ref_shape),
+            input_shape_zyx=tuple(ref_shape), link_map=link_map,
         )
-        log_event(
-            "Wrote ROI companion headers: "
-            + ", ".join(p.name for p in written)
-        )
-        metadata["companion_header_files"] = [p.name for p in written]
-        metadata["companion_headers_roi"] = True
-        metadata["companion_headers_single_resolution"] = not write_pyramids
+        kind = "ROI"
     elif header_files and not write_pyramids:
         # Pyramids weren't written, so the multi-resolution headers would link
         # to absent pyramid levels (which Imaris/BigDataViewer read as corrupt).
         # Rewrite them to reference only the full-resolution Data.
         written = write_single_resolution_headers(
-            header_files, output_dir, output_shape_zyx=tuple(ref_shape)
+            header_files, output_dir, output_shape_zyx=tuple(ref_shape),
+            link_map=link_map,
         )
+        kind = "single-resolution"
+    elif header_files:
+        # Full volume with pyramids: the source headers already describe exactly
+        # what was written, and the export deliberately kept the original
+        # filenames, so a verbatim copy is correct — *if* the links are bare
+        # filenames. A header whose links carry nested source paths would still
+        # name those paths from the output folder, so fall back to rebuilding it
+        # through the recorded mapping. Validation below decides which it was.
+        written = copy_companion_header_files(header_files, output_dir)
+        kind = "copied"
+        problems = validate_headers(written)
+        if problems:
+            log_event(
+                "Copied companion headers do not resolve against the output "
+                "("
+                + "; ".join(problems)
+                + "); rebuilding them from the recorded channel mapping instead."
+            )
+            for path in written:
+                path.unlink(missing_ok=True)
+            written = write_single_resolution_headers(
+                header_files, output_dir, output_shape_zyx=tuple(ref_shape),
+                link_map=link_map,
+            )
+            kind = "rebuilt"
+
+    if header_files:
+        # Validate only now: an external link cannot be dereferenced until the
+        # data files it points at are written and closed. Nothing is reported as
+        # a good header until it has actually been followed to real 3-D data of
+        # the size the header claims.
+        problems = validate_headers(written)
+        metadata["companion_header_validation"] = {
+            "ok": not problems,
+            "problems": problems,
+            "kind": kind,
+        }
+        if problems:
+            quarantined = [quarantine_header(p) for p in written if p.exists()]
+            metadata["companion_header_files"] = []
+            metadata["companion_headers_quarantined"] = [
+                p.name for p in quarantined if p is not None
+            ]
+            log_event("Companion header validation FAILED: " + "; ".join(problems))
+            save_metadata(metadata, output_dir)
+            raise RuntimeError(
+                "The exported image data is complete and correct, but the "
+                "companion header files could not be written correctly. They "
+                "have been renamed to '.invalid' rather than left where a viewer "
+                "would open them:\n  " + "\n  ".join(problems)
+            )
+        metadata["companion_header_files"] = [p.name for p in written]
+        if kind == "ROI":
+            metadata["companion_headers_roi"] = True
+            metadata["companion_headers_single_resolution"] = not write_pyramids
+        elif kind in ("single-resolution", "rebuilt"):
+            metadata["companion_headers_single_resolution"] = True
         log_event(
-            "Wrote single-resolution companion headers: "
+            f"Wrote {kind} companion headers (validated): "
             + ", ".join(p.name for p in written)
         )
-        metadata["companion_header_files"] = [p.name for p in written]
-        metadata["companion_headers_single_resolution"] = True
-    elif header_files:
-        copied = copy_companion_header_files(header_files, output_dir)
-        log_event(
-            "Copied companion header files: "
-            + ", ".join(p.name for p in copied)
-        )
-        metadata["companion_header_files"] = [p.name for p in copied]
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path

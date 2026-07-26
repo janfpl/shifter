@@ -146,6 +146,7 @@ def write_single_resolution_headers(
     header_files: list[Path],
     output_dir: Path | str,
     output_shape_zyx: tuple[int, int, int] | None = None,
+    link_map: Any = None,
 ) -> list[Path]:
     """Write companion headers into *output_dir* describing full-resolution only.
 
@@ -164,14 +165,18 @@ def write_single_resolution_headers(
     for src in ims_files:
         dst = output_dir / src.name
         try:
-            rebuild_ims_header(
-                src, dst, output_shape_zyx=output_shape_zyx, keep_paths={"Data"}
+            info = rebuild_ims_header(
+                src, dst, link_map=link_map, output_shape_zyx=output_shape_zyx,
+                keep_paths={"Data"},
             )
+            if info["unresolved"]:
+                raise RuntimeError("; ".join(info["unresolved"]))
             written.append(dst)
         except Exception as exc:
             logger.warning(
                 "Could not write single-resolution header %s: %s", src.name, exc
             )
+            _unlink_quietly(dst)
 
     for stem, pair in sorted(bdv_pairs.items()):
         written.extend(
@@ -180,6 +185,7 @@ def write_single_resolution_headers(
                 pair.get("xml"),
                 output_dir,
                 keep_paths={"Data"},
+                link_map=link_map,
                 output_shape_zyx=output_shape_zyx,
             )
         )
@@ -228,75 +234,149 @@ def _set_ims_char_attr(grp: Any, key: str, text: object) -> None:
     grp.attrs.create(key, _ims_char_attr(text))
 
 
-def _remap_ims_external_links(f: Any, rename: Any) -> None:
-    """Rewrite each Channel's ``Data`` external-link filename via *rename*."""
-    import h5py
-
-    ds = f.get("DataSet")
-    if ds is None:
-        return
-    for lvl_name in ds.keys():
-        lvl = ds[lvl_name]
-        for tp_name in lvl.keys():
-            tp = lvl[tp_name]
-            for ch_name in tp.keys():
-                grp = tp[ch_name]
-                link = grp.get("Data", getlink=True)
-                if isinstance(link, h5py.ExternalLink):
-                    new = rename(link.filename)
-                    if new != link.filename:
-                        path = link.path
-                        del grp["Data"]
-                        grp["Data"] = h5py.ExternalLink(new, path)
-
-
-def _remap_bdv_external_links(f: Any, rename: Any) -> None:
-    """Rewrite each ``cells`` external-link filename via *rename*."""
-    import h5py
-
-    for t in [k for k in f.keys() if re.fullmatch(r"t\d+", k)]:
-        for s in f[t].keys():
-            grp = f[f"{t}/{s}"]
-            for lvl in grp.keys():
-                cell_grp = grp[lvl]
-                link = cell_grp.get("cells", getlink=True)
-                if isinstance(link, h5py.ExternalLink):
-                    new = rename(link.filename)
-                    if new != link.filename:
-                        path = link.path
-                        del cell_grp["cells"]
-                        cell_grp["cells"] = h5py.ExternalLink(new, path)
+# --------------------------------------------------------------------------- #
+# External-link mapping
+#
+# Every rewritten header has to repoint its external links at the *corrected
+# output* files. Inferring the new target from the old filename with a string
+# rule ("append the export suffix") works only for a flat layout where links are
+# bare filenames. Real acquisitions nest them:
+#
+#     raw/stack_1_channel_0-561_obj_left/Cam_left_00000.lux.h5
+#
+# Rewrite that nested name into a header sitting in a flat output folder and one
+# of two things happens. Either it does not resolve — a broken link, loud and
+# harmless — or it resolves back to the *original raw data*, and the user views
+# uncorrected pixels believing they are corrected. The second is the failure
+# this class exists to prevent: it is silent, and the output looks right.
+#
+# So the export records what it actually did — source path -> output filename —
+# and the mapping is applied instead of guessed. Lookup tries progressively
+# looser matches, stopping short of the one guess that could be wrong: a
+# basename shared by two different sources is refused outright rather than
+# resolved arbitrarily.
+# --------------------------------------------------------------------------- #
 
 
-def _crop_ims_dimensions(
-    f: Any, roi: tuple[int, int, int, int, int, int]
-) -> None:
-    """Set an Imaris header's dimensions/extent to the ROI, preserving voxel size.
+def _normalise_link(text: str) -> str:
+    """Normalise an external-link filename for comparison.
 
-    Imaris stores voxel dimensions in ``DataSetInfo/Image`` as X/Y/Z and the
-    physical bounding box as ExtMin{0,1,2}/ExtMax{0,1,2} (axis 0=X, 1=Y, 2=Z),
-    where voxel size = (ExtMax-ExtMin)/N. The ROI keeps the same voxel size, so
-    the new extent is the corresponding sub-box.
+    Link filenames are written by other tools on other platforms, so separators
+    may be ``\\`` and case may differ from what is on disk here. Case is folded
+    only where the filesystem is case-insensitive; folding it on Linux would
+    conflate two files that genuinely differ.
     """
-    z0, z1, y0, y1, x0, x1 = roi
-    img = f.get("DataSetInfo/Image")
-    if img is None:
-        return
+    normalised = text.strip().replace("\\", "/")
+    if os.name == "nt":
+        normalised = normalised.casefold()
+    return normalised
 
-    def _read(k: str) -> float:
-        return float(_ims_read_char_attr(img.attrs[k]))
 
-    axes = {0: ("X", x0, x1), 1: ("Y", y0, y1), 2: ("Z", z0, z1)}
-    for i, (dim_name, start, end) in axes.items():
-        n = _read(dim_name)
-        mn = _read(f"ExtMin{i}")
-        mx = _read(f"ExtMax{i}")
-        vox = (mx - mn) / n if n else 0.0
-        _set_ims_char_attr(img, f"ExtMin{i}", f"{mn + start * vox:.6g}")
-        _set_ims_char_attr(img, f"ExtMax{i}", f"{mn + end * vox:.6g}")
-    _set_ims_char_attr(img, "X", x1 - x0)
-    _set_ims_char_attr(img, "Y", y1 - y0)
-    _set_ims_char_attr(img, "Z", z1 - z0)
+class ExternalLinkMap:
+    """Maps a header's external-link filenames onto the files an export wrote.
+
+    Built from ``{source path: output filename}`` as recorded by the export
+    itself. *header_dir* is the directory the **source** header lives in, used to
+    resolve relative links against the layout they were written for.
+
+    :meth:`resolve` returns the output filename to write, or None when the link
+    cannot be mapped with certainty — never a guess.
+    """
+
+    def __init__(
+        self,
+        source_to_output: dict[str, str],
+        header_dir: Path | str | None = None,
+    ) -> None:
+        self.header_dir = Path(header_dir) if header_dir is not None else None
+        self._raw: dict[str, str] = dict(source_to_output)
+        self._normalised: dict[str, str] = {}
+        self._absolute: dict[str, str] = {}
+        self._by_basename: dict[str, str] = {}
+        self._ambiguous: set[str] = set()
+
+        for source, output in source_to_output.items():
+            source_path = Path(source)
+            self._normalised[_normalise_link(source)] = output
+            try:
+                self._absolute[str(source_path.resolve())] = output
+            except OSError:  # unresolvable path; the other lookups still apply
+                pass
+            basename = _normalise_link(source_path.name)
+            if basename in self._by_basename:
+                # Two sources ending in the same filename: a basename match can
+                # no longer identify which one a link meant.
+                self._ambiguous.add(basename)
+            self._by_basename[basename] = output
+
+    @property
+    def ambiguous_basenames(self) -> set[str]:
+        """Basenames shared by more than one source, so never matched by name."""
+        return set(self._ambiguous)
+
+    @property
+    def outputs(self) -> set[str]:
+        """Every output filename this map can produce."""
+        return set(self._raw.values())
+
+    def resolve(self, link_filename: str) -> str | None:
+        """Return the output filename for *link_filename*, or None if unmapped."""
+        if link_filename in self._raw:
+            return self._raw[link_filename]
+
+        normalised = _normalise_link(link_filename)
+        if normalised in self._normalised:
+            return self._normalised[normalised]
+
+        if self.header_dir is not None:
+            try:
+                candidate = str((self.header_dir / normalised).resolve())
+            except OSError:
+                candidate = ""
+            if candidate and candidate in self._absolute:
+                return self._absolute[candidate]
+
+        basename = _normalise_link(Path(normalised).name)
+        if basename in self._ambiguous:
+            return None
+        return self._by_basename.get(basename)
+
+    def explain(self, link_filename: str) -> str:
+        """Say why *link_filename* could not be resolved, for an error message."""
+        basename = _normalise_link(Path(_normalise_link(link_filename)).name)
+        if basename in self._ambiguous:
+            return (
+                f"{link_filename!r} matches more than one exported channel by "
+                f"filename ({basename!r} is not unique across the sources), so "
+                "which corrected file it means cannot be determined"
+            )
+        return (
+            f"{link_filename!r} does not correspond to any exported channel "
+            f"(exported: {', '.join(sorted(self.outputs)) or 'none'})"
+        )
+
+
+class SuffixLinkMap:
+    """Fallback map that just appends the export suffix to each link basename.
+
+    This is the old string rule, kept only for callers that have no recorded
+    mapping to hand (standalone header tooling and tests). It flattens nested
+    link paths to a bare filename, which is right for a flat output folder, but
+    it cannot tell whether the file it names was actually written — prefer
+    :class:`ExternalLinkMap`, which knows.
+    """
+
+    def __init__(self, output_suffix: str) -> None:
+        self.output_suffix = output_suffix
+
+    def resolve(self, link_filename: str) -> str | None:
+        from shifter.utils import h5_output_filename
+
+        return h5_output_filename(Path(_normalise_link(link_filename)).name,
+                                  self.output_suffix)
+
+    def explain(self, link_filename: str) -> str:  # pragma: no cover - never fails
+        return f"{link_filename!r} could not be renamed"
 
 
 def write_roi_headers(
@@ -306,6 +386,7 @@ def write_roi_headers(
     roi: tuple[int, int, int, int, int, int],
     write_pyramids: bool,
     input_shape_zyx: tuple[int, int, int] | None = None,
+    link_map: Any = None,
 ) -> list[Path]:
     """Write companion headers matching an ROI-cropped export.
 
@@ -317,14 +398,14 @@ def write_roi_headers(
     transform placing the crop at its true position in the specimen — or, if the
     XML cannot be rewritten safely, neither file is written. *input_shape_zyx* is
     the uncropped ``(nz, ny, nx)``; when given, a ViewSetup declaring a different
-    size is rejected rather than silently relabelled. Returns the written paths.
+    size is rejected rather than silently relabelled. *link_map* repoints the
+    external links at the files the export recorded writing; without one the
+    links fall back to the old ``output_suffix`` string rule, which cannot tell
+    whether the file it names was actually written. Returns the written paths.
     """
-    from shifter.utils import h5_output_filename
-
     output_dir = Path(output_dir)
-
-    def rename(filename: str) -> str:
-        return h5_output_filename(filename, output_suffix)
+    if link_map is None:
+        link_map = SuffixLinkMap(output_suffix)
 
     z0, z1, y0, y1, x0, x1 = roi
     out_shape = (z1 - z0, y1 - y0, x1 - x0)
@@ -341,13 +422,16 @@ def write_roi_headers(
             # physical extent, and each level's own ImageSizeX/Y/Z derived
             # from that level's downsample factors — so no part of the
             # header contradicts the data it links to.
-            rebuild_ims_header(
-                src, dst, rename=rename, output_shape_zyx=out_shape,
+            info = rebuild_ims_header(
+                src, dst, link_map=link_map, output_shape_zyx=out_shape,
                 roi=roi, keep_paths=keep_paths,
             )
+            if info["unresolved"]:
+                raise RuntimeError("; ".join(info["unresolved"]))
             written.append(dst)
         except Exception as exc:
             logger.warning("Could not write ROI header %s: %s", src.name, exc)
+            _unlink_quietly(dst)
 
     for stem, pair in sorted(bdv_pairs.items()):
         written.extend(
@@ -356,7 +440,7 @@ def write_roi_headers(
                 pair.get("xml"),
                 output_dir,
                 keep_paths=keep_paths,
-                rename=rename,
+                link_map=link_map,
                 output_shape_zyx=out_shape,
                 input_shape_zyx=input_shape_zyx,
                 roi=roi,
@@ -731,7 +815,7 @@ def write_bdv_pair(
     output_dir: Path | str,
     *,
     keep_paths: set[str] | None = None,
-    rename: Any = None,
+    link_map: Any = None,
     output_shape_zyx: tuple[int, int, int] | None = None,
     input_shape_zyx: tuple[int, int, int] | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
@@ -760,7 +844,11 @@ def write_bdv_pair(
     dst_xml = output_dir / src_xml.name
 
     try:
-        rebuild_bdv_h5_header(src_h5, dst_h5, rename=rename, keep_paths=keep_paths)
+        info = rebuild_bdv_h5_header(
+            src_h5, dst_h5, link_map=link_map, keep_paths=keep_paths
+        )
+        if info["unresolved"]:
+            raise RuntimeError("; ".join(info["unresolved"]))
     except Exception as exc:
         logger.warning("BDV pair omitted: could not write %s: %s", src_h5.name, exc)
         _unlink_quietly(dst_h5)
@@ -793,6 +881,260 @@ def _unlink_quietly(path: Path) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Header validation
+#
+# A header can be flawless HDF5 and still be wrong: an external link is just a
+# (filename, dataset path) pair, and nothing checks that the pair leads
+# anywhere. Inspecting the h5py.ExternalLink object therefore proves nothing at
+# all — the validators below **dereference** every link, from the header's own
+# directory, exactly as a viewer would, and compare what they find against what
+# the header claims about it.
+#
+# Because links can only resolve once the data files are closed, this runs at
+# the very end of an export. Nothing is reported as written until it passes.
+# --------------------------------------------------------------------------- #
+
+
+def _iter_ims_links(f: Any) -> Any:
+    """Yield ``(group_path, group, ExternalLink)`` for each Imaris channel link."""
+    import h5py
+
+    dataset = f.get("DataSet")
+    if dataset is None:
+        return
+    for level_name in dataset.keys():
+        level = dataset[level_name]
+        for tp_name in level.keys():
+            for ch_name in level[tp_name].keys():
+                group = level[tp_name][ch_name]
+                link = group.get("Data", getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    yield f"{level_name}/{tp_name}/{ch_name}", group, link
+
+
+def _check_link_target(
+    header: Path, link: Any, where: str
+) -> tuple[tuple[int, ...] | None, list[str]]:
+    """Dereference one external link; return its shape and any problems."""
+    import h5py
+
+    target = (header.parent / link.filename).resolve()
+    if not target.is_file():
+        return None, [
+            f"{header.name}: {where} links to {link.filename!r}, which does not "
+            f"exist next to the header"
+        ]
+    try:
+        with h5py.File(str(target), "r") as t:
+            if link.path not in t:
+                return None, [
+                    f"{header.name}: {where} links to dataset {link.path!r} in "
+                    f"{link.filename!r}, which has no such dataset"
+                ]
+            shape = tuple(t[link.path].shape)
+    except Exception as exc:
+        return None, [f"{header.name}: {where} could not read {link.filename!r}: {exc}"]
+
+    if len(shape) != 3:
+        return shape, [
+            f"{header.name}: {where} links to a {len(shape)}-D dataset {shape}, "
+            f"expected 3-D"
+        ]
+    return shape, []
+
+
+def _validate_ims_header(path: Path) -> list[str]:
+    """Dereference an .ims header's links and check every declared size."""
+    import h5py
+
+    problems: list[str] = []
+    with h5py.File(str(path), "r") as f:
+        if "DataSet" not in f:
+            return [f"{path.name}: no DataSet group"]
+
+        level_zero_shape: tuple[int, ...] | None = None
+        found_link = False
+        for where, group, link in _iter_ims_links(f):
+            found_link = True
+            shape, link_problems = _check_link_target(path, link, where)
+            problems.extend(link_problems)
+            if shape is None or len(shape) != 3:
+                continue
+
+            declared: list[int] = []
+            for key in ("ImageSizeZ", "ImageSizeY", "ImageSizeX"):
+                if key not in group.attrs:
+                    problems.append(f"{path.name}: {where} has no {key} attribute")
+                    break
+                value = group.attrs[key]
+                if getattr(value, "dtype", None) != np.uint8:
+                    problems.append(
+                        f"{path.name}: {where}/{key} is {getattr(value, 'dtype', '?')}, "
+                        "expected a uint8 char array"
+                    )
+                try:
+                    declared.append(int(_ims_read_char_attr(value)))
+                except ValueError:
+                    problems.append(f"{path.name}: {where}/{key} is not a number")
+                    break
+            else:
+                if tuple(declared) != shape:
+                    problems.append(
+                        f"{path.name}: {where} declares "
+                        f"{declared[2]}x{declared[1]}x{declared[0]} (X Y Z) but links "
+                        f"to a dataset of shape {shape[2]}x{shape[1]}x{shape[0]}"
+                    )
+            if where.startswith("ResolutionLevel 0/"):
+                level_zero_shape = shape
+
+        if not found_link:
+            problems.append(f"{path.name}: no external links in DataSet")
+
+        image = f.get("DataSetInfo/Image")
+        if image is None:
+            problems.append(f"{path.name}: no DataSetInfo/Image group")
+        elif level_zero_shape is not None:
+            declared = []
+            for key in ("Z", "Y", "X"):
+                if key not in image.attrs:
+                    problems.append(f"{path.name}: DataSetInfo/Image has no {key}")
+                    break
+                value = image.attrs[key]
+                if getattr(value, "dtype", None) != np.uint8:
+                    problems.append(
+                        f"{path.name}: DataSetInfo/Image/{key} is "
+                        f"{getattr(value, 'dtype', '?')}, expected a uint8 char array"
+                    )
+                try:
+                    declared.append(int(_ims_read_char_attr(value)))
+                except ValueError:
+                    problems.append(f"{path.name}: DataSetInfo/Image/{key} is not a number")
+                    break
+            else:
+                if tuple(declared) != level_zero_shape:
+                    problems.append(
+                        f"{path.name}: DataSetInfo/Image declares "
+                        f"{declared[2]}x{declared[1]}x{declared[0]} (X Y Z) but the "
+                        f"full-resolution data is {level_zero_shape[2]}x"
+                        f"{level_zero_shape[1]}x{level_zero_shape[0]}"
+                    )
+    return problems
+
+
+def _validate_bdv_h5_header(path: Path) -> list[str]:
+    """Dereference a *_bdv.h5 header's links and check its resolution tables."""
+    import h5py
+
+    problems: list[str] = []
+    with h5py.File(str(path), "r") as f:
+        setups = sorted(k for k in f.keys() if re.fullmatch(r"s\d+", k))
+        timepoints = sorted(k for k in f.keys() if re.fullmatch(r"t\d+", k))
+        if not setups:
+            problems.append(f"{path.name}: no setup (sNN) groups")
+        if not timepoints:
+            problems.append(f"{path.name}: no timepoint (tNNNNN) groups")
+
+        for t in timepoints:
+            for s in sorted(f[t].keys()):
+                group = f[f"{t}/{s}"]
+                levels = sorted(group.keys(), key=lambda v: int(v) if v.isdigit() else 0)
+
+                resolutions_key = f"{s}/resolutions"
+                if resolutions_key not in f:
+                    problems.append(f"{path.name}: {s} has no resolutions table")
+                else:
+                    n_rows = int(f[resolutions_key].shape[0])
+                    if n_rows != len(levels):
+                        problems.append(
+                            f"{path.name}: {s}/resolutions has {n_rows} rows but "
+                            f"{t}/{s} has {len(levels)} level(s) — the header would "
+                            "advertise a level that is not there"
+                        )
+                    if n_rows and tuple(int(v) for v in f[resolutions_key][0]) != (1, 1, 1):
+                        problems.append(
+                            f"{path.name}: {s}/resolutions level 0 is "
+                            f"{tuple(f[resolutions_key][0])}, expected (1, 1, 1)"
+                        )
+
+                full_shape: tuple[int, ...] | None = None
+                for level in levels:
+                    link = group[level].get("cells", getlink=True)
+                    if not isinstance(link, h5py.ExternalLink):
+                        problems.append(
+                            f"{path.name}: {t}/{s}/{level}/cells is not an external link"
+                        )
+                        continue
+                    where = f"{t}/{s}/{level}"
+                    shape, link_problems = _check_link_target(path, link, where)
+                    problems.extend(link_problems)
+                    if shape is None or len(shape) != 3:
+                        continue
+                    if level == "0":
+                        full_shape = shape
+                        continue
+                    # Factors come from the link target's own name, never from
+                    # the level index: the ladder need not be powers of two.
+                    fw, fh, fd = dataset_path_factors(link.path)
+                    if full_shape is not None:
+                        expected = (full_shape[0] // fd, full_shape[1] // fh,
+                                    full_shape[2] // fw)
+                        if shape != expected:
+                            problems.append(
+                                f"{path.name}: {where} links to a dataset of shape "
+                                f"{shape} but its downsample factors "
+                                f"({fw}, {fh}, {fd}) imply {expected}"
+                            )
+    return problems
+
+
+def validate_header(path: Path | str) -> list[str]:
+    """Return human-readable problems with a companion header (empty = OK).
+
+    Dereferences every external link relative to the header's own directory, so
+    it can only be run once the data files it points at are written and closed.
+    Recognises ``.ims``, ``*_bdv.h5`` and ``*_bdv.xml``; anything else is
+    reported as unrecognised rather than silently passed.
+    """
+    path = Path(path)
+    name = path.name.lower()
+    try:
+        if name.endswith(".ims"):
+            return _validate_ims_header(path)
+        if name.endswith(".xml"):
+            return validate_bdv_xml(path)
+        if name.endswith(".h5"):
+            return _validate_bdv_h5_header(path)
+    except Exception as exc:
+        return [f"{path.name}: could not be validated: {type(exc).__name__}: {exc}"]
+    return [f"{path.name}: not a recognised companion header"]
+
+
+def quarantine_header(path: Path) -> Path | None:
+    """Rename a bad header to ``<name>.invalid`` so no viewer can open it.
+
+    Preferred over deleting: the file is still there to diagnose, but neither
+    Imaris nor BigDataViewer will pick up the renamed extension, so it cannot be
+    mistaken for a working header. Returns the new path, or None if it could not
+    be moved (in which case it is deleted, since leaving it is worse).
+    """
+    quarantined = path.with_name(path.name + ".invalid")
+    try:
+        os.replace(str(path), str(quarantined))
+        return quarantined
+    except OSError:
+        _unlink_quietly(path)
+        return None
+
+
+def validate_headers(paths: list[Path]) -> list[str]:
+    """Validate several headers, returning every problem found across them."""
+    problems: list[str] = []
+    for path in paths:
+        problems.extend(validate_header(path))
+    return problems
 
 
 class H5FileManager:
@@ -1332,7 +1674,7 @@ def rebuild_ims_header(
     src_path: Path | str,
     dst_path: Path | str,
     *,
-    rename: Any = None,
+    link_map: Any = None,
     output_shape_zyx: tuple[int, int, int] | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
     keep_paths: set[str] | None = None,
@@ -1341,8 +1683,12 @@ def rebuild_ims_header(
 
     Parameters
     ----------
-    rename : callable, optional
-        Maps each external-link filename to the exported filename.
+    link_map : ExternalLinkMap, optional
+        Maps each external-link filename to the file the export actually wrote.
+        A link the map cannot resolve is reported in the returned ``unresolved``
+        list and left pointing at its original target — the caller must treat
+        that as a failed header rather than ship it, since the stale target may
+        still resolve, to the *uncorrected* source data.
     output_shape_zyx : tuple, optional
         ``(nz, ny, nx)`` of the exported full-resolution data. Each channel's
         ``ImageSizeX/Y/Z`` is derived from this and the level's own downsample
@@ -1358,7 +1704,8 @@ def rebuild_ims_header(
     Returns
     -------
     dict
-        ``{"levels": [...], "channels": int}`` describing what was written.
+        ``{"levels": [...], "channels": int, "unresolved": [...]}`` describing
+        what was written.
     """
     import h5py
 
@@ -1367,6 +1714,7 @@ def rebuild_ims_header(
     tmp_path = dst_path.with_name(dst_path.name + ".tmp")
 
     written_levels: list[str] = []
+    unresolved: list[str] = []
     n_channels = 0
 
     with h5py.File(str(src_path), "r") as src, h5py.File(str(tmp_path), "w") as dst:
@@ -1410,8 +1758,12 @@ def rebuild_ims_header(
                     if isinstance(link, h5py.ExternalLink):
                         factors = dataset_path_factors(link.path)
                         target = link.filename
-                        if rename is not None:
-                            target = rename(target)
+                        if link_map is not None:
+                            mapped = link_map.resolve(target)
+                            if mapped is None:
+                                unresolved.append(link_map.explain(target))
+                            else:
+                                target = mapped
                         dst_ch["Data"] = h5py.ExternalLink(target, link.path)
 
                     # Histogram payload + range markers.
@@ -1490,21 +1842,27 @@ def rebuild_ims_header(
                     dst_image.attrs.create("Z", _ims_char_attr(nz))
 
     os.replace(str(tmp_path), str(dst_path))
-    return {"levels": written_levels, "channels": n_channels}
+    return {
+        "levels": written_levels,
+        "channels": n_channels,
+        "unresolved": sorted(set(unresolved)),
+    }
 
 
 def rebuild_bdv_h5_header(
     src_path: Path | str,
     dst_path: Path | str,
     *,
-    rename: Any = None,
+    link_map: Any = None,
     keep_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Write a fresh BigDataViewer HDF5 header derived from *src_path*.
 
     Keeps only the levels whose ``cells`` link targets are in *keep_paths* (all
     levels when it is None), truncating each setup's ``resolutions`` /
-    ``subdivisions`` tables to match, and remapping link filenames via *rename*.
+    ``subdivisions`` tables to match, and repointing link filenames through
+    *link_map* (see :func:`rebuild_ims_header` for how unresolved links are
+    reported).
     """
     import h5py
 
@@ -1513,6 +1871,7 @@ def rebuild_bdv_h5_header(
     tmp_path = dst_path.with_name(dst_path.name + ".tmp")
 
     kept_per_setup: dict[str, list[str]] = {}
+    unresolved: list[str] = []
 
     with h5py.File(str(src_path), "r") as src, h5py.File(str(tmp_path), "w") as dst:
         timepoints = [k for k in src.keys() if re.fullmatch(r"t\d+", k)]
@@ -1529,8 +1888,12 @@ def rebuild_bdv_h5_header(
                     if keep_paths is not None and leaf not in keep_paths:
                         continue
                     target = link.filename
-                    if rename is not None:
-                        target = rename(target)
+                    if link_map is not None:
+                        mapped = link_map.resolve(target)
+                        if mapped is None:
+                            unresolved.append(link_map.explain(target))
+                        else:
+                            target = mapped
                     dst.create_group(f"{t}/{s}/{len(keep)}")
                     dst[f"{t}/{s}/{len(keep)}/cells"] = h5py.ExternalLink(
                         target, link.path
@@ -1551,7 +1914,10 @@ def rebuild_bdv_h5_header(
                 dst.create_dataset(key, data=data)
 
     os.replace(str(tmp_path), str(dst_path))
-    return {"levels_per_setup": kept_per_setup}
+    return {
+        "levels_per_setup": kept_per_setup,
+        "unresolved": sorted(set(unresolved)),
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -600,6 +600,103 @@ def test_export_without_pyramids(files: list[Path]) -> bool:
     return all_ok
 
 
+def test_export_rebuilds_headers_with_nested_links(files: list[Path]) -> bool:
+    """A header whose links carry nested source paths must not be copied as-is.
+
+    Copied verbatim into a flat output folder, ``sub/chNN_test.lux.h5`` either
+    dangles or — if the export happens to sit inside the acquisition tree —
+    resolves back to the uncorrected source. The export must notice the copy
+    does not validate and rebuild the header from the recorded channel mapping.
+    """
+    mgr = H5FileManager()
+    outdir = Path(tempfile.mkdtemp())
+    all_ok = True
+
+    # Nested copies of the channel data, and an .ims linking to them by path.
+    nested_dir = files[0].parent / "sub"
+    nested_dir.mkdir(exist_ok=True)
+    for fp in files:
+        shutil.copy2(fp, nested_dir / fp.name)
+
+    nz, ny, nx = VOLUME_SHAPE
+    header = files[0].parent / "main_nested.ims"
+
+    def _u8(value: object) -> np.ndarray:
+        return np.frombuffer(str(value).encode(), dtype=np.uint8).copy()
+
+    with h5py.File(str(header), "w") as f:
+        for key, value in (
+            ("DataSetDirectoryName", "DataSet"),
+            ("DataSetInfoDirectoryName", "DataSetInfo"),
+            ("ImarisDataSet", "ImarisDataSet"),
+            ("ImarisVersion", "5.5.0"),
+            ("ThumbnailDirectoryName", "Thumbnail"),
+        ):
+            f.attrs.create(key, _u8(value))
+        for ch, fp in enumerate(files):
+            g = f.create_group(f"DataSet/ResolutionLevel 0/TimePoint 0/Channel {ch}")
+            g["Data"] = h5py.ExternalLink(f"sub/{fp.name}", "Data")
+            for attr, val in (("ImageSizeX", nx), ("ImageSizeY", ny), ("ImageSizeZ", nz)):
+                g.attrs.create(attr, _u8(val))
+        img = f.create_group("DataSetInfo/Image")
+        for attr, val in (("X", nx), ("Y", ny), ("Z", nz), ("Unit", "um")):
+            img.attrs.create(attr, _u8(val))
+        f.create_group("DataSetInfo/TimeInfo")
+
+    try:
+        loaders = [H5Loader(fp, mgr) for fp in files]
+        shift_manager = ShiftManager()
+        shift_manager.init_channels(
+            [fp.name for fp in files], reference_index=0,
+            colormaps=["green", "magenta", "cyan"],
+        )
+        meta_path = run_export_h5(
+            loaders, shift_manager, outdir,
+            ram_percent=90, voxel_xy=VOXEL_XY, voxel_z=VOXEL_Z,
+            write_pyramids=True,
+        )
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        validation = meta.get("companion_header_validation", {})
+        if not validation.get("ok"):
+            print(f"  FAIL: header validation not ok: {validation}")
+            all_ok = False
+        if validation.get("kind") != "rebuilt":
+            print(f"  FAIL: expected the copy to be rebuilt, got {validation.get('kind')!r}")
+            all_ok = False
+
+        out_header = outdir / header.name
+        if not out_header.exists():
+            print(f"  FAIL: {header.name} was not written")
+            all_ok = False
+        else:
+            with h5py.File(str(out_header), "r") as f:
+                for ch in range(len(files)):
+                    grp = f[f"DataSet/ResolutionLevel 0/TimePoint 0/Channel {ch}"]
+                    link = grp.get("Data", getlink=True)
+                    if "/" in link.filename:
+                        print(f"  FAIL: channel {ch} link still nested: {link.filename}")
+                        all_ok = False
+                    elif not (outdir / link.filename).is_file():
+                        print(f"  FAIL: channel {ch} link {link.filename} does not resolve")
+                        all_ok = False
+                    # And it must reach the CORRECTED copy, not the original.
+                    if grp["Data"].shape != VOLUME_SHAPE:
+                        print(f"  FAIL: channel {ch} links to shape {grp['Data'].shape}")
+                        all_ok = False
+
+        if all_ok:
+            print("  PASS: nested links rebuilt to resolve against the corrected output")
+    finally:
+        mgr.close_all()
+        shutil.rmtree(outdir, ignore_errors=True)
+        shutil.rmtree(nested_dir, ignore_errors=True)
+        header.unlink(missing_ok=True)
+
+    return all_ok
+
+
 def run_validation() -> bool:
     """Run all H5 tests and report results."""
     print("=" * 60)
@@ -640,6 +737,10 @@ def run_validation() -> bool:
 
         print("\n--- Test: Export with pyramid layers disabled ---")
         if not test_export_without_pyramids(files):
+            all_passed = False
+
+        print("\n--- Test: Companion header with nested external links ---")
+        if not test_export_rebuilds_headers_with_nested_links(files):
             all_passed = False
 
     finally:

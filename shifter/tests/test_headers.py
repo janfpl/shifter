@@ -21,9 +21,13 @@ import numpy as np
 
 from shifter.h5_utils import (
     BdvXmlError,
+    ExternalLinkMap,
+    quarantine_header,
     rebuild_ims_header,
     reduce_header_to_single_resolution,
     validate_bdv_xml,
+    validate_header,
+    validate_headers,
     write_bdv_xml,
     write_roi_headers,
     write_single_resolution_headers,
@@ -647,6 +651,378 @@ def test_rebuilt_roi_ims_declares_crop_everywhere() -> None:
         assert float(img.attrs["ExtMax2"].tobytes().decode()) == 50.0
 
 
+# --------------------------------------------------------------------------- #
+# Exact source -> output link mapping
+#
+# These fixtures build REAL .lux.h5 targets, so every assertion dereferences the
+# links the way a viewer does. A test that only inspects the ExternalLink object
+# would pass just as happily on a header pointing at nothing — or at the
+# uncorrected source data, which is the failure worth catching.
+# --------------------------------------------------------------------------- #
+
+_DATA_SHAPE = (8, 8, 8)
+
+
+def _write_lux(path: Path, shape_zyx: tuple[int, int, int], pyramids: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nz, ny, nx = shape_zyx
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("Data", data=np.zeros((nz, ny, nx), np.uint16))
+        if pyramids:
+            f.create_dataset(
+                "Data_2_2_2", data=np.zeros((nz // 2, ny // 2, nx // 2), np.uint16)
+            )
+
+
+def _u8(value: object) -> np.ndarray:
+    return np.frombuffer(str(value).encode(), dtype=np.uint8).copy()
+
+
+def _make_acquisition(
+    root: Path,
+    *,
+    nested: bool = False,
+    n_channels: int = 2,
+    pyramids: bool = True,
+    shape_zyx: tuple[int, int, int] = _DATA_SHAPE,
+    same_basename: bool = False,
+) -> dict:
+    """Build an acquisition: real per-channel data plus .ims and BDV headers.
+
+    With *nested*, each channel lives in its own subfolder and the headers link
+    to it by a relative path — the layout that breaks a filename-based rule.
+    With *same_basename*, every channel file is called ``Cam_left_00000.lux.h5``,
+    which is what real nested acquisitions actually look like.
+    """
+    nz, ny, nx = shape_zyx
+    root.mkdir(parents=True, exist_ok=True)
+
+    sources: list[Path] = []
+    links: list[str] = []
+    for ch in range(n_channels):
+        if nested:
+            name = "Cam_left_00000.lux.h5" if same_basename else f"Cam_left_{ch}.lux.h5"
+            rel = f"raw/stack_1_channel_{ch}-561_obj_left/{name}"
+        else:
+            rel = f"chan{ch}.lux.h5"
+        path = root / rel
+        _write_lux(path, shape_zyx, pyramids)
+        sources.append(path)
+        links.append(rel)
+
+    level_paths = ["Data"] + (["Data_2_2_2"] if pyramids else [])
+
+    ims = root / "main_test.ims"
+    with h5py.File(str(ims), "w") as f:
+        for key, value in (
+            ("DataSetDirectoryName", "DataSet"),
+            ("DataSetInfoDirectoryName", "DataSetInfo"),
+            ("ImarisDataSet", "ImarisDataSet"),
+            ("ImarisVersion", "5.5.0"),
+            ("ThumbnailDirectoryName", "Thumbnail"),
+        ):
+            f.attrs.create(key, _u8(value))
+        for lvl, path in enumerate(level_paths):
+            div = 2 if path != "Data" else 1
+            for ch in range(n_channels):
+                g = f.create_group(
+                    f"DataSet/ResolutionLevel {lvl}/TimePoint 0/Channel {ch}"
+                )
+                g["Data"] = h5py.ExternalLink(links[ch], path)
+                g.create_dataset("Histogram", data=np.zeros(256, np.uint64))
+                for attr, val in (("ImageSizeX", nx // div), ("ImageSizeY", ny // div),
+                                  ("ImageSizeZ", nz // div)):
+                    g.attrs.create(attr, _u8(val))
+        img = f.create_group("DataSetInfo/Image")
+        for attr, val in (("X", nx), ("Y", ny), ("Z", nz), ("Unit", "um"),
+                          ("ExtMin0", 0), ("ExtMax0", nx), ("ExtMin1", 0),
+                          ("ExtMax1", ny), ("ExtMin2", 0), ("ExtMax2", nz)):
+            img.attrs.create(attr, _u8(val))
+        f.create_group("DataSetInfo/TimeInfo")
+
+    bdv_h5 = root / "main_test_bdv.h5"
+    with h5py.File(str(bdv_h5), "w") as f:
+        res = np.array([[2**i] * 3 for i in range(len(level_paths))], dtype=float)
+        for ch in range(n_channels):
+            f.create_dataset(f"s{ch:02d}/resolutions", data=res)
+            f.create_dataset(
+                f"s{ch:02d}/subdivisions", data=np.full((len(level_paths), 3), 8.0)
+            )
+            for lvl, path in enumerate(level_paths):
+                f[f"t00000/s{ch:02d}/{lvl}/cells"] = h5py.ExternalLink(links[ch], path)
+
+    bdv_xml = root / "main_test_bdv.xml"
+    setups = "".join(
+        f"<ViewSetup><id>{ch}</id><name>ch{ch}</name><size>{nx} {ny} {nz}</size>"
+        "<voxelSize><unit>micrometer</unit><size>1 1 1</size></voxelSize>"
+        f"<attributes><channel>{ch}</channel></attributes></ViewSetup>"
+        for ch in range(n_channels)
+    )
+    regs = "".join(
+        f'<ViewRegistration timepoint="0" setup="{ch}"><ViewTransform type="affine">'
+        "<affine>1 0 0 0 0 1 0 0 0 0 1 0</affine></ViewTransform></ViewRegistration>"
+        for ch in range(n_channels)
+    )
+    bdv_xml.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<SpimData version="0.2"><BasePath type="relative">.</BasePath>'
+        '<SequenceDescription><ImageLoader format="bdv.hdf5">'
+        f'<hdf5 type="relative">{bdv_h5.name}</hdf5></ImageLoader>'
+        f"<ViewSetups>{setups}</ViewSetups>"
+        '<Timepoints type="range"><first>0</first><last>0</last></Timepoints>'
+        f"</SequenceDescription><ViewRegistrations>{regs}</ViewRegistrations></SpimData>"
+    )
+
+    return {
+        "dir": root, "ims": ims, "bdv_h5": bdv_h5, "bdv_xml": bdv_xml,
+        "sources": sources, "headers": [ims, bdv_h5, bdv_xml],
+    }
+
+
+def _export_outputs(
+    acq: dict, out_dir: Path, suffix: str, shape_zyx: tuple[int, int, int],
+    pyramids: bool,
+) -> ExternalLinkMap:
+    """Write the corrected output files an export would, and record the mapping."""
+    from shifter.utils import h5_output_filename
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mapping: dict[str, str] = {}
+    for source in acq["sources"]:
+        out_name = h5_output_filename(source.name, suffix)
+        _write_lux(out_dir / out_name, shape_zyx, pyramids)
+        mapping[str(source)] = out_name
+    return ExternalLinkMap(mapping, header_dir=acq["dir"])
+
+
+def _assert_links_resolve(header: Path) -> None:
+    problems = validate_header(header)
+    assert problems == [], problems
+
+
+def test_nested_links_are_repointed_at_the_corrected_output() -> None:
+    """The dangerous case: a nested link must not survive into a flat output.
+
+    Left as-is, ``raw/stack_1_channel_0/Cam_left_00000.lux.h5`` either dangles or
+    resolves back to the *uncorrected* source — the user then views raw data
+    believing it is corrected.
+    """
+    root = Path(tempfile.mkdtemp())
+    acq = _make_acquisition(root / "acq", nested=True, same_basename=False)
+    out = root / "out"
+    link_map = _export_outputs(acq, out, "", _DATA_SHAPE, pyramids=False)
+
+    written = write_single_resolution_headers(
+        acq["headers"], out, output_shape_zyx=_DATA_SHAPE, link_map=link_map
+    )
+    assert {p.name for p in written} == {"main_test.ims", "main_test_bdv.h5",
+                                         "main_test_bdv.xml"}
+    for path in written:
+        _assert_links_resolve(path)
+
+    # Flat filenames, and every link lands in the output folder.
+    with h5py.File(str(out / "main_test.ims"), "r") as f:
+        for ch in range(2):
+            link = f[f"DataSet/ResolutionLevel 0/TimePoint 0/Channel {ch}"].get(
+                "Data", getlink=True
+            )
+            assert "/" not in link.filename, link.filename
+            assert (out / link.filename).is_file()
+            assert not (root / "acq" / link.filename).exists()
+
+
+def test_ambiguous_basenames_are_refused_not_guessed() -> None:
+    """Two sources sharing a basename must not be resolved by name."""
+    root = Path(tempfile.mkdtemp())
+    acq = _make_acquisition(root / "acq", nested=True, same_basename=True)
+    out = root / "out"
+
+    # Both channels are Cam_left_00000.lux.h5, so the export must rename them;
+    # a basename lookup can no longer say which one a link meant.
+    out.mkdir()
+    mapping = {}
+    for ch, source in enumerate(acq["sources"]):
+        out_name = f"Cam_left_00000_ch{ch}.lux.h5"
+        _write_lux(out / out_name, _DATA_SHAPE, pyramids=False)
+        mapping[str(source)] = out_name
+    link_map = ExternalLinkMap(mapping, header_dir=acq["dir"])
+
+    assert link_map.ambiguous_basenames == {"cam_left_00000.lux.h5"} or (
+        link_map.ambiguous_basenames == {"Cam_left_00000.lux.h5"}
+    ), link_map.ambiguous_basenames
+    # A bare basename is refused...
+    assert link_map.resolve("Cam_left_00000.lux.h5") is None
+    assert "not unique" in link_map.explain("Cam_left_00000.lux.h5")
+    # ...but the full nested path each header actually stores is unambiguous.
+    assert link_map.resolve(
+        "raw/stack_1_channel_1-561_obj_left/Cam_left_00000.lux.h5"
+    ) == "Cam_left_00000_ch1.lux.h5"
+
+
+def test_unresolvable_link_takes_the_header_down_with_it() -> None:
+    """A link that cannot be mapped must not be left pointing at the source."""
+    root = Path(tempfile.mkdtemp())
+    acq = _make_acquisition(root / "acq", nested=False, n_channels=2)
+    out = root / "out"
+    # Only channel 0 was exported, so channel 1's link cannot be mapped.
+    out.mkdir()
+    _write_lux(out / "chan0.lux.h5", _DATA_SHAPE, pyramids=False)
+    link_map = ExternalLinkMap({str(acq["sources"][0]): "chan0.lux.h5"},
+                               header_dir=acq["dir"])
+
+    written = write_single_resolution_headers(
+        [acq["ims"]], out, output_shape_zyx=_DATA_SHAPE, link_map=link_map
+    )
+    assert written == []
+    assert not (out / "main_test.ims").exists()
+
+
+def test_link_map_lookup_orders() -> None:
+    root = Path(tempfile.mkdtemp())
+    acq = _make_acquisition(root / "acq", nested=True, n_channels=1)
+    source = acq["sources"][0]
+    link_map = ExternalLinkMap({str(source): "out.lux.h5"}, header_dir=acq["dir"])
+
+    rel = "raw/stack_1_channel_0-561_obj_left/Cam_left_0.lux.h5"
+    assert link_map.resolve(str(source)) == "out.lux.h5"          # exact
+    assert link_map.resolve(rel) == "out.lux.h5"                  # relative to header
+    assert link_map.resolve(rel.replace("/", "\\")) == "out.lux.h5"  # windows sep
+    assert link_map.resolve("Cam_left_0.lux.h5") == "out.lux.h5"  # unambiguous base
+    assert link_map.resolve("somewhere_else.lux.h5") is None
+    assert "does not correspond" in link_map.explain("somewhere_else.lux.h5")
+
+
+def _matrix_case(pyramids: bool, crop: bool) -> None:
+    """Rebuild headers for one (pyramids, crop) combination and validate them."""
+    root = Path(tempfile.mkdtemp())
+    acq = _make_acquisition(root / "acq", nested=True, pyramids=pyramids)
+    out = root / "out"
+
+    if crop:
+        roi = (2, 6, 2, 6, 2, 6)
+        shape = (4, 4, 4)
+        suffix = "_corrected_roi"
+    else:
+        roi = None
+        shape = _DATA_SHAPE
+        suffix = ""
+
+    link_map = _export_outputs(acq, out, suffix, shape, pyramids=pyramids)
+    if crop:
+        written = write_roi_headers(
+            acq["headers"], out, suffix, roi, pyramids,
+            input_shape_zyx=_DATA_SHAPE, link_map=link_map,
+        )
+    else:
+        written = write_single_resolution_headers(
+            acq["headers"], out, output_shape_zyx=shape, link_map=link_map
+        )
+
+    assert len(written) == 3, [p.name for p in written]
+    problems = validate_headers(written)
+    assert problems == [], problems
+
+    # Declared sizes must equal the ACTUAL shapes of the linked datasets.
+    with h5py.File(str(out / "main_test.ims"), "r") as f:
+        for level in f["DataSet"].keys():
+            for ch in f[f"DataSet/{level}/TimePoint 0"].keys():
+                group = f[f"DataSet/{level}/TimePoint 0/{ch}"]
+                declared = tuple(
+                    int(group.attrs[k].tobytes().decode())
+                    for k in ("ImageSizeZ", "ImageSizeY", "ImageSizeX")
+                )
+                assert group["Data"].shape == declared, (level, ch, declared)
+
+
+def test_matrix_pyramids_no_crop() -> None:
+    _matrix_case(pyramids=True, crop=False)
+
+
+def test_matrix_no_pyramids_no_crop() -> None:
+    _matrix_case(pyramids=False, crop=False)
+
+
+def test_matrix_pyramids_crop() -> None:
+    _matrix_case(pyramids=True, crop=True)
+
+
+def test_matrix_no_pyramids_crop() -> None:
+    _matrix_case(pyramids=False, crop=True)
+
+
+def test_validate_header_dereferences_rather_than_inspecting() -> None:
+    """A link object that looks fine but leads nowhere must be reported."""
+    d = Path(tempfile.mkdtemp())
+    ims = d / "dangling.ims"
+    with h5py.File(str(ims), "w") as f:
+        g = f.create_group("DataSet/ResolutionLevel 0/TimePoint 0/Channel 0")
+        g["Data"] = h5py.ExternalLink("absent.lux.h5", "Data")
+        for attr, val in (("ImageSizeX", 8), ("ImageSizeY", 8), ("ImageSizeZ", 8)):
+            g.attrs.create(attr, _u8(val))
+        img = f.create_group("DataSetInfo/Image")
+        for attr, val in (("X", 8), ("Y", 8), ("Z", 8)):
+            img.attrs.create(attr, _u8(val))
+    problems = validate_header(ims)
+    assert any("does not exist" in p for p in problems), problems
+
+
+def test_validate_header_catches_size_lie_and_s1_attrs() -> None:
+    """Declared sizes must match the linked data, and text attrs must be uint8."""
+    d = Path(tempfile.mkdtemp())
+    _write_lux(d / "chan.lux.h5", (8, 8, 8), pyramids=False)
+    ims = d / "wrong.ims"
+    with h5py.File(str(ims), "w") as f:
+        g = f.create_group("DataSet/ResolutionLevel 0/TimePoint 0/Channel 0")
+        g["Data"] = h5py.ExternalLink("chan.lux.h5", "Data")
+        g.attrs.create("ImageSizeX", _u8(999))          # a lie
+        g.attrs.create("ImageSizeY", _u8(8))
+        g.attrs.create("ImageSizeZ", _u8(8))
+        img = f.create_group("DataSetInfo/Image")
+        for attr in ("X", "Y", "Z"):
+            img.attrs.create(attr, np.frombuffer(b"8", dtype="S1").copy())  # S1, not uint8
+    problems = validate_header(ims)
+    assert any("declares 999x8x8" in p for p in problems), problems
+    assert any("expected a uint8 char array" in p for p in problems), problems
+
+
+def test_validate_bdv_h5_catches_advertised_but_absent_level() -> None:
+    """resolutions must not claim more levels than the file actually links to."""
+    d = Path(tempfile.mkdtemp())
+    _write_lux(d / "chan.lux.h5", (8, 8, 8), pyramids=True)
+    bdv = d / "over_bdv.h5"
+    with h5py.File(str(bdv), "w") as f:
+        f.create_dataset("s00/resolutions", data=np.array([[1, 1, 1], [2, 2, 2]], float))
+        f.create_dataset("s00/subdivisions", data=np.full((2, 3), 8.0))
+        f["t00000/s00/0/cells"] = h5py.ExternalLink("chan.lux.h5", "Data")  # only one
+    problems = validate_header(bdv)
+    assert any("advertise a level that is not there" in p for p in problems), problems
+
+
+def test_validate_bdv_h5_catches_factor_shape_mismatch() -> None:
+    """A level's linked shape must equal full shape / its own downsample factors."""
+    d = Path(tempfile.mkdtemp())
+    with h5py.File(str(d / "chan.lux.h5"), "w") as f:
+        f.create_dataset("Data", data=np.zeros((8, 8, 8), np.uint16))
+        f.create_dataset("Data_2_2_2", data=np.zeros((8, 8, 8), np.uint16))  # not halved
+    bdv = d / "bad_bdv.h5"
+    with h5py.File(str(bdv), "w") as f:
+        f.create_dataset("s00/resolutions", data=np.array([[1, 1, 1], [2, 2, 2]], float))
+        f.create_dataset("s00/subdivisions", data=np.full((2, 3), 8.0))
+        f["t00000/s00/0/cells"] = h5py.ExternalLink("chan.lux.h5", "Data")
+        f["t00000/s00/1/cells"] = h5py.ExternalLink("chan.lux.h5", "Data_2_2_2")
+    problems = validate_header(bdv)
+    assert any("imply" in p for p in problems), problems
+
+
+def test_quarantine_header_makes_it_unopenable() -> None:
+    d = Path(tempfile.mkdtemp())
+    bad = d / "main_test.ims"
+    bad.write_bytes(b"not really a header")
+    moved = quarantine_header(bad)
+    assert moved is not None and moved.name == "main_test.ims.invalid"
+    assert not bad.exists() and moved.is_file()
+
+
 _TESTS = [
     test_rebuilt_ims_matches_linked_shapes_and_is_uint8,
     test_rebuilt_ims_drops_imaris_viewer_residue,
@@ -671,6 +1047,19 @@ _TESTS = [
     test_real_bdv_xml_validates_against_its_h5,
     test_validate_bdv_xml_flags_missing_h5_and_wrong_size,
     test_validate_bdv_xml_flags_setup_without_h5_group,
+    test_nested_links_are_repointed_at_the_corrected_output,
+    test_ambiguous_basenames_are_refused_not_guessed,
+    test_unresolvable_link_takes_the_header_down_with_it,
+    test_link_map_lookup_orders,
+    test_matrix_pyramids_no_crop,
+    test_matrix_no_pyramids_no_crop,
+    test_matrix_pyramids_crop,
+    test_matrix_no_pyramids_crop,
+    test_validate_header_dereferences_rather_than_inspecting,
+    test_validate_header_catches_size_lie_and_s1_attrs,
+    test_validate_bdv_h5_catches_advertised_but_absent_level,
+    test_validate_bdv_h5_catches_factor_shape_mismatch,
+    test_quarantine_header_makes_it_unopenable,
 ]
 
 
