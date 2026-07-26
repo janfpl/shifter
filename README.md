@@ -91,7 +91,15 @@ Select an output directory and RAM allocation (50-95% of system memory). Choose 
 
 The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
 
-**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. When enabled, every level is built from each corrected slab while it is still in memory — the written `Data` is **never read back** — so the pyramid phase costs a little extra CPU rather than a full re-read of the volume per level. (The original implementation re-read the whole corrected volume once per level, which on a ~215 GiB/channel volume was ~85% of total export time.) Sums are accumulated as integers rather than `float64`, and where one level's factors divide another's (the usual 2/4/8 ladder) the coarser level is derived from the finer level's unrounded sums; results are bit-identical to the previous implementation either way. When disabled, the output `.lux.h5` contains only the full-resolution `Data`, and the size estimate / `bytes_written_gb` reflect full-resolution only.
+**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. When enabled, every level is built from each corrected slab while it is still in memory — the written `Data` is **never read back** — so the pyramid phase costs a little extra CPU rather than a full re-read of the volume per level. (The original implementation re-read the whole corrected volume once per level, which on a ~215 GiB/channel volume was ~85% of total export time; on that dataset the rewrite took a full export from 8h 53m to 44m.) When disabled, the output `.lux.h5` contains only the full-resolution `Data`, and the size estimate / `bytes_written_gb` reflect full-resolution only.
+
+Three properties make this exact and fast:
+
+- Sums are accumulated as **integers** rather than `float64` (integer floor division of the block sum is identical to truncating the float mean for uint16 input).
+- Where one level's factors divide another's (the usual 2/4/8 ladder), the coarser level is derived from the finer level's **unrounded sums** instead of from the full-resolution slab again.
+- The XY reduction is **parallelised across CPU cores with numba** when it is installed. This is safe precisely because the sums are integers — addition is associative and commutative and the accumulator cannot overflow, so evaluation order does not change the result. Install numba (see above) for a multi-core speed-up; without it the code falls back to numpy and results are unchanged.
+
+Setting `CSC_PYRAMID_GPU=1` runs the XY reduction on the GPU via CuPy instead. This copies each slab to the device, so it only helps when the GPU is otherwise idle and the CPU is the bottleneck; numba is the better default. The chosen backend is recorded in `performance_log.txt` (`backend=numba|gpu|numpy`).
 
 Companion Imaris (`.ims`) and BigDataViewer (`*_bdv.h5`) headers describe a *multi-resolution* dataset and link to the pyramid levels. With pyramids **on** they are copied verbatim; with pyramids **off** they are **rewritten to a single (full-resolution) level** so they still resolve against the pyramid-less output — e.g. for import into the Imaris File Converter, which builds its own pyramids from the full-resolution data. (Copying the original multi-resolution headers next to pyramid-less data would make Imaris/BigDataViewer read the dataset as corrupt.)
 
@@ -219,5 +227,5 @@ Ensure the path points to your CUDA 12.6 installation.
 - psutil (>=5.9)
 - qtpy (>=2.3)
 - matplotlib (>=3.5)
-- numba (optional, for faster mutual-information registration; install via conda)
+- numba (recommended: parallelises pyramid generation and mutual-information registration; install via conda)
 - CuPy (optional, for GPU acceleration)

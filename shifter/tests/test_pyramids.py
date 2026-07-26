@@ -230,7 +230,53 @@ def test_export_never_rereads_output_for_pyramids() -> None:
         assert np.array_equal(f["Data_2_2_2"][()], expect.astype(np.uint16))
 
 
+def test_parallel_backend_is_bit_identical_to_numpy() -> None:
+    """The numba XY reduction must equal the numpy one exactly.
+
+    Parallelising is only safe because these are *integer* sums: addition is
+    associative and commutative and the accumulator cannot overflow, so
+    evaluation order is irrelevant. This would not hold for float means.
+    """
+    from shifter import h5_utils as hu
+
+    if not hu._HAVE_NUMBA_PYRAMID:
+        return  # numba not installed; nothing to compare
+
+    rng = np.random.default_rng(11)
+    original = hu._HAVE_NUMBA_PYRAMID
+    try:
+        for shape in ((7, 101, 97), (3, 64, 64), (33, 128, 130)):
+            for fh, fw in ((2, 2), (3, 3), (4, 2), (1, 4), (5, 7)):
+                for dtype in (np.uint16, np.uint32):
+                    src = rng.integers(0, 65536, size=shape).astype(dtype)
+                    sd = hu.pyramid_sum_dtype(fw, fh, 1)
+                    hu._HAVE_NUMBA_PYRAMID = False
+                    ref = hu._block_sum_xy(src, fh, fw, sd)
+                    hu._HAVE_NUMBA_PYRAMID = True
+                    got = hu._block_sum_xy(src, fh, fw, sd)
+                    assert got.shape == ref.shape, (shape, fh, fw, dtype)
+                    assert np.array_equal(got, ref), (
+                        f"numba != numpy for shape={shape} factors=({fh},{fw}) {dtype}"
+                    )
+    finally:
+        hu._HAVE_NUMBA_PYRAMID = original
+
+
+def test_streaming_matches_reference_under_numba() -> None:
+    """End-to-end streaming pyramids stay exact with the parallel backend on."""
+    from shifter import h5_utils as hu
+
+    if not hu._HAVE_NUMBA_PYRAMID:
+        return
+    rng = np.random.default_rng(12)
+    vol = rng.integers(0, 65536, size=(37, 66, 70), dtype=np.uint16)
+    levels = [("Data_2_2_2", 2, 2, 2), ("Data_4_4_4", 4, 4, 4), ("Data_3_3_3", 3, 3, 3)]
+    _check(vol, levels, [4, 9, 37], "numba backend")
+
+
 _TESTS = [
+    test_parallel_backend_is_bit_identical_to_numpy,
+    test_streaming_matches_reference_under_numba,
     test_export_never_rereads_output_for_pyramids,
     test_block_sum_matches_float_average,
     test_sum_dtype_avoids_overflow,

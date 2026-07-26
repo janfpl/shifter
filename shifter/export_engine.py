@@ -293,12 +293,15 @@ def _log_pyramid_summary(name: str, summary: dict[str, Any]) -> None:
     reread of the output: the interesting numbers are compute vs write time and
     the bytes produced.
     """
+    from shifter.h5_utils import pyramid_backend
+
     compute_s = summary["compute_s"]
     write_s = summary["write_s"]
     mib = summary["bytes_written"] / 1024**2
     write_mibps = mib / write_s if write_s > 0 else 0.0
     log_event(
         f"pyramids {name} | levels={','.join(summary['levels']) or '-'} "
+        f"backend={pyramid_backend()} "
         f"compute={compute_s:.1f}s write={write_s:.1f}s ({write_mibps:.0f} MiB/s) "
         f"wrote={mib:.0f}MiB reread=0B"
         + (f" | SKIPPED={','.join(summary['skipped'])}" if summary["skipped"] else "")

@@ -541,12 +541,116 @@ def block_sum_3d(
     return reshaped.sum(axis=(1, 3, 5), dtype=sum_dtype)
 
 
+# --------------------------------------------------------------------------- #
+# XY block-sum backends
+#
+# The XY reduction of the full-resolution slab dominates pyramid compute (every
+# coarser level works on progressively smaller data). Parallelising it is safe
+# in a way a float reduction would not be: integer addition is associative and
+# commutative, and pyramid_sum_dtype() guarantees the accumulator cannot
+# overflow, so any evaluation order yields bit-identical sums.
+#
+# Backends, in preference order: numba (threads across CPU cores, no data
+# movement), cupy (opt-in via CSC_PYRAMID_GPU=1; adds a host->device copy of the
+# whole slab, so it only pays off when the GPU is idle), then plain numpy.
+# --------------------------------------------------------------------------- #
+
+# Below this many output elements the thread/launch overhead outweighs the win.
+_PARALLEL_MIN_ELEMS = 1 << 16
+
+try:  # pragma: no cover - exercised only when numba is installed
+    import numba
+
+    @numba.njit(parallel=True, cache=True)
+    def _block_sum_xy_numba(planes, factor_h, factor_w, out):  # noqa: ANN001
+        """Fill *out* with the (factor_h, factor_w) XY block sums of *planes*.
+
+        Parallel over (plane, output row); each iteration reads its source rows
+        sequentially, which keeps the access pattern cache-friendly.
+        """
+        n_planes = out.shape[0]
+        oh = out.shape[1]
+        ow = out.shape[2]
+        for idx in numba.prange(n_planes * oh):
+            p = idx // oh
+            oy = idx - p * oh
+            y0 = oy * factor_h
+            for dy in range(factor_h):
+                row = planes[p, y0 + dy]
+                for ox in range(ow):
+                    x0 = ox * factor_w
+                    acc = 0
+                    for dx in range(factor_w):
+                        acc += row[x0 + dx]
+                    out[p, oy, ox] += acc
+
+    _HAVE_NUMBA_PYRAMID = True
+except Exception:  # numba missing or failed to compile
+    _HAVE_NUMBA_PYRAMID = False
+
+
+def _pyramid_gpu_enabled() -> bool:
+    """True when the caller opted into the CuPy XY reduction."""
+    return os.environ.get("CSC_PYRAMID_GPU", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _block_sum_xy_cupy(
+    planes: np.ndarray, factor_h: int, factor_w: int, sum_dtype: np.dtype
+) -> np.ndarray | None:
+    """CuPy XY block sum; returns None if the GPU path is unavailable/fails."""
+    try:
+        import cupy as cp
+    except Exception:
+        return None
+    n, h, w = planes.shape
+    oh, ow = h // factor_h, w // factor_w
+    try:
+        gpu = cp.asarray(planes[:, : oh * factor_h, : ow * factor_w])
+        reduced = gpu.reshape(n, oh, factor_h, ow, factor_w).sum(
+            axis=(2, 4), dtype=sum_dtype
+        )
+        out = cp.asnumpy(reduced)
+        del gpu, reduced
+        cp.get_default_memory_pool().free_all_blocks()
+        return out
+    except Exception as exc:
+        logger.warning("GPU pyramid reduction failed (%s); falling back to CPU", exc)
+        return None
+
+
+def pyramid_backend() -> str:
+    """Name of the XY-reduction backend that will be used ('gpu'/'numba'/'numpy')."""
+    if _pyramid_gpu_enabled():
+        return "gpu"
+    return "numba" if _HAVE_NUMBA_PYRAMID else "numpy"
+
+
 def _block_sum_xy(
     planes: np.ndarray, factor_h: int, factor_w: int, sum_dtype: np.dtype
 ) -> np.ndarray:
-    """Sum ``(factor_h, factor_w)`` XY blocks of every plane in *planes*."""
+    """Sum ``(factor_h, factor_w)`` XY blocks of every plane in *planes*.
+
+    Dispatches to the fastest available backend; every backend returns the same
+    exact integer sums (see the note above).
+    """
     n, h, w = planes.shape
     oh, ow = h // factor_h, w // factor_w
+    big_enough = n * oh * ow >= _PARALLEL_MIN_ELEMS
+
+    if big_enough and _pyramid_gpu_enabled():
+        out = _block_sum_xy_cupy(planes, factor_h, factor_w, sum_dtype)
+        if out is not None:
+            return out
+
+    if big_enough and _HAVE_NUMBA_PYRAMID:
+        out = np.zeros((n, oh, ow), dtype=sum_dtype)
+        # Numba indexes only inside the trimmed region, so no copy is needed
+        # even when the factors do not divide the plane dimensions.
+        _block_sum_xy_numba(planes, factor_h, factor_w, out)
+        return out
+
     trimmed = planes[:, : oh * factor_h, : ow * factor_w]
     if not trimmed.flags["C_CONTIGUOUS"]:
         trimmed = np.ascontiguousarray(trimmed)
