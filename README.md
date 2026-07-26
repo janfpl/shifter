@@ -188,6 +188,8 @@ The XML is rewritten from the source rather than authored from scratch; only wha
 
 If any of that cannot be done safely — the document is not SpimData, has no `ViewSetup`/`ViewRegistration` entries, or declares a size that does not match the exported volume — **neither** file is written and the reason is logged. A header that looks plausible but misplaces the data is worse than no header.
 
+The rewrite is checked against a genuine Luxendo BDV XML (`shifter/tests/data/main_st-0-x00-y00-0-x00-y01_bdv.xml`, a two-channel 3099 × 6979 × 5347 acquisition) as well as synthetic fixtures. In that sample the registration *is* the calibration (2.925 × 2.925 × 3 µm per voxel), which pins the transform ordering down: cropping at voxel (1000, 2000, 500) moves the world origin by 2925 / 5850 / 1500 µm, not by 1000 / 2000 / 500. Getting that backwards would displace a crop by roughly 2 mm while still producing a volume that looks entirely reasonable, so it is covered by a test.
+
 ## Registration Algorithms
 
 Three algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.

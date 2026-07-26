@@ -35,3 +35,7 @@ gpu = [
 
 [project.scripts]
 shifter = "shifter.main:main"
+
+[tool.setuptools.package-data]
+# The genuine Luxendo BDV XML that test_headers.py checks the rewrite against.
+"shifter.tests" = ["data/*.xml"]

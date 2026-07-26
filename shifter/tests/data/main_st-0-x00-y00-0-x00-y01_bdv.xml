@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+    <SpimData version="0.2">
+
+      <BasePath type="relative">.</BasePath>
+
+      <SequenceDescription>
+
+        <ImageLoader format="bdv.hdf5">
+        <hdf5 type="relative">main_st-0-x00-y00-0-x00-y01_bdv.h5</hdf5>
+        </ImageLoader>
+
+        <ViewSetups>
+
+    
+
+            <ViewSetup>
+                <id>0</id>
+                <name>ch:0_st:0-x00-y00-0-x00-y01_ang:h0-v90_obj:bottom-bottom_cam:bottom</name>
+                <size>5347 6979 3099</size>
+                <voxelSize>
+                    <unit>micrometer</unit>
+                    <size>2.925 2.925 3</size>
+                </voxelSize>
+                <attributes>
+                    <channel>0</channel>
+                    <angle>0</angle>
+                    <tile>0</tile>
+                </attributes>
+            </ViewSetup>
+
+            
+
+            <ViewSetup>
+                <id>1</id>
+                <name>ch:1_st:0-x00-y00-0-x00-y01_ang:h0-v90_obj:bottom-bottom_cam:bottom</name>
+                <size>5347 6979 3099</size>
+                <voxelSize>
+                    <unit>micrometer</unit>
+                    <size>2.925 2.925 3</size>
+                </voxelSize>
+                <attributes>
+                    <channel>1</channel>
+                    <angle>0</angle>
+                    <tile>0</tile>
+                </attributes>
+            </ViewSetup>
+
+            
+
+          <Attributes name="channel">
+            
+            <Channel>
+              <id>0</id>
+              <name>ch:0</name>
+            </Channel>
+        
+            <Channel>
+              <id>1</id>
+              <name>ch:1</name>
+            </Channel>
+        
+          </Attributes>
+
+          <Attributes name="angle">
+            
+            <Angle>
+              <id>0</id>
+              <name>ang:h0-v90_obj:bottom-bottom</name>
+            </Angle>
+        
+          </Attributes>
+
+          <Attributes name="tile">
+            
+            <Tile>
+              <id>0</id>
+              <name>st:0-x00-y00-0-x00-y01</name>
+            </Tile>
+        
+          </Attributes>
+
+        </ViewSetups>
+
+        <Timepoints type="range">
+            <first>0</first>
+            <last>0</last>
+        </Timepoints>
+
+      </SequenceDescription>
+
+      <ViewRegistrations>
+    
+
+            <ViewRegistration timepoint="0" setup="0">
+              <ViewTransform type="affine">
+                <affine>2.925 0 0 -9006.575 0 2.925 0 -10799.059 0 0 3 -8872.391</affine>
+              </ViewTransform>
+            </ViewRegistration>
+
+            
+
+            <ViewRegistration timepoint="0" setup="1">
+              <ViewTransform type="affine">
+                <affine>2.925 0 0 -9006.575 0 2.925 0 -10799.059 0 0 3 -8872.391</affine>
+              </ViewTransform>
+            </ViewRegistration>
+
+            
+      </ViewRegistrations>
+
+    </SpimData>
+    

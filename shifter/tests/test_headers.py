@@ -421,6 +421,98 @@ def test_bdv_h5_without_xml_is_omitted() -> None:
     assert not (out / bdv.name).exists()
 
 
+# --------------------------------------------------------------------------- #
+# Real manufacturer sample
+#
+# tests/data/main_st-0-x00-y00-0-x00-y01_bdv.xml is a genuine Luxendo BDV XML
+# for a 3099 x 6979 x 5347 two-channel acquisition. Synthetic fixtures only
+# prove the code agrees with itself; this one is the check that it agrees with
+# what the microscope actually writes.
+# --------------------------------------------------------------------------- #
+
+_SAMPLE_XML = Path(__file__).parent / "data" / "main_st-0-x00-y00-0-x00-y01_bdv.xml"
+_SAMPLE_SHAPE = (3099, 6979, 5347)  # (nz, ny, nx), i.e. <size>5347 6979 3099</size>
+
+
+def test_real_bdv_xml_full_resolution_is_unchanged_but_repointed() -> None:
+    """A full-volume export must leave sizes and registrations exactly as found."""
+    out = Path(tempfile.mkdtemp())
+    dst = out / _SAMPLE_XML.name
+    write_bdv_xml(_SAMPLE_XML, dst, output_shape_zyx=_SAMPLE_SHAPE,
+                  input_shape_zyx=_SAMPLE_SHAPE, h5_filename="renamed_bdv.h5")
+
+    assert _xml_sizes(dst) == [(5347, 6979, 3099), (5347, 6979, 3099)]
+    for setup in ("0", "1"):
+        assert np.allclose(_bdv_model(dst, setup), _bdv_model(_SAMPLE_XML, setup))
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(str(dst)).getroot()
+    assert root.find("./SequenceDescription/ImageLoader/hdf5").text == "renamed_bdv.h5"
+    # Everything the rewrite does not understand is carried through untouched.
+    assert root.find("BasePath").text == "."
+    assert [a.get("name") for a in root.findall(".//Attributes")] == [
+        "channel", "angle", "tile"
+    ]
+    setups = root.findall(".//ViewSetup")
+    assert [s.find("voxelSize/size").text for s in setups] == [
+        "2.925 2.925 3", "2.925 2.925 3"
+    ]
+    assert [s.find("attributes/channel").text for s in setups] == ["0", "1"]
+    assert setups[0].find("name").text.startswith("ch:0_st:0-x00-y00")
+
+
+def test_real_bdv_xml_crop_lands_at_the_right_micrometre() -> None:
+    """The crop's world origin must shift by the offset *scaled by calibration*.
+
+    The sample's registration is the calibration itself (2.925, 2.925, 3 um per
+    voxel plus a translation), so this pins down the transform ordering: the
+    crop offset is in voxels and must be consumed by that calibration. Applying
+    it on the wrong side would displace the crop by ~2 mm — a plausible-looking
+    volume in the wrong place, which is exactly the failure worth a test.
+    """
+    out = Path(tempfile.mkdtemp())
+    dst = out / _SAMPLE_XML.name
+    roi = (500, 1500, 2000, 4000, 1000, 3000)  # z0,z1, y0,y1, x0,x1
+    write_bdv_xml(_SAMPLE_XML, dst, output_shape_zyx=(1000, 2000, 2000),
+                  input_shape_zyx=_SAMPLE_SHAPE, roi=roi,
+                  h5_filename="main_st-0-x00-y00-0-x00-y01_bdv.h5")
+
+    assert _xml_sizes(dst) == [(2000, 2000, 1000), (2000, 2000, 1000)]
+    for setup in ("0", "1"):
+        full, crop = _bdv_model(_SAMPLE_XML, setup), _bdv_model(dst, setup)
+        origin = crop @ np.array([0.0, 0.0, 0.0, 1.0])
+        # -9006.575 + 2.925*1000, -10799.059 + 2.925*2000, -8872.391 + 3*500
+        assert np.allclose(origin[:3], [-6081.575, -4949.059, -7372.391]), origin
+        # ... and every other voxel follows the same mapping.
+        for v in ((0, 0, 0), (500, 700, 900), (1999, 1999, 999)):
+            got = crop @ np.array([*v, 1.0])
+            want = full @ np.array([v[0] + 1000, v[1] + 2000, v[2] + 500, 1.0])
+            assert np.allclose(got, want), (setup, v, got, want)
+        assert np.allclose(crop[:3, :3], full[:3, :3])
+
+
+def test_real_bdv_xml_validates_against_its_h5() -> None:
+    """Both ViewSetups must resolve to setup groups in the paired H5."""
+    out = Path(tempfile.mkdtemp())
+    dst = out / _SAMPLE_XML.name
+    h5_name = "main_st-0-x00-y00-0-x00-y01_bdv.h5"
+    write_bdv_xml(_SAMPLE_XML, dst, output_shape_zyx=_SAMPLE_SHAPE,
+                  input_shape_zyx=_SAMPLE_SHAPE, h5_filename=h5_name)
+    with h5py.File(str(out / h5_name), "w") as f:
+        for s in ("s00", "s01"):
+            f.create_dataset(f"{s}/resolutions", data=np.ones((1, 3)))
+            f.create_dataset(f"{s}/subdivisions", data=np.full((1, 3), 64.0))
+    assert validate_bdv_xml(dst, expected_shape_zyx=_SAMPLE_SHAPE) == []
+
+    # A setup with no matching sNN group is a dataset BigDataViewer cannot open.
+    (out / h5_name).unlink()
+    with h5py.File(str(out / h5_name), "w") as f:
+        f.create_dataset("s00/resolutions", data=np.ones((1, 3)))
+    problems = validate_bdv_xml(dst, expected_shape_zyx=_SAMPLE_SHAPE)
+    assert len(problems) == 1 and "ViewSetup 1" in problems[0], problems
+
+
 def test_validate_bdv_xml_flags_missing_h5_and_wrong_size() -> None:
     d = Path(tempfile.mkdtemp())
     xml = d / "main_test_bdv.xml"
@@ -574,6 +666,9 @@ _TESTS = [
     test_bdv_xml_rejects_setup_of_different_size,
     test_bdv_pair_is_complete_or_wholly_absent,
     test_bdv_h5_without_xml_is_omitted,
+    test_real_bdv_xml_full_resolution_is_unchanged_but_repointed,
+    test_real_bdv_xml_crop_lands_at_the_right_micrometre,
+    test_real_bdv_xml_validates_against_its_h5,
     test_validate_bdv_xml_flags_missing_h5_and_wrong_size,
     test_validate_bdv_xml_flags_setup_without_h5_group,
 ]
