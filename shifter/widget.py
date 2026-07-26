@@ -758,13 +758,17 @@ class ChromaticShiftWidget(QWidget):
         row_ram.addWidget(self.lbl_ram)
         lay.addLayout(row_ram)
 
-        # Pyramid regeneration re-reads the whole volume once per level and can
-        # dominate H5 export time, so it is off by default. Tick to write the
-        # low-resolution multiscale layers (needed for fast multiscale viewing).
+        # Pyramids are built from each corrected slab in memory (no reread) and
+        # the reduction is parallelised, so on a measured 431 GiB export they
+        # cost ~7 min on top of a ~21 min pyramids-off floor. That is cheap
+        # enough to write them by default: the multiscale layers give fast
+        # zoomed-out viewing and keep the Imaris/BigDataViewer companion headers
+        # matching the data without a single-resolution rewrite. Untick for the
+        # fastest possible export when only full resolution is needed.
         self.chk_write_pyramids = QCheckBox(
-            "Write low-resolution pyramid layers (slower; H5 only)"
+            "Write low-resolution pyramid layers (H5 only)"
         )
-        self.chk_write_pyramids.setChecked(False)
+        self.chk_write_pyramids.setChecked(True)
         lay.addWidget(self.chk_write_pyramids)
 
         self.btn_export = QPushButton("Apply && Export")

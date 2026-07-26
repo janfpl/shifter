@@ -14,12 +14,28 @@ conda activate shifter
 pip install -e .
 ```
 
-> **Note:** Installing `numba` via conda is recommended because it provides pre-built
-> binaries for `numba` and its dependency `llvmlite`. Installing these via pip may fail
-> on macOS and other platforms due to build toolchain incompatibilities. If you skip the
-> conda numba install, mutual-information registration will still work but will use a
-> slower pure-NumPy fallback. You can also install numba as a pip extra with
-> `pip install -e ".[numba]"`, though this may require additional build dependencies.
+> **Install `numba` — it is strongly recommended, not cosmetic.** It parallelises two
+> hot paths across CPU cores. On a measured 431 GiB two-channel export, pyramid
+> generation took **103 s per channel with numba versus 631 s without (6.1×)**, and
+> mutual-information registration is likewise far slower on the pure-NumPy fallback.
+> Results are bit-identical either way — only the speed differs.
+>
+> Install it via conda (as in the command above) because conda ships pre-built binaries
+> for `numba` and its dependency `llvmlite`; installing via pip may fail on macOS and
+> other platforms due to build toolchain incompatibilities. The pip extra
+> `pip install -e ".[numba]"` also works but may require additional build dependencies.
+>
+> To confirm it is active in the environment you actually run the app from:
+>
+> ```bash
+> conda activate shifter
+> python -c "import numba; print(numba.__version__)"
+> ```
+>
+> Every export also logs the backend in use — look for
+> `Pyramid reduction backend: numba (N threads)` near the top of
+> `performance_log.txt`. If it instead reads `numpy (single-threaded fallback …)`, the
+> line names the underlying error.
 
 For GPU acceleration (optional, requires **CUDA Toolkit 12.6**):
 
@@ -55,7 +71,7 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 - Reads the `Data` dataset as the full-resolution volume
 - Detects and displays resolution pyramid levels (`Data_W_H_D` naming convention) as napari multiscale layers
 - Parses embedded JSON metadata for voxel sizes and channel descriptions
-- On export, pyramids can optionally be regenerated for corrected volumes using block averaging (off by default — see Export)
+- On export, pyramids are regenerated for corrected volumes using block averaging (on by default; can be disabled — see Export)
 
 ## Workflow
 
@@ -91,13 +107,26 @@ Select an output directory and RAM allocation (50-95% of system memory). Choose 
 
 The number of Z-planes per slab is sized from the *currently available* system RAM (scaled by the RAM allocation slider) and capped so a single slab never exceeds a few GiB — reading and materializing one slab transiently holds several full-size copies at once (the source chunks, dask's concatenated buffer, and the output slab). This keeps peak memory bounded even for very large (hundreds-of-GB) volumes: export throughput is limited by disk I/O, not slab size, so batching more planes into one slab only increases memory pressure without exporting any faster. If an export runs out of memory, lower the RAM allocation slider, close other applications, or export a smaller ROI.
 
-**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **off by default**. When enabled, every level is built from each corrected slab while it is still in memory — the written `Data` is **never read back** — so the pyramid phase costs a little extra CPU rather than a full re-read of the volume per level. (The original implementation re-read the whole corrected volume once per level, which on a ~215 GiB/channel volume was ~85% of total export time; on that dataset the rewrite took a full export from 8h 53m to 44m.) When disabled, the output `.lux.h5` contains only the full-resolution `Data`, and the size estimate / `bytes_written_gb` reflect full-resolution only.
+**Low-resolution pyramid layers** (Luxendo H5 only) are controlled by the *"Write low-resolution pyramid layers"* checkbox and are **on by default**. Every level is built from each corrected slab while it is still in memory — the written `Data` is **never read back** — and the reduction is parallelised across CPU cores, so the pyramid phase is now a modest addition rather than the dominant cost.
+
+Measured on a 431 GiB two-channel export (3099 × 6979 × 5347, five pyramid levels, 32-core machine):
+
+| Build | Pyramid compute / channel | Total export |
+|---|---|---|
+| Original (re-read `Data` once per level) | 3 h 52 m | **8 h 53 m** |
+| Streaming, single-threaded numpy | 631 s | **44.8 m** |
+| Streaming + numba (current) | **103 s** | **28.6 m** |
+| Pyramids disabled (floor) | — | 21.3 m |
+
+That is **18.7× faster than the original build**, and pyramids now cost ~7 min on top of the 21.3 min pyramids-off floor (they used to cost 23.5 min). Roughly 80% of the remaining runtime is disk I/O.
+
+Untick the box for the fastest possible export when only full resolution is needed — the output `.lux.h5` then contains just `Data`, the size estimate and `bytes_written_gb` reflect full resolution only, and the companion headers are rewritten to describe a single resolution level.
 
 Three properties make this exact and fast:
 
 - Sums are accumulated as **integers** rather than `float64` (integer floor division of the block sum is identical to truncating the float mean for uint16 input).
 - Where one level's factors divide another's (the usual 2/4/8 ladder), the coarser level is derived from the finer level's **unrounded sums** instead of from the full-resolution slab again.
-- The XY reduction is **parallelised across CPU cores with numba** when it is installed. This is safe precisely because the sums are integers — addition is associative and commutative and the accumulator cannot overflow, so evaluation order does not change the result. **Without numba the reduction falls back to a single-threaded numpy path that is several times slower** (results are identical either way), so check the log line `Pyramid reduction backend:` — it states which backend is in use and, when numba is missing, why.
+- The XY reduction is **parallelised across CPU cores with numba** when it is installed. This is safe precisely because the sums are integers — addition is associative and commutative and the accumulator cannot overflow, so evaluation order does not change the result. **Without numba the reduction falls back to a single-threaded numpy path measured 6.1× slower** (results are identical either way), so check the log line `Pyramid reduction backend:` — it states which backend is in use and, when numba is missing, why.
 
 Setting `CSC_PYRAMID_GPU=1` runs the XY reduction on the GPU via CuPy instead. This copies each slab to the device, so it only helps when the GPU is otherwise idle and the CPU is the bottleneck; numba is the better default. The chosen backend is recorded in `performance_log.txt` (`backend=numba|gpu|numpy`).
 
