@@ -178,7 +178,7 @@ Output format matches the input format:
 
 ## Registration Algorithms
 
-Three algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
+Four algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
 
 ### Phase Cross-Correlation
 
@@ -221,6 +221,24 @@ Coarse-to-fine exhaustive search maximizing mutual information via joint histogr
 | GPU | Supported via CuPy (accelerates histogram computation) |
 
 This is the default algorithm. It is the most robust across dissimilar intensity distributions between channels (e.g. different fluorophores), at the cost of speed; install `numba` (recommended) for a large parallel speed-up.
+
+### deedsBCV (MIND-SSC)
+
+Registration on **MIND-SSC** descriptors — the modality-independent self-similarity descriptor from [deedsBCV](https://github.com/mattiaspaul/deedsBCV) (Mattias P. Heinrich, MIT-licensed). Each voxel is described by 12 values measuring how its local patch differs from patches at neighbouring offsets, so the descriptor encodes *structure* rather than intensity: an arbitrary brightness/contrast change leaves it unchanged. Shifts are then found by a discrete displacement search over a 4× / 2× / 1× downsampling pyramid, minimizing the descriptor sum-of-squared-differences over a strided grid of sample points.
+
+| Aspect | Detail |
+|--------|--------|
+| Speed | Moderate (pyramid search; roughly a few seconds per channel for a 160³ ROI) |
+| Best for | Channels whose intensity relationship is non-linear or inverted — the mutual-information use case, at a fraction of the cost |
+| Limitations | Translation only (see below); descriptor computation holds two 12-channel `float32` volumes in RAM |
+| Parameters | Descriptor quantisation step (default 1) and refinement radius (default 3) |
+| GPU | Supported via CuPy (whole pipeline, descriptors and search) |
+
+**Scope.** deedsBCV proper is a *deformable* registration: dense discrete displacements on a control-point grid, regularized with a minimum spanning tree. Shifter applies one global integer shift per channel, so what is implemented here is deeds' similarity core — the MIND-SSC descriptor plus the discrete data-cost search — in the translation-only role that `linearBCV` plays before deeds' deformable pass. The regularization and the deformable field are not implemented, as this pipeline has nowhere to apply them.
+
+The descriptors follow `src/MINDSSCbox.h` of the reference implementation, with two deviations: descriptor entries are kept as `float32` (the `exp(-x)` form the reference leaves commented out) and compared by SSD rather than quantized into a 64-bit word and compared by Hamming distance, and box filtering uses a mean rather than a running sum — the constant cancels in the per-voxel noise normalization that follows.
+
+Confidence is how far the best candidate stands out from the coarsest level's cost distribution, `(median − min) / (max − min)`, the minimization counterpart of the mutual-information confidence.
 
 ## GPU Acceleration
 

@@ -50,12 +50,15 @@ class RegistrationResult:
 # ZNCC) hold several float64/complex128 copies of the sub-volume
 # simultaneously (skimage/scipy internals plus our own pre-cast copies);
 # mutual information only needs raveled float64 copies plus small
-# histograms. These are upper-bound heuristics for pre-flight warnings,
-# not an exact accounting.
+# histograms. deedsBCV holds two 12-channel float32 descriptor volumes
+# (96 B/voxel) plus the six-channel distance buffer and its box-filter
+# temporaries while building each of them. These are upper-bound heuristics
+# for pre-flight warnings, not an exact accounting.
 MEMORY_BYTES_PER_VOXEL: dict[str, int] = {
     "Phase Cross-Correlation": 64,
     "Zero-Normalized Cross-Correlation": 64,
     "Mutual Information": 24,
+    "deedsBCV (MIND-SSC)": 160,
 }
 _DEFAULT_MEMORY_BYTES_PER_VOXEL = 64
 
