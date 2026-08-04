@@ -32,6 +32,57 @@ _TESTED_CUDA = "12.6"
 _CUDA_MARKER = "##SHIFTER_CUDA_VERSIONS##"
 
 
+# Probe strategies, tried in order by :func:`_detect_gpu`. Each controls how the
+# DLL search path is arranged before CuPy is imported and NVRTC is exercised:
+#   "isolated" — remove system CUDA-toolkit dirs from PATH so CuPy uses only its
+#                own bundled libraries (fixes a system nvrtc shadowing the
+#                bundled one, the common Windows crash).
+#   "system"   — inject the system CUDA toolkit path (for conda cudatoolkit and
+#                other setups whose CuPy relies on system libraries).
+#   "bundled"  — leave PATH untouched (CuPy's default resolution).
+_STRATEGIES = ("isolated", "system")
+
+import re as _re
+
+# Matches a system CUDA Toolkit install dir, e.g.
+# ``C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin``.
+_SYSTEM_CUDA_RE = _re.compile(r"NVIDIA GPU Computing Toolkit[\\/]+CUDA", _re.IGNORECASE)
+
+
+def _strip_system_cuda_from_path() -> list[str]:
+    """Remove system CUDA-toolkit directories from this process's ``PATH``.
+
+    Returns the removed entries (for logging). This lets CuPy load its own
+    bundled CUDA libraries instead of a system toolkit's DLLs, which — when the
+    two versions differ — otherwise shadow the bundled ``nvrtc`` and crash the
+    kernel compile natively.
+    """
+    if sys.platform != "win32":
+        return []
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    kept: list[str] = []
+    removed: list[str] = []
+    for entry in entries:
+        (removed if entry and _SYSTEM_CUDA_RE.search(entry) else kept).append(entry)
+    if removed:
+        os.environ["PATH"] = os.pathsep.join(kept)
+    return removed
+
+
+def _apply_cuda_strategy(strategy: str) -> None:
+    """Arrange the DLL search path for a probe *strategy* (see ``_STRATEGIES``)."""
+    if strategy == "isolated":
+        removed = _strip_system_cuda_from_path()
+        if removed:
+            logger.debug("Isolated strategy removed %d system CUDA PATH entrie(s)", len(removed))
+    elif strategy == "system":
+        try:
+            _ensure_cuda_env()
+        except Exception as exc:
+            logger.debug("CUDA env setup failed: %s", exc)
+    # "bundled": leave PATH as-is.
+
+
 def _ensure_cuda_env() -> None:
     """Try to locate and configure CUDA paths on Windows.
 
@@ -200,28 +251,21 @@ def _test_nvrtc(cupy) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _probe_gpu(setup_env: bool = True) -> tuple[bool, str, str]:
+def _probe_gpu(strategy: str = "isolated") -> tuple[bool, str, str]:
     """Try to import cupy and detect a suitable NVIDIA GPU.
 
     Parameters
     ----------
-    setup_env : bool
-        If True, inject the system CUDA toolkit directories into the DLL search
-        path (:func:`_ensure_cuda_env`) before probing. Modern ``cupy-cuda12x``
-        wheels ship their own CUDA libraries and work best *without* this — a
-        system toolkit whose ``nvrtc`` DLL differs from CuPy's bundled one can
-        shadow it and cause a native crash. Callers therefore try ``False``
-        first and fall back to ``True`` only for setups (e.g. conda cudatoolkit)
-        that genuinely need the system libraries.
+    strategy : str
+        How to arrange the DLL search path before probing — one of
+        ``_STRATEGIES`` (see :func:`_apply_cuda_strategy`). ``"isolated"``
+        (the default) removes system CUDA-toolkit dirs from ``PATH`` so CuPy
+        uses its own bundled libraries, avoiding the common Windows crash where
+        a system ``nvrtc`` DLL shadows the bundled one.
 
     Returns ``(available, gpu_name, fail_reason)``.
     """
-    if setup_env:
-        # Only when explicitly asked: point the loader at the system toolkit.
-        try:
-            _ensure_cuda_env()
-        except Exception as exc:
-            logger.debug("CUDA env setup failed: %s", exc)
+    _apply_cuda_strategy(strategy)
 
     try:
         import cupy  # noqa: F401
@@ -309,20 +353,16 @@ def _format_cuda_version(v: int | None) -> str:
     return f"{v // 1000}.{(v % 1000) // 10}"
 
 
-def _read_cuda_versions(setup_env: bool = False) -> dict[str, int] | None:
+def _read_cuda_versions(strategy: str = "isolated") -> dict[str, int] | None:
     """Query the installed CUDA runtime/driver versions (no kernel compile).
 
     These are plain driver-API lookups — unlike the NVRTC kernel compile they do
     not JIT anything, so they are safe to call even on a mismatched install.
-    Returns ``None`` if CuPy/CUDA is not importable. *setup_env* mirrors
+    Returns ``None`` if CuPy/CUDA is not importable. *strategy* mirrors
     :func:`_probe_gpu` so the version is read under the same DLL search path as
     the probe it accompanies.
     """
-    if setup_env:
-        try:
-            _ensure_cuda_env()
-        except Exception:
-            pass
+    _apply_cuda_strategy(strategy)
     try:
         import cupy
         return {
@@ -333,11 +373,11 @@ def _read_cuda_versions(setup_env: bool = False) -> dict[str, int] | None:
         return None
 
 
-def _emit_cuda_version_marker(setup_env: bool = False) -> None:
+def _emit_cuda_version_marker(strategy: str = "isolated") -> None:
     """Print the CUDA-version marker line (called by the child probe only)."""
     import json
 
-    info = _read_cuda_versions(setup_env)
+    info = _read_cuda_versions(strategy)
     if info:
         print(f"{_CUDA_MARKER} {json.dumps(info)}", flush=True)
 
@@ -439,7 +479,7 @@ def _report_gpu_unavailable(reason: str) -> None:
 _PROBE_TIMEOUT_S = 30
 
 
-def _probe_gpu_subprocess(setup_env: bool = False) -> tuple[bool, str, str]:
+def _probe_gpu_subprocess(strategy: str = "isolated") -> tuple[bool, str, str]:
     """Run :func:`_probe_gpu` in a child process and return its result.
 
     The probe imports CuPy and JIT-compiles a test kernel through NVRTC. On a
@@ -450,8 +490,8 @@ def _probe_gpu_subprocess(setup_env: bool = False) -> tuple[bool, str, str]:
     the blast radius: a crashing child just yields a non-zero exit code, which
     we translate into "GPU unavailable" and keep running on CPU.
 
-    *setup_env* selects whether the child injects the system CUDA toolkit path
-    (see :func:`_probe_gpu`); it is forwarded to the child as ``--setup-env``.
+    *strategy* (see :func:`_probe_gpu`) is forwarded to the child as
+    ``--strategy <name>``.
     """
     import json
     import subprocess
@@ -462,9 +502,9 @@ def _probe_gpu_subprocess(setup_env: bool = False) -> tuple[bool, str, str]:
         "faulthandler",
         "-m",
         "shifter.registration._gpu_probe",
+        "--strategy",
+        strategy,
     ]
-    if setup_env:
-        cmd.append("--setup-env")
     try:
         proc = subprocess.run(
             cmd,
@@ -542,25 +582,21 @@ def _detect_gpu() -> tuple[bool, str, str]:
         return False, "", "GPU disabled via SHIFTER_DISABLE_GPU=1"
 
     if os.environ.get("SHIFTER_GPU_PROBE", "").lower() == "inprocess":
-        for setup_env in (False, True):
-            _GPU_CUDA_VERSIONS = _read_cuda_versions(setup_env)
-            available, name, reason = _probe_gpu(setup_env=setup_env)
+        for strategy in _STRATEGIES:
+            _GPU_CUDA_VERSIONS = _read_cuda_versions(strategy)
+            available, name, reason = _probe_gpu(strategy=strategy)
             if available:
                 return available, name, reason
         return available, name, reason
 
     last = (False, "", "")
-    for setup_env in (False, True):
-        available, name, reason = _probe_gpu_subprocess(setup_env=setup_env)
+    for strategy in _STRATEGIES:
+        available, name, reason = _probe_gpu_subprocess(strategy=strategy)
         if available:
-            if setup_env:
-                # Reproduce the winning strategy's DLL search path in *this*
-                # process for the real GPU work that runs in-process later.
-                # (_ensure_cuda_env only edits PATH/DLL dirs.)
-                try:
-                    _ensure_cuda_env()
-                except Exception as exc:
-                    logger.debug("CUDA env setup failed in parent process: %s", exc)
+            # Reproduce the winning strategy's DLL search path in *this* process
+            # for the real GPU work that runs in-process later.
+            _apply_cuda_strategy(strategy)
+            logger.info("GPU probe succeeded with '%s' strategy", strategy)
             return available, name, reason
         last = (available, name, reason)
     return last

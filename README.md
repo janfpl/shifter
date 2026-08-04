@@ -248,7 +248,7 @@ All registration algorithms support optional GPU acceleration via CuPy. The widg
 
 On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it.
 
-The probe is attempted twice, each in its own subprocess: first using CuPy's own **bundled** CUDA libraries (no changes to the DLL search path), then — only if that fails — with the system CUDA toolkit path injected. Trying the bundled libraries first avoids the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL shadows the (different-version) one bundled with `cupy-cuda12x` and crashes the compile. Two environment variables control the check:
+The probe is attempted twice, each in its own subprocess. The first attempt is **isolated**: it removes any system CUDA-toolkit directory from `PATH` so CuPy loads only its own bundled CUDA libraries. This fixes the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL (already on `PATH` from the CUDA installer) shadows the different-version one bundled with `cupy-cuda12x` and crashes the compile. The second attempt injects the **system** CUDA toolkit path, for setups (e.g. conda `cudatoolkit`) whose CuPy relies on the system libraries. Whichever succeeds, that same `PATH` arrangement is applied to the app process for the real GPU work. Two environment variables control the check:
 
 - `SHIFTER_DISABLE_GPU=1` — skip the GPU probe entirely and run on CPU (fastest startup; use this if the probe is slow or unreliable on your machine).
 - `SHIFTER_GPU_PROBE=inprocess` — run the probe in-process (the old behaviour), for debugging only; a native CuPy fault will crash the app.
@@ -266,9 +266,16 @@ Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); th
 If the startup banner reports that CuPy could not compile a test kernel on an otherwise-supported CUDA 12.x runtime, a system CUDA toolkit's `nvrtc` DLL is most likely shadowing CuPy's bundled one. Try, in order:
 
 1. Refresh the bundled CUDA libraries: `pip install -U cupy-cuda12x`.
-2. Remove the system CUDA `bin` directory from `PATH` in the shell you launch from (e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin`) — CuPy does not need it when its bundled libraries are used.
-3. Update your NVIDIA driver.
-4. As a quick isolation check, run the probe on its own: `python -m shifter.registration._gpu_probe` (prints the probe's JSON result and any native crash).
+2. Update your NVIDIA driver.
+3. Diagnose directly with the probe, which takes a `--strategy` and prints its JSON result (and, thanks to faulthandler, any native crash stack):
+
+   ```cmd
+   python -m shifter.registration._gpu_probe --strategy isolated
+   python -m shifter.registration._gpu_probe --strategy system
+   python -m shifter.registration._gpu_probe --strategy bundled
+   ```
+
+   `isolated` is what the app tries first (it drops system CUDA-toolkit dirs from `PATH` so CuPy uses its bundled libraries); `bundled` leaves `PATH` untouched. If `isolated` prints `"available": true`, the app will use the GPU on the next launch.
 
 **Troubleshooting: GPU not detected (conda-installed CUDA toolkit)**
 
