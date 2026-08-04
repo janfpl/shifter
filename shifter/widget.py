@@ -625,7 +625,7 @@ class ChromaticShiftWidget(QWidget):
         row_sr_xy.addWidget(QLabel("XY search range (voxels):"))
         self.spin_sr_xy = QSpinBox()
         self.spin_sr_xy.setRange(1, MAX_SEARCH_RANGE)
-        self.spin_sr_xy.setValue(20)
+        self.spin_sr_xy.setValue(1)
         row_sr_xy.addWidget(self.spin_sr_xy)
         lay.addLayout(row_sr_xy)
 
