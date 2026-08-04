@@ -20,9 +20,12 @@ _GPU_FAIL_REASON: str = ""
 # ``{"runtime": int, "driver": int}`` (CuPy's integer form, e.g. 12060 = 12.6).
 _GPU_CUDA_VERSIONS: dict[str, int] | None = None
 
-# The single CUDA toolkit version this application is built and tested against.
-# Surfaced prominently when a version mismatch is the reason the GPU is off.
-_SUPPORTED_CUDA = "12.6"
+# CuPy's ``cupy-cuda12x`` wheels bundle their own CUDA libraries and work with
+# any CUDA 12.x runtime (the bundled runtime may report e.g. 12.9 even when the
+# separately installed toolkit is 12.6 — that is fine). So the supported line is
+# the whole 12.x series; 12.6 is just the version this app is tested against.
+_SUPPORTED_CUDA_LINE = "12.x"
+_TESTED_CUDA = "12.6"
 
 # stdout marker the child probe prints (before the crash-prone NVRTC test) so
 # the parent can report the CUDA version even when the child faults natively.
@@ -197,16 +200,28 @@ def _test_nvrtc(cupy) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _probe_gpu() -> tuple[bool, str, str]:
+def _probe_gpu(setup_env: bool = True) -> tuple[bool, str, str]:
     """Try to import cupy and detect a suitable NVIDIA GPU.
+
+    Parameters
+    ----------
+    setup_env : bool
+        If True, inject the system CUDA toolkit directories into the DLL search
+        path (:func:`_ensure_cuda_env`) before probing. Modern ``cupy-cuda12x``
+        wheels ship their own CUDA libraries and work best *without* this — a
+        system toolkit whose ``nvrtc`` DLL differs from CuPy's bundled one can
+        shadow it and cause a native crash. Callers therefore try ``False``
+        first and fall back to ``True`` only for setups (e.g. conda cudatoolkit)
+        that genuinely need the system libraries.
 
     Returns ``(available, gpu_name, fail_reason)``.
     """
-    # Attempt to fix CUDA path before importing CuPy.
-    try:
-        _ensure_cuda_env()
-    except Exception as exc:
-        logger.debug("CUDA env setup failed: %s", exc)
+    if setup_env:
+        # Only when explicitly asked: point the loader at the system toolkit.
+        try:
+            _ensure_cuda_env()
+        except Exception as exc:
+            logger.debug("CUDA env setup failed: %s", exc)
 
     try:
         import cupy  # noqa: F401
@@ -294,17 +309,20 @@ def _format_cuda_version(v: int | None) -> str:
     return f"{v // 1000}.{(v % 1000) // 10}"
 
 
-def _read_cuda_versions() -> dict[str, int] | None:
+def _read_cuda_versions(setup_env: bool = False) -> dict[str, int] | None:
     """Query the installed CUDA runtime/driver versions (no kernel compile).
 
     These are plain driver-API lookups — unlike the NVRTC kernel compile they do
     not JIT anything, so they are safe to call even on a mismatched install.
-    Returns ``None`` if CuPy/CUDA is not importable.
+    Returns ``None`` if CuPy/CUDA is not importable. *setup_env* mirrors
+    :func:`_probe_gpu` so the version is read under the same DLL search path as
+    the probe it accompanies.
     """
-    try:
-        _ensure_cuda_env()
-    except Exception:
-        pass
+    if setup_env:
+        try:
+            _ensure_cuda_env()
+        except Exception:
+            pass
     try:
         import cupy
         return {
@@ -315,11 +333,11 @@ def _read_cuda_versions() -> dict[str, int] | None:
         return None
 
 
-def _emit_cuda_version_marker() -> None:
+def _emit_cuda_version_marker(setup_env: bool = False) -> None:
     """Print the CUDA-version marker line (called by the child probe only)."""
     import json
 
-    info = _read_cuda_versions()
+    info = _read_cuda_versions(setup_env)
     if info:
         print(f"{_CUDA_MARKER} {json.dumps(info)}", flush=True)
 
@@ -337,74 +355,91 @@ def _parse_cuda_marker(stdout: str) -> dict[str, int] | None:
     return None
 
 
-def _looks_like_cuda_version_issue(reason: str, versions: dict[str, int] | None) -> bool:
-    """Heuristic: does *reason* indicate an unsupported/mismatched CUDA version?
+def _cuda_major(versions: dict[str, int] | None) -> int | None:
+    """Major CUDA version from a detected version dict, or None if unknown."""
+    if versions and versions.get("runtime"):
+        return versions["runtime"] // 1000
+    return None
 
-    A native NVRTC crash and an NVRTC compilation failure are both characteristic
-    of a CuPy build that does not match the installed CUDA toolkit. A detected
-    runtime version outside the supported 12.x line is also treated as one.
-    """
+
+def _nvrtc_failed(reason: str) -> bool:
+    """Whether *reason* describes an NVRTC/kernel-compile failure or crash."""
     r = (reason or "").lower()
-    if any(
+    return any(
         s in r
         for s in (
             "crashed while testing cupy/nvrtc",
+            "gpu probe crashed",
             "nvrtc compilation failed",
-            "version mismatch",
+            "nvrtc",
         )
-    ):
-        return True
-    if versions and versions.get("runtime"):
-        if versions["runtime"] // 1000 != 12:
-            return True
-    return False
+    )
+
+
+def _print_banner(lines: list[str]) -> None:
+    """Log a bordered multi-line banner (blank entries dropped)."""
+    bar = "=" * 64
+    body = [f"  {ln}" for ln in lines if ln]
+    logger.warning("\n".join(["", bar, *body, bar]))
 
 
 def _report_gpu_unavailable(reason: str) -> None:
-    """Log why the GPU is off, calling out a CUDA-version mismatch clearly.
+    """Log why the GPU is off, distinguishing the two common causes clearly.
 
-    When the failure looks like a CUDA toolkit version problem, print a prominent
-    multi-line banner stating that only CUDA %s is supported, so the cause is
-    obvious in the terminal rather than buried in a one-line probe message.
+    1. A genuinely unsupported CUDA *major* version (not 12.x).
+    2. A CuPy/NVRTC compile failure on an otherwise-supported 12.x runtime —
+       almost always a CUDA DLL/PATH conflict (a system toolkit's ``nvrtc``
+       shadowing CuPy's bundled one), not a version problem.
+
+    Anything else keeps the plain one-line warning.
     """
     versions = _GPU_CUDA_VERSIONS
-    if not _looks_like_cuda_version_issue(reason, versions):
-        logger.warning("GPU unavailable: %s", reason)
+    major = _cuda_major(versions)
+
+    if major is not None and major != 12:
+        detected = f"Detected CUDA runtime {_format_cuda_version(versions['runtime'])}."
+        _print_banner(
+            [
+                "GPU acceleration DISABLED — unsupported CUDA version",
+                f"Only CUDA {_SUPPORTED_CUDA_LINE} is supported "
+                f"(tested with {_TESTED_CUDA}).",
+                detected,
+                "Running on CPU. Install a CUDA 12.x build of CuPy",
+                "(pip install cupy-cuda12x), or set SHIFTER_DISABLE_GPU=1.",
+            ]
+        )
         return
 
-    detected = ""
-    if versions and versions.get("runtime"):
-        detected = f"Detected CUDA runtime {_format_cuda_version(versions['runtime'])}"
-        if versions.get("driver"):
-            detected += (
-                f" (driver supports up to {_format_cuda_version(versions['driver'])})"
+    if _nvrtc_failed(reason):
+        detected = ""
+        if versions and versions.get("runtime"):
+            detected = (
+                f"Detected CUDA runtime {_format_cuda_version(versions['runtime'])}"
+                " — a supported 12.x version, so this is not a version problem."
             )
-        detected += " — incompatible."
+        _print_banner(
+            [
+                "GPU acceleration DISABLED — CuPy could not compile a test kernel",
+                detected,
+                "This is almost always a CUDA DLL/PATH conflict: a system CUDA",
+                "toolkit whose nvrtc DLL shadows the one bundled with CuPy.",
+                "Running on CPU. Things to try, in order:",
+                "  - pip install -U cupy-cuda12x   (refresh bundled CUDA libs)",
+                "  - remove any system CUDA '...\\bin' from PATH in this shell",
+                "  - update your NVIDIA driver",
+                "  - set SHIFTER_DISABLE_GPU=1 to silence this check",
+            ]
+        )
+        return
 
-    bar = "=" * 64
-    lines = [
-        "",
-        bar,
-        "  GPU acceleration DISABLED — unsupported CUDA version",
-        f"  Only CUDA {_SUPPORTED_CUDA} is supported.",
-    ]
-    if detected:
-        lines.append(f"  {detected}")
-    lines += [
-        "  Running on CPU. To enable the GPU, install the CUDA "
-        f"{_SUPPORTED_CUDA} Toolkit",
-        "  with a matching CuPy (pip install cupy-cuda12x) and an up-to-date",
-        "  NVIDIA driver, or set SHIFTER_DISABLE_GPU=1 to silence this check.",
-        bar,
-    ]
-    logger.warning("\n".join(lines))
+    logger.warning("GPU unavailable: %s", reason)
 
 
 # How long to wait for the out-of-process GPU probe before giving up (seconds).
 _PROBE_TIMEOUT_S = 30
 
 
-def _probe_gpu_subprocess() -> tuple[bool, str, str]:
+def _probe_gpu_subprocess(setup_env: bool = False) -> tuple[bool, str, str]:
     """Run :func:`_probe_gpu` in a child process and return its result.
 
     The probe imports CuPy and JIT-compiles a test kernel through NVRTC. On a
@@ -414,6 +449,9 @@ def _probe_gpu_subprocess() -> tuple[bool, str, str]:
     whole application down during startup. Running it in a subprocess contains
     the blast radius: a crashing child just yields a non-zero exit code, which
     we translate into "GPU unavailable" and keep running on CPU.
+
+    *setup_env* selects whether the child injects the system CUDA toolkit path
+    (see :func:`_probe_gpu`); it is forwarded to the child as ``--setup-env``.
     """
     import json
     import subprocess
@@ -425,6 +463,8 @@ def _probe_gpu_subprocess() -> tuple[bool, str, str]:
         "-m",
         "shifter.registration._gpu_probe",
     ]
+    if setup_env:
+        cmd.append("--setup-env")
     try:
         proc = subprocess.run(
             cmd,
@@ -480,31 +520,50 @@ def _probe_gpu_subprocess() -> tuple[bool, str, str]:
 def _detect_gpu() -> tuple[bool, str, str]:
     """Decide GPU availability, isolating the crash-prone probe by default.
 
+    Tries two strategies in order, each in its own subprocess so a native fault
+    in one cannot stop the next:
+
+    1. ``setup_env=False`` — let CuPy use its own **bundled** CUDA libraries,
+       touching neither PATH nor the DLL search dirs. This is what modern
+       ``cupy-cuda12x`` wants, and it avoids the system-toolkit ``nvrtc`` DLL
+       conflict that otherwise crashes the probe.
+    2. ``setup_env=True`` — inject the system CUDA toolkit path, for setups
+       (e.g. conda ``cudatoolkit``) whose CuPy relies on the system libraries.
+
     Controlled by two environment variables:
 
     * ``SHIFTER_DISABLE_GPU=1`` — skip probing entirely and run on CPU.
     * ``SHIFTER_GPU_PROBE=inprocess`` — probe in-process (the old behaviour);
       faster, but a native CuPy/NVRTC fault will crash the app.
     """
+    global _GPU_CUDA_VERSIONS
+
     if os.environ.get("SHIFTER_DISABLE_GPU") == "1":
         return False, "", "GPU disabled via SHIFTER_DISABLE_GPU=1"
 
     if os.environ.get("SHIFTER_GPU_PROBE", "").lower() == "inprocess":
-        global _GPU_CUDA_VERSIONS
-        _GPU_CUDA_VERSIONS = _read_cuda_versions()
-        return _probe_gpu()
+        for setup_env in (False, True):
+            _GPU_CUDA_VERSIONS = _read_cuda_versions(setup_env)
+            available, name, reason = _probe_gpu(setup_env=setup_env)
+            if available:
+                return available, name, reason
+        return available, name, reason
 
-    available, name, reason = _probe_gpu_subprocess()
-    if available:
-        # The probe ran in a child process; make sure *this* process also has
-        # the CUDA environment set up for the real GPU work that runs in-process
-        # later. (_ensure_cuda_env only edits PATH/DLL dirs — it does not touch
-        # NVRTC, so it cannot trigger the native fault the subprocess guards.)
-        try:
-            _ensure_cuda_env()
-        except Exception as exc:
-            logger.debug("CUDA env setup failed in parent process: %s", exc)
-    return available, name, reason
+    last = (False, "", "")
+    for setup_env in (False, True):
+        available, name, reason = _probe_gpu_subprocess(setup_env=setup_env)
+        if available:
+            if setup_env:
+                # Reproduce the winning strategy's DLL search path in *this*
+                # process for the real GPU work that runs in-process later.
+                # (_ensure_cuda_env only edits PATH/DLL dirs.)
+                try:
+                    _ensure_cuda_env()
+                except Exception as exc:
+                    logger.debug("CUDA env setup failed in parent process: %s", exc)
+            return available, name, reason
+        last = (available, name, reason)
+    return last
 
 
 def gpu_available() -> bool:

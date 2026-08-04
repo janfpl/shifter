@@ -246,7 +246,9 @@ Confidence is how far the best candidate stands out from the coarsest level's co
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.
 
-On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it. Two environment variables control the check:
+On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it.
+
+The probe is attempted twice, each in its own subprocess: first using CuPy's own **bundled** CUDA libraries (no changes to the DLL search path), then — only if that fails — with the system CUDA toolkit path injected. Trying the bundled libraries first avoids the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL shadows the (different-version) one bundled with `cupy-cuda12x` and crashes the compile. Two environment variables control the check:
 
 - `SHIFTER_DISABLE_GPU=1` — skip the GPU probe entirely and run on CPU (fastest startup; use this if the probe is slow or unreliable on your machine).
 - `SHIFTER_GPU_PROBE=inprocess` — run the probe in-process (the old behaviour), for debugging only; a native CuPy fault will crash the app.
@@ -257,11 +259,20 @@ Install GPU support:
 pip install -e ".[gpu]"
 ```
 
-Requires CUDA Toolkit 12.6 and compatible hardware/drivers. CUDA 10.x and 13.x are not supported.
+Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); the app is tested against CUDA 12.6. The CuPy wheel bundles its own CUDA 12.x libraries, so it may report a runtime version (e.g. 12.9) different from a separately installed toolkit — that is expected and fine. CUDA 11.x and 13.x are not supported.
 
-**Troubleshooting: GPU not detected**
+**Troubleshooting: GPU shows CPU mode with a "could not compile a test kernel" banner**
 
-If the widget shows CPU-only mode despite having a CUDA-capable GPU, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
+If the startup banner reports that CuPy could not compile a test kernel on an otherwise-supported CUDA 12.x runtime, a system CUDA toolkit's `nvrtc` DLL is most likely shadowing CuPy's bundled one. Try, in order:
+
+1. Refresh the bundled CUDA libraries: `pip install -U cupy-cuda12x`.
+2. Remove the system CUDA `bin` directory from `PATH` in the shell you launch from (e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin`) — CuPy does not need it when its bundled libraries are used.
+3. Update your NVIDIA driver.
+4. As a quick isolation check, run the probe on its own: `python -m shifter.registration._gpu_probe` (prints the probe's JSON result and any native crash).
+
+**Troubleshooting: GPU not detected (conda-installed CUDA toolkit)**
+
+If you rely on a conda-installed `cudatoolkit` rather than the bundled CuPy libraries, and the widget shows CPU-only mode, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
 
 ```cmd
 echo %CUDA_PATH%
@@ -284,9 +295,7 @@ Ensure the path points to your CUDA 12.6 installation.
 
 **Troubleshooting: app closes immediately on startup**
 
-When the GPU probe fails because of a CUDA toolkit version mismatch, the terminal prints a clear banner — **"Only CUDA 12.6 is supported"** — with the detected CUDA version, and the app continues on CPU.
-
-If the application still exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, the installed CuPy does not match this machine's CUDA driver/toolkit and crashes while being probed. Start with the probe disabled:
+The GPU probe now runs out-of-process, so a native CuPy/NVRTC crash should no longer take the app down — it falls back to CPU and prints a banner explaining why. If you are on an older build, or the app still exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, start with the probe disabled:
 
 ```cmd
 set SHIFTER_DISABLE_GPU=1

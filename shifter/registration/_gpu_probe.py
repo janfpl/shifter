@@ -17,16 +17,22 @@ means such a fault produces a non-zero exit code that the parent turns into
 from __future__ import annotations
 
 import json
+import sys
 
 
 def main() -> None:
     from shifter.registration.gpu_utils import _emit_cuda_version_marker, _probe_gpu
 
+    # Whether to inject the system CUDA toolkit path (see _probe_gpu). Default is
+    # off — use CuPy's bundled CUDA libraries; the parent passes --setup-env for
+    # the fallback attempt.
+    setup_env = "--setup-env" in sys.argv[1:]
+
     # Emit the detected CUDA version first, so the parent can report it even if
     # the NVRTC kernel compile below faults natively and this process dies.
-    _emit_cuda_version_marker()
+    _emit_cuda_version_marker(setup_env)
 
-    available, name, reason = _probe_gpu()
+    available, name, reason = _probe_gpu(setup_env=setup_env)
     print(json.dumps({"available": available, "name": name, "reason": reason}))
 
 
