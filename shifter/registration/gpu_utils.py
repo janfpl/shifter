@@ -16,6 +16,18 @@ _GPU_AVAILABLE: bool | None = None
 _GPU_NAME: str = ""
 _GPU_FAIL_REASON: str = ""
 
+# CUDA runtime/driver versions detected during probing, if any:
+# ``{"runtime": int, "driver": int}`` (CuPy's integer form, e.g. 12060 = 12.6).
+_GPU_CUDA_VERSIONS: dict[str, int] | None = None
+
+# The single CUDA toolkit version this application is built and tested against.
+# Surfaced prominently when a version mismatch is the reason the GPU is off.
+_SUPPORTED_CUDA = "12.6"
+
+# stdout marker the child probe prints (before the crash-prone NVRTC test) so
+# the parent can report the CUDA version even when the child faults natively.
+_CUDA_MARKER = "##SHIFTER_CUDA_VERSIONS##"
+
 
 def _ensure_cuda_env() -> None:
     """Try to locate and configure CUDA paths on Windows.
@@ -273,6 +285,121 @@ def _get_device_name(cupy_mod: Any) -> str:
         return ""
 
 
+def _format_cuda_version(v: int | None) -> str:
+    """Format CuPy's integer CUDA version (e.g. 12060) as ``"12.6"``."""
+    try:
+        v = int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "unknown"
+    return f"{v // 1000}.{(v % 1000) // 10}"
+
+
+def _read_cuda_versions() -> dict[str, int] | None:
+    """Query the installed CUDA runtime/driver versions (no kernel compile).
+
+    These are plain driver-API lookups — unlike the NVRTC kernel compile they do
+    not JIT anything, so they are safe to call even on a mismatched install.
+    Returns ``None`` if CuPy/CUDA is not importable.
+    """
+    try:
+        _ensure_cuda_env()
+    except Exception:
+        pass
+    try:
+        import cupy
+        return {
+            "runtime": int(cupy.cuda.runtime.runtimeGetVersion()),
+            "driver": int(cupy.cuda.runtime.driverGetVersion()),
+        }
+    except Exception:
+        return None
+
+
+def _emit_cuda_version_marker() -> None:
+    """Print the CUDA-version marker line (called by the child probe only)."""
+    import json
+
+    info = _read_cuda_versions()
+    if info:
+        print(f"{_CUDA_MARKER} {json.dumps(info)}", flush=True)
+
+
+def _parse_cuda_marker(stdout: str) -> dict[str, int] | None:
+    """Extract the CUDA-version marker emitted by the child probe, if present."""
+    import json
+
+    for line in stdout.splitlines():
+        if line.startswith(_CUDA_MARKER):
+            try:
+                return json.loads(line[len(_CUDA_MARKER):].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _looks_like_cuda_version_issue(reason: str, versions: dict[str, int] | None) -> bool:
+    """Heuristic: does *reason* indicate an unsupported/mismatched CUDA version?
+
+    A native NVRTC crash and an NVRTC compilation failure are both characteristic
+    of a CuPy build that does not match the installed CUDA toolkit. A detected
+    runtime version outside the supported 12.x line is also treated as one.
+    """
+    r = (reason or "").lower()
+    if any(
+        s in r
+        for s in (
+            "crashed while testing cupy/nvrtc",
+            "nvrtc compilation failed",
+            "version mismatch",
+        )
+    ):
+        return True
+    if versions and versions.get("runtime"):
+        if versions["runtime"] // 1000 != 12:
+            return True
+    return False
+
+
+def _report_gpu_unavailable(reason: str) -> None:
+    """Log why the GPU is off, calling out a CUDA-version mismatch clearly.
+
+    When the failure looks like a CUDA toolkit version problem, print a prominent
+    multi-line banner stating that only CUDA %s is supported, so the cause is
+    obvious in the terminal rather than buried in a one-line probe message.
+    """
+    versions = _GPU_CUDA_VERSIONS
+    if not _looks_like_cuda_version_issue(reason, versions):
+        logger.warning("GPU unavailable: %s", reason)
+        return
+
+    detected = ""
+    if versions and versions.get("runtime"):
+        detected = f"Detected CUDA runtime {_format_cuda_version(versions['runtime'])}"
+        if versions.get("driver"):
+            detected += (
+                f" (driver supports up to {_format_cuda_version(versions['driver'])})"
+            )
+        detected += " — incompatible."
+
+    bar = "=" * 64
+    lines = [
+        "",
+        bar,
+        "  GPU acceleration DISABLED — unsupported CUDA version",
+        f"  Only CUDA {_SUPPORTED_CUDA} is supported.",
+    ]
+    if detected:
+        lines.append(f"  {detected}")
+    lines += [
+        "  Running on CPU. To enable the GPU, install the CUDA "
+        f"{_SUPPORTED_CUDA} Toolkit",
+        "  with a matching CuPy (pip install cupy-cuda12x) and an up-to-date",
+        "  NVIDIA driver, or set SHIFTER_DISABLE_GPU=1 to silence this check.",
+        bar,
+    ]
+    logger.warning("\n".join(lines))
+
+
 # How long to wait for the out-of-process GPU probe before giving up (seconds).
 _PROBE_TIMEOUT_S = 30
 
@@ -314,6 +441,9 @@ def _probe_gpu_subprocess() -> tuple[bool, str, str]:
         )
     except Exception as exc:
         return False, "", f"GPU probe could not be launched ({exc}); using CPU"
+
+    global _GPU_CUDA_VERSIONS
+    _GPU_CUDA_VERSIONS = _parse_cuda_marker(proc.stdout or "")
 
     if proc.returncode != 0:
         stderr_tail = ""
@@ -360,6 +490,8 @@ def _detect_gpu() -> tuple[bool, str, str]:
         return False, "", "GPU disabled via SHIFTER_DISABLE_GPU=1"
 
     if os.environ.get("SHIFTER_GPU_PROBE", "").lower() == "inprocess":
+        global _GPU_CUDA_VERSIONS
+        _GPU_CUDA_VERSIONS = _read_cuda_versions()
         return _probe_gpu()
 
     available, name, reason = _probe_gpu_subprocess()
@@ -383,7 +515,7 @@ def gpu_available() -> bool:
         if _GPU_AVAILABLE:
             logger.info("GPU enabled: %s", _GPU_NAME)
         elif _GPU_FAIL_REASON:
-            logger.warning("GPU unavailable: %s", _GPU_FAIL_REASON)
+            _report_gpu_unavailable(_GPU_FAIL_REASON)
     return _GPU_AVAILABLE
 
 

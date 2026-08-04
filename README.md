@@ -284,7 +284,9 @@ Ensure the path points to your CUDA 12.6 installation.
 
 **Troubleshooting: app closes immediately on startup**
 
-If the application exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, the installed CuPy does not match this machine's CUDA driver/toolkit and crashes while being probed. Start with the probe disabled:
+When the GPU probe fails because of a CUDA toolkit version mismatch, the terminal prints a clear banner — **"Only CUDA 12.6 is supported"** — with the detected CUDA version, and the app continues on CPU.
+
+If the application still exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, the installed CuPy does not match this machine's CUDA driver/toolkit and crashes while being probed. Start with the probe disabled:
 
 ```cmd
 set SHIFTER_DISABLE_GPU=1

@@ -20,7 +20,11 @@ import json
 
 
 def main() -> None:
-    from shifter.registration.gpu_utils import _probe_gpu
+    from shifter.registration.gpu_utils import _emit_cuda_version_marker, _probe_gpu
+
+    # Emit the detected CUDA version first, so the parent can report it even if
+    # the NVRTC kernel compile below faults natively and this process dies.
+    _emit_cuda_version_marker()
 
     available, name, reason = _probe_gpu()
     print(json.dumps({"available": available, "name": name, "reason": reason}))
