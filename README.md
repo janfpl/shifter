@@ -246,6 +246,11 @@ Confidence is how far the best candidate stands out from the coarsest level's co
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.
 
+On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it. Two environment variables control the check:
+
+- `SHIFTER_DISABLE_GPU=1` — skip the GPU probe entirely and run on CPU (fastest startup; use this if the probe is slow or unreliable on your machine).
+- `SHIFTER_GPU_PROBE=inprocess` — run the probe in-process (the old behaviour), for debugging only; a native CuPy fault will crash the app.
+
 Install GPU support:
 
 ```bash
@@ -276,6 +281,17 @@ echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%
 ```
 
 Ensure the path points to your CUDA 12.6 installation.
+
+**Troubleshooting: app closes immediately on startup**
+
+If the application exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, the installed CuPy does not match this machine's CUDA driver/toolkit and crashes while being probed. Start with the probe disabled:
+
+```cmd
+set SHIFTER_DISABLE_GPU=1
+python -m shifter
+```
+
+The app will run on CPU. To restore GPU acceleration, reinstall CuPy to match your CUDA version (`pip install cupy-cuda12x` for CUDA 12.x) and update your NVIDIA driver, then unset the variable.
 
 ## Dependencies
 

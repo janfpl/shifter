@@ -273,11 +273,113 @@ def _get_device_name(cupy_mod: Any) -> str:
         return ""
 
 
+# How long to wait for the out-of-process GPU probe before giving up (seconds).
+_PROBE_TIMEOUT_S = 30
+
+
+def _probe_gpu_subprocess() -> tuple[bool, str, str]:
+    """Run :func:`_probe_gpu` in a child process and return its result.
+
+    The probe imports CuPy and JIT-compiles a test kernel through NVRTC. On a
+    machine whose CuPy build does not match the installed CUDA driver/toolkit,
+    that compile can trigger a **native** fault (e.g. a Windows access
+    violation) that a Python ``try/except`` cannot catch — it would take the
+    whole application down during startup. Running it in a subprocess contains
+    the blast radius: a crashing child just yields a non-zero exit code, which
+    we translate into "GPU unavailable" and keep running on CPU.
+    """
+    import json
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        "-X",
+        "faulthandler",
+        "-m",
+        "shifter.registration._gpu_probe",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            "",
+            "GPU probe timed out (possible driver/toolkit hang); using CPU. "
+            "Set SHIFTER_DISABLE_GPU=1 to skip the probe.",
+        )
+    except Exception as exc:
+        return False, "", f"GPU probe could not be launched ({exc}); using CPU"
+
+    if proc.returncode != 0:
+        stderr_tail = ""
+        if proc.stderr:
+            logger.debug("GPU probe subprocess stderr:\n%s", proc.stderr)
+            lines = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+            if lines:
+                stderr_tail = f" ({lines[-1].strip()})"
+        return (
+            False,
+            "",
+            "GPU probe crashed while testing CuPy/NVRTC"
+            f"{stderr_tail}. This usually means the installed CuPy does not "
+            "match the CUDA driver/toolkit on this machine. Using CPU. Set "
+            "SHIFTER_DISABLE_GPU=1 to skip this probe on startup.",
+        )
+
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+                return (
+                    bool(data["available"]),
+                    str(data.get("name", "")),
+                    str(data.get("reason", "")),
+                )
+            except (ValueError, KeyError):
+                break
+
+    return False, "", "GPU probe returned no usable result; using CPU"
+
+
+def _detect_gpu() -> tuple[bool, str, str]:
+    """Decide GPU availability, isolating the crash-prone probe by default.
+
+    Controlled by two environment variables:
+
+    * ``SHIFTER_DISABLE_GPU=1`` — skip probing entirely and run on CPU.
+    * ``SHIFTER_GPU_PROBE=inprocess`` — probe in-process (the old behaviour);
+      faster, but a native CuPy/NVRTC fault will crash the app.
+    """
+    if os.environ.get("SHIFTER_DISABLE_GPU") == "1":
+        return False, "", "GPU disabled via SHIFTER_DISABLE_GPU=1"
+
+    if os.environ.get("SHIFTER_GPU_PROBE", "").lower() == "inprocess":
+        return _probe_gpu()
+
+    available, name, reason = _probe_gpu_subprocess()
+    if available:
+        # The probe ran in a child process; make sure *this* process also has
+        # the CUDA environment set up for the real GPU work that runs in-process
+        # later. (_ensure_cuda_env only edits PATH/DLL dirs — it does not touch
+        # NVRTC, so it cannot trigger the native fault the subprocess guards.)
+        try:
+            _ensure_cuda_env()
+        except Exception as exc:
+            logger.debug("CUDA env setup failed in parent process: %s", exc)
+    return available, name, reason
+
+
 def gpu_available() -> bool:
     """Return True if a suitable GPU + cupy installation is detected."""
     global _GPU_AVAILABLE, _GPU_NAME, _GPU_FAIL_REASON
     if _GPU_AVAILABLE is None:
-        _GPU_AVAILABLE, _GPU_NAME, _GPU_FAIL_REASON = _probe_gpu()
+        _GPU_AVAILABLE, _GPU_NAME, _GPU_FAIL_REASON = _detect_gpu()
         if _GPU_AVAILABLE:
             logger.info("GPU enabled: %s", _GPU_NAME)
         elif _GPU_FAIL_REASON:
