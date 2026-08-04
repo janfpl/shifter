@@ -16,6 +16,7 @@ verbosity.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import sys
@@ -23,6 +24,7 @@ import sys
 logger = logging.getLogger("shifter")
 
 _LEVEL_ENV = "SHIFTER_LOG_LEVEL"
+_QT_LOG_ENV = "SHIFTER_QT_LOG"  # set to "0" to disable the Qt message handler
 _configured = False
 
 
@@ -31,7 +33,10 @@ def configure_logging(level: int | str | None = None) -> None:
 
     Respects an existing logging configuration: if the caller (or napari) has
     already added root handlers, only the level is adjusted so we don't emit
-    duplicate lines.
+    duplicate lines. Also enables :mod:`faulthandler`, so that a *native* crash
+    (segfault or C++ ``abort`` from Qt/OpenGL, which Python's exception handling
+    cannot catch) dumps the crashing thread's stack to stderr instead of the
+    process simply vanishing.
     """
     global _configured
     if level is None:
@@ -48,6 +53,13 @@ def configure_logging(level: int | str | None = None) -> None:
         )
         root.addHandler(handler)
     root.setLevel(level)
+
+    if not faulthandler.is_enabled():
+        try:
+            faulthandler.enable()
+        except Exception:  # pragma: no cover - depends on stderr being real
+            pass
+
     _configured = True
 
 
@@ -73,8 +85,14 @@ def install_excepthook() -> None:
 def install_qt_message_handler() -> None:
     """Forward Qt's own debug/warning/fatal messages into the Python log.
 
-    No-op if Qt bindings are not importable yet.
+    No-op if Qt bindings are not importable yet, or if ``SHIFTER_QT_LOG=0`` is
+    set (a kill-switch for isolating whether this hook itself is implicated in a
+    startup crash). The callback is defensive: it never lets a logging failure
+    propagate back into the Qt C++ layer, which would turn a warning into an
+    abort.
     """
+    if os.environ.get(_QT_LOG_ENV) == "0":
+        return
     try:
         from qtpy.QtCore import QtMsgType, qInstallMessageHandler
     except Exception:
@@ -90,7 +108,10 @@ def install_qt_message_handler() -> None:
     }
 
     def _handler(mode, context, message):  # noqa: ANN001 - Qt callback signature
-        qt_logger.log(level_map.get(mode, logging.INFO), "%s", message)
+        try:
+            qt_logger.log(level_map.get(mode, logging.INFO), "%s", message)
+        except Exception:
+            pass  # never propagate a logging error into Qt's C++ layer
 
     qInstallMessageHandler(_handler)
 
