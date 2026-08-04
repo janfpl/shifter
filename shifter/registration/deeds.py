@@ -308,6 +308,13 @@ def _build_shifts(
 class DeedsRegistration(RegistrationAlgorithm):
     """Translation search on MIND-SSC descriptors, deedsBCV-style.
 
+    Scope: this is deedsBCV's similarity core (MIND-SSC descriptors + discrete
+    data-cost search) in a translation-only role, **not** the full deformable
+    registration — the control-point displacement field and its
+    minimum-spanning-tree regularisation are not implemented, since this
+    pipeline applies a single global integer shift per channel. See the module
+    docstring for the full list of differences from the reference C++.
+
     Parameters
     ----------
     quantisation_step : int
