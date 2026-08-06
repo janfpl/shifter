@@ -160,6 +160,7 @@ def run_validation() -> bool:
     algorithms = [
         ("Phase Cross-Correlation", PhaseCorrelation(normalization=None)),
         ("Mutual Information", ALGORITHM_REGISTRY["Mutual Information"]()),
+        ("Mutual Information (Brent)", ALGORITHM_REGISTRY["Mutual Information (Brent)"]()),
         ("Zero-Normalized Cross-Correlation", ALGORITHM_REGISTRY["Zero-Normalized Cross-Correlation"]()),
         ("deedsBCV (MIND-SSC)", ALGORITHM_REGISTRY["deedsBCV (MIND-SSC)"]()),
     ]

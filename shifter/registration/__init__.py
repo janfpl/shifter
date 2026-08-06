@@ -9,6 +9,9 @@ from shifter.registration.phase_correlation import PhaseCorrelation
 from shifter.registration.mutual_information import (
     MutualInformationRegistration,
 )
+from shifter.registration.mutual_information_brent import (
+    MutualInformationBrentRegistration,
+)
 from shifter.registration.cross_correlation import ZNCCRegistration
 from shifter.registration.deeds import DeedsRegistration, mind_ssc
 from shifter.registration.preprocessing import preprocess
@@ -28,6 +31,7 @@ from shifter.registration.gpu_utils import (
 ALGORITHM_REGISTRY: dict[str, type[RegistrationAlgorithm]] = {
     "Phase Cross-Correlation": PhaseCorrelation,
     "Mutual Information": MutualInformationRegistration,
+    "Mutual Information (Brent)": MutualInformationBrentRegistration,
     "Zero-Normalized Cross-Correlation": ZNCCRegistration,
     "deedsBCV (MIND-SSC)": DeedsRegistration,
 }
@@ -41,6 +45,7 @@ __all__ = [
     "estimate_registration_bytes",
     "PhaseCorrelation",
     "MutualInformationRegistration",
+    "MutualInformationBrentRegistration",
     "ZNCCRegistration",
     "DeedsRegistration",
     "mind_ssc",

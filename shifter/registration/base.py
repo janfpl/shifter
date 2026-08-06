@@ -58,6 +58,7 @@ MEMORY_BYTES_PER_VOXEL: dict[str, int] = {
     "Phase Cross-Correlation": 64,
     "Zero-Normalized Cross-Correlation": 64,
     "Mutual Information": 24,
+    "Mutual Information (Brent)": 24,
     "deedsBCV (MIND-SSC)": 160,
 }
 _DEFAULT_MEMORY_BYTES_PER_VOXEL = 64
