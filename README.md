@@ -178,7 +178,7 @@ Output format matches the input format:
 
 ## Registration Algorithms
 
-Five algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
+Six algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
 
 Every algorithm estimates **one global integer translation per channel** — Shifter corrects rigid chromatic shift, not local deformation. Where an algorithm is named after an upstream package that does more than that (currently deedsBCV), only the part that produces a translation is implemented; the per-algorithm scope notes below say exactly what was and was not taken from the original.
 
@@ -255,6 +255,20 @@ Registration on **MIND-SSC** descriptors — the modality-independent self-simil
 The descriptors follow `src/MINDSSCbox.h` of the reference implementation, with two deviations: descriptor entries are kept as `float32` (the `exp(-x)` form the reference leaves commented out) and compared by SSD rather than quantized into a 64-bit word and compared by Hamming distance, and box filtering uses a mean rather than a running sum — the constant cancels in the per-voxel noise normalization that follows.
 
 Confidence is how far the best candidate stands out from the coarsest level's cost distribution, `(median − min) / (max − min)`, the minimization counterpart of the mutual-information confidence.
+
+### deedsBCV (MIND-SSC, Brent)
+
+The MIND-SSC descriptor above, but the finer pyramid grid searches are replaced with **Brent's method** — the same bounded per-axis optimizer used by Mutual Information (Brent). Descriptors are computed once at full resolution; the coarsest pyramid level grid-searches the whole range for a seed, then Brent refines it, evaluating the descriptor cost at continuous (sub-voxel) shifts by linear interpolation of the descriptor field (`scipy.ndimage.map_coordinates`) so the objective is smooth. The converged shift is rounded to the nearest voxel.
+
+| Aspect | Detail |
+|--------|--------|
+| Speed | Comparable to grid deedsBCV — the descriptor grid search is already cheap, so Brent is a modest saving rather than a large one (unlike the Mutual Information pair, where it replaces an expensive fine grid) |
+| Best for | The MIND-SSC use case when you specifically want a gradient-free continuous optimizer over the descriptor cost rather than a discrete grid |
+| Limitations | Local refinement seeded by the coarse pyramid level; translation-only (as with grid deedsBCV); result is integer-rounded |
+| Parameters | Descriptor quantisation step (default 1) |
+| GPU | Not used — Brent is a sequential optimizer, so this method runs on CPU regardless of the GPU toggle |
+
+Included mainly to complete the pairing of both similarity metrics (mutual information and MIND-SSC) with both search strategies (grid and Brent). For MIND-SSC the grid search is already fast, so the grid variant remains the better default; the speed win from Brent is real for Mutual Information, where the exhaustive fine grid is the bottleneck.
 
 ## GPU Acceleration
 

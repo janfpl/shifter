@@ -163,6 +163,7 @@ def run_validation() -> bool:
         ("Mutual Information (Brent)", ALGORITHM_REGISTRY["Mutual Information (Brent)"]()),
         ("Zero-Normalized Cross-Correlation", ALGORITHM_REGISTRY["Zero-Normalized Cross-Correlation"]()),
         ("deedsBCV (MIND-SSC)", ALGORITHM_REGISTRY["deedsBCV (MIND-SSC)"]()),
+        ("deedsBCV (MIND-SSC, Brent)", ALGORITHM_REGISTRY["deedsBCV (MIND-SSC, Brent)"]()),
     ]
 
     for algo_name, algo in algorithms:

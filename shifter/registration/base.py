@@ -60,6 +60,7 @@ MEMORY_BYTES_PER_VOXEL: dict[str, int] = {
     "Mutual Information": 24,
     "Mutual Information (Brent)": 24,
     "deedsBCV (MIND-SSC)": 160,
+    "deedsBCV (MIND-SSC, Brent)": 160,
 }
 _DEFAULT_MEMORY_BYTES_PER_VOXEL = 64
 
