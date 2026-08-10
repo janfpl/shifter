@@ -270,6 +270,23 @@ The MIND-SSC descriptor above, but the finer pyramid grid searches are replaced 
 
 Included mainly to complete the pairing of both similarity metrics (mutual information and MIND-SSC) with both search strategies (grid and Brent). For MIND-SSC the grid search is already fast, so the grid variant remains the better default; the speed win from Brent is real for Mutual Information, where the exhaustive fine grid is the bottleneck.
 
+## Deformable Registration (deedsBCV)
+
+The six algorithms above all estimate a single **global integer translation** per channel. For **local, non-rigid** chromatic distortion that a global shift cannot correct, there is a separate **deformable** path: a faithful numpy/cupy port of the full deedsBCV algorithm that solves a dense, sub-voxel **displacement field** and warps the moving channel with trilinear interpolation.
+
+It is deliberately kept **off** the integer transform model — the shift table, the manual spin boxes, and the normal "Apply & Export" all stay integer-only and untouched. Instead, a dedicated **"Export Deformable (deedsBCV, ROI)"** button in the Export section runs the deformable solver on the drawn ROI for the registration-selected channels and writes corrected BigTIFF volumes directly (the reference and unselected channels are written unchanged).
+
+The solver ports the reference pipeline (`deedsBCV0.cpp`): a 5-level control-point grid (`grid_spacing = 8,7,6,5,4`), MIND-SSC descriptors, a discrete per-control-point data cost over a `(2·L+1)^3` displacement label space, minimum-spanning-tree **belief-propagation** regularization (`primsMST` + separable squared-L2 `messageDT`), and forward+backward **symmetric inverse-consistent** composition (`consistentMappingCL`). The displacement field warps the moving volume as `corrected(p) = moving(p + field(p))`.
+
+| Aspect | Detail |
+|--------|--------|
+| Output | Warped corrected BigTIFF volumes for the ROI (a dense field per channel, applied with sub-voxel interpolation) |
+| Best for | Local, spatially-varying misalignment that a single translation leaves behind |
+| Scope (v1) | ROI / downsampled volumes held in RAM; runs on CPU. Native full-size slab+halo streaming warp and the GPU path are planned follow-ups |
+| Fidelity | Faithful to the reference apart from the inherited descriptor deviation (float32 `exp(-x)` MIND-SSC + SSD instead of quantised popcount Hamming), and no affine pre-stage — assumes roughly pre-aligned inputs |
+
+On synthetic data with a known smooth deformation, the full schedule reduces fixed↔moving SSD by ~98%. Because it solves a per-voxel field over a multi-level label search, it is substantially slower than the translation methods (tens of seconds for a modest ROI on CPU) — it is an export-time correction, not an interactive one.
+
 ## GPU Acceleration
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.

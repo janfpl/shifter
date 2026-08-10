@@ -15,6 +15,11 @@ from shifter.registration.mutual_information_brent import (
 from shifter.registration.cross_correlation import ZNCCRegistration
 from shifter.registration.deeds import DeedsRegistration, mind_ssc
 from shifter.registration.deeds_brent import DeedsBrentRegistration
+from shifter.registration.deeds_deformable import (
+    DeformableResult,
+    register_deformable,
+    warp_corrected,
+)
 from shifter.registration.preprocessing import preprocess
 from shifter.registration.confidence import (
     CONFIDENCE_HIGH,
@@ -51,6 +56,9 @@ __all__ = [
     "ZNCCRegistration",
     "DeedsRegistration",
     "DeedsBrentRegistration",
+    "DeformableResult",
+    "register_deformable",
+    "warp_corrected",
     "mind_ssc",
     "preprocess",
     "ALGORITHM_REGISTRY",
