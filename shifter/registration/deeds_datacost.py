@@ -79,8 +79,15 @@ def data_cost(
     # valid because step % skip == 0).
     fixed_s = desc_fixed[:, :cz:skip, :cy:skip, :cx:skip]
 
-    maxsamp = sb ** 3
-    alpha1 = 0.5 * (step / (alpha * quant)) / maxsamp * data_scale
+    # Data-vs-regularizer weight. The reference sums the popcount over the
+    # sampled block voxels and divides once by maxsamp (== the sample count) via
+    # alpha1, i.e. a mean over samples. We take that mean directly with
+    # ``.mean(...)`` below, so alpha1 must NOT divide by maxsamp again — doing so
+    # would underweight the data term by (step/skip)^3, and by a *different*
+    # factor at every level (since skip varies), breaking the reference's uniform
+    # balance. ``data_scale`` then rescales the SSD magnitude to the popcount
+    # range ALPHA was tuned for.
+    alpha1 = 0.5 * (step / (alpha * quant)) * data_scale
 
     costall = xp.empty((num_cp, L, L, L), dtype=xp.float32)
     for a0 in range(L):

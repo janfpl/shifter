@@ -368,6 +368,21 @@ class RegistrationWorker(QThread):
         return results
 
 
+def _deformable_output_name(filename: str) -> str:
+    """Output filename for a deformably-corrected channel — always ``.tif``.
+
+    Strips a known input extension (``.lux.h5``, ``.h5``, ``.tiff``, ``.tif``) and
+    appends ``_deformable_roi.tif``, since the deformable path writes BigTIFF
+    regardless of the input format.
+    """
+    base = filename
+    for ext in (".lux.h5", ".h5", ".tiff", ".tif"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    return f"{base}_deformable_roi.tif"
+
+
 class DeformableExportWorker(QThread):
     """Background thread for deformable (deedsBCV) ROI export.
 
@@ -2169,10 +2184,28 @@ class ChromaticShiftWidget(QWidget):
                 "rectangle and set the Z range first.",
             )
             return
+        y_start, y_end, x_start, x_end = bounds
         z_start = self.spin_z_start.value()
         z_end = self.spin_z_end.value() + 1  # inclusive → exclusive
         if z_end <= z_start:
             QMessageBox.warning(self, "Invalid Z", "Z end must be > Z start.")
+            return
+
+        # The deformable solver needs an ROI at least 2x the coarsest grid
+        # spacing per axis (including Z); reject small ROIs up front with a clear
+        # message rather than failing deep inside the solver.
+        from shifter.registration.deeds_deformable import GRID_SPACING
+
+        min_size = 2 * max(GRID_SPACING)
+        roi_nz, roi_ny, roi_nx = z_end - z_start, y_end - y_start, x_end - x_start
+        if min(roi_nz, roi_ny, roi_nx) < min_size:
+            QMessageBox.warning(
+                self, "ROI Too Small",
+                f"Deformable registration needs an ROI of at least {min_size} "
+                f"voxels per axis (including the Z range). This ROI is "
+                f"{roi_nx}×{roi_ny}×{roi_nz}.\n\nEnlarge the ROI rectangle or the "
+                "Z range.",
+            )
             return
 
         ref_idx = self.shift_manager.reference_index
@@ -2189,11 +2222,12 @@ class ChromaticShiftWidget(QWidget):
             )
             return
 
-        channel_dicts = self.shift_manager.to_channel_dicts(
-            output_suffix="_deformable_roi"
-        )
+        # Deformable output is always BigTIFF, so force a .tif name regardless of
+        # the input format — otherwise an H5 input would yield a .h5-named file
+        # containing TIFF bytes.
         output_names = {
-            d["channel_index"]: d["filename_corrected"] for d in channel_dicts
+            t.channel_index: _deformable_output_name(t.filename)
+            for t in self.shift_manager.transforms
         }
         existing = [
             output_names[c]

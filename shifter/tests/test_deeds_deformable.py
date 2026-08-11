@@ -214,6 +214,33 @@ def test_integer_pipeline_untouched() -> None:
     }
 
 
+def test_rejects_small_or_mismatched_volumes() -> None:
+    """A too-thin ROI or a shape mismatch raises a clear ValueError up front."""
+    small = np.zeros((10, 40, 40), np.uint16)  # 10 < 2*max(grid spacing)=16
+    try:
+        register_deformable(small, small, levels_params=_FAST)
+        raise AssertionError("small volume did not raise")
+    except ValueError:
+        pass
+
+    a, b = np.zeros((40, 40, 40), np.uint16), np.zeros((40, 40, 32), np.uint16)
+    try:
+        register_deformable(a, b, levels_params=_FAST)
+        raise AssertionError("shape mismatch did not raise")
+    except ValueError:
+        pass
+
+
+def test_warp_corrected_rounds_integer_output() -> None:
+    """Warping by a zero field returns the input exactly (rounded, not floored)."""
+    field = np.zeros((3, 4, 4, 4), np.float32)
+    res = DeformableResult(field=field, volume_shape=(16, 16, 16))
+    vol = (np.random.default_rng(0).random((16, 16, 16)) * 1000 + 0.6).astype(np.uint16)
+    out = warp_corrected(vol, res)
+    assert out.dtype == vol.dtype
+    assert np.array_equal(out, vol), "identity warp changed integer values"
+
+
 def test_full_schedule_recovery_slow() -> None:
     """Opt-in faithful full-schedule run (skipped unless SHIFTER_SLOW_TESTS=1)."""
     import os
@@ -240,6 +267,8 @@ _TESTS = [
     test_gpu_flag_falls_back_to_cpu,
     test_progress_is_monotonic,
     test_integer_pipeline_untouched,
+    test_rejects_small_or_mismatched_volumes,
+    test_warp_corrected_rounds_integer_output,
     test_full_schedule_recovery_slow,
 ]
 

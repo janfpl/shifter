@@ -52,8 +52,11 @@ ALPHA = 1.6
 
 # Rebalances the float32-SSD data cost against the squared-label regularizer,
 # since our descriptor SSD is a different magnitude than the reference popcount
-# Hamming that ALPHA was tuned for. Tuned on synthetic recovery.
-DATA_SCALE = 150.0
+# Hamming that ALPHA was tuned for. Chosen to minimise endpoint error against a
+# known field on *noisy* synthetic data (the min of the data-vs-smoothness
+# trade-off — larger values start fitting noise), which coincides with a strong
+# SSD reduction and a fold-free field.
+DATA_SCALE = 8.0
 
 
 @dataclass
@@ -111,10 +114,27 @@ def register_deformable(
     fixed = xp.asarray(reference_volume, dtype=xp.float32)
     moving = xp.asarray(moving_volume, dtype=xp.float32)
     shape = tuple(int(s) for s in fixed.shape)
+    if fixed.shape != moving.shape:
+        raise ValueError(
+            f"reference and moving volumes must match: {shape} vs "
+            f"{tuple(int(s) for s in moving.shape)}"
+        )
     Z, Y, X = shape
 
     levels = _levels(levels_params)
     n_levels = len(levels)
+
+    # The coarsest control grid needs at least one cell per axis, plus a margin
+    # so the descriptor and block reduction have data to work with. Below this a
+    # zero-size grid would fail obscurely inside prims_graph/regularise.
+    coarsest_step = max(step for step, *_ in levels)
+    min_size = 2 * coarsest_step
+    if min(shape) < min_size:
+        raise ValueError(
+            f"deformable registration needs a volume of at least {min_size} "
+            f"voxels per axis (coarsest grid spacing {coarsest_step}); got {shape}. "
+            "Enlarge the ROI or its Z range."
+        )
 
     def grid_of(step):
         return (Z // step, Y // step, X // step)
@@ -188,4 +208,10 @@ def warp_corrected(moving_volume, result: DeformableResult, use_gpu: bool = Fals
     field_full = upsample_field(xp.asarray(result.field), result.volume_shape, xp)
     warped = warp_volume(xp.asarray(moving_volume), field_full, xp, order=1)
     out = warped.get() if hasattr(warped, "get") else np.asarray(warped)
-    return out.astype(moving_volume.dtype)
+    # Round (not truncate) when writing back to an integer dtype, so trilinear
+    # sampling does not introduce a systematic ~0.5-intensity downward bias.
+    dtype = np.dtype(moving_volume.dtype)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        out = np.clip(np.rint(out), info.min, info.max)
+    return out.astype(dtype)
