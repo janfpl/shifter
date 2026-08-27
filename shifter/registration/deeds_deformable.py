@@ -86,6 +86,27 @@ def _levels(levels_params):
     return list(zip(GRID_SPACING, SEARCH_RADIUS, QUANTISATION, MIND_STEP))
 
 
+def _select_xp(use_gpu: bool):
+    """Return cupy if requested and usable, else numpy."""
+    if use_gpu:
+        try:
+            import cupy as cp
+
+            cp.zeros(1)  # probe: import + a real allocation
+            return cp
+        except Exception as exc:  # pragma: no cover - depends on hardware
+            logger.warning("GPU deformable unavailable (%s); using CPU", exc)
+    return np
+
+
+def _free_gpu(xp) -> None:
+    if xp is not np:  # pragma: no cover - depends on hardware
+        try:
+            xp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+
 def register_deformable(
     reference_volume: np.ndarray,
     moving_volume: np.ndarray,
@@ -98,33 +119,22 @@ def register_deformable(
 ) -> DeformableResult:
     """Solve the deformable field aligning *moving* to *reference*.
 
-    Returns a :class:`DeformableResult`; use :func:`warp_corrected` to obtain the
-    corrected volume.
+    Descriptors, data cost and warping run on ``xp`` (cupy when *use_gpu* and a
+    GPU is available, else numpy); the MST regularizer always runs on the host.
+    If the GPU path fails at any point (e.g. out of memory), the whole solve is
+    retried on CPU. Returns a :class:`DeformableResult`; use
+    :func:`warp_corrected` to obtain the corrected volume.
     """
-    xp = np
-    if use_gpu:
-        try:
-            import cupy as cp
-
-            cp.zeros(1)  # probe
-            xp = cp
-        except Exception as exc:  # pragma: no cover - depends on hardware
-            logger.warning("GPU deformable unavailable (%s); using CPU", exc)
-            xp = np
-
-    fixed = xp.asarray(reference_volume, dtype=xp.float32)
-    moving = xp.asarray(moving_volume, dtype=xp.float32)
-    shape = tuple(int(s) for s in fixed.shape)
-    if fixed.shape != moving.shape:
+    ref_host = np.ascontiguousarray(reference_volume, dtype=np.float32)
+    mov_host = np.ascontiguousarray(moving_volume, dtype=np.float32)
+    shape = tuple(int(s) for s in ref_host.shape)
+    if ref_host.shape != mov_host.shape:
         raise ValueError(
             f"reference and moving volumes must match: {shape} vs "
-            f"{tuple(int(s) for s in moving.shape)}"
+            f"{tuple(int(s) for s in mov_host.shape)}"
         )
-    Z, Y, X = shape
 
     levels = _levels(levels_params)
-    n_levels = len(levels)
-
     # The coarsest control grid needs at least one cell per axis, plus a margin
     # so the descriptor and block reduction have data to work with. Below this a
     # zero-size grid would fail obscurely inside prims_graph/regularise.
@@ -137,11 +147,35 @@ def register_deformable(
             "Enlarge the ROI or its Z range."
         )
 
+    xp = _select_xp(use_gpu)
+    if xp is not np:
+        try:
+            field = _solve(xp, ref_host, mov_host, shape, levels, data_scale,
+                           alpha, progress_callback)
+            return DeformableResult(field=field, volume_shape=shape)
+        except Exception as exc:  # pragma: no cover - depends on hardware
+            logger.warning("GPU deformable failed (%s); falling back to CPU", exc)
+            _free_gpu(xp)
+
+    field = _solve(np, ref_host, mov_host, shape, levels, data_scale,
+                   alpha, progress_callback)
+    return DeformableResult(field=field, volume_shape=shape)
+
+
+def _solve(xp, ref_host, mov_host, shape, levels, data_scale, alpha,
+           progress_callback):
+    """Run the multi-level symmetric solve with array module *xp*; return the
+    host (numpy) forward field ``(3, gz, gy, gx)`` at the finest grid."""
+    Z, Y, X = shape
+    n_levels = len(levels)
+
+    fixed = xp.asarray(ref_host, dtype=xp.float32)
+    moving = xp.asarray(mov_host, dtype=xp.float32)
+
     def grid_of(step):
         return (Z // step, Y // step, X // step)
 
-    # Forward (uf) and backward (ub) control-grid fields, initialised at the
-    # coarsest grid as zeros.
+    # Forward (uf) and backward (ub) control-grid fields, at the coarsest grid.
     g0 = grid_of(levels[0][0])
     uf = xp.zeros((3,) + g0, dtype=xp.float32)
     ub = xp.zeros((3,) + g0, dtype=xp.float32)
@@ -191,25 +225,31 @@ def register_deformable(
         # ---- inverse-consistent symmetric composition ---------------------
         uf, ub = compose_consistent(uf, ub, step, xp)
 
+        _free_gpu(xp)
         level_timer.__exit__(None, None, None)
 
         if progress_callback is not None:
             progress_callback((li + 1) / n_levels)
 
-    return DeformableResult(field=to_host(uf), volume_shape=shape)
+    return to_host(uf)
 
 
 def warp_corrected(moving_volume, result: DeformableResult, use_gpu: bool = False):
-    """Warp *moving_volume* by the solved field, returning the corrected volume."""
-    xp = np
-    if use_gpu:
-        try:
-            import cupy as cp
+    """Warp *moving_volume* by the solved field, returning the corrected volume.
 
-            cp.zeros(1)
-            xp = cp
-        except Exception:  # pragma: no cover
-            xp = np
+    Uses the GPU when *use_gpu* and available, falling back to CPU on any error.
+    """
+    xp = _select_xp(use_gpu)
+    if xp is not np:
+        try:
+            return _warp_with(xp, moving_volume, result)
+        except Exception as exc:  # pragma: no cover - depends on hardware
+            logger.warning("GPU warp failed (%s); using CPU", exc)
+            _free_gpu(xp)
+    return _warp_with(np, moving_volume, result)
+
+
+def _warp_with(xp, moving_volume, result: DeformableResult):
     field_full = upsample_field(xp.asarray(result.field), result.volume_shape, xp)
     warped = warp_volume(xp.asarray(moving_volume), field_full, xp, order=1)
     out = warped.get() if hasattr(warped, "get") else np.asarray(warped)

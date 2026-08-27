@@ -493,6 +493,121 @@ class DeformableExportWorker(QThread):
         self.progress.emit(total * scale, total * scale, "Deformable export complete.")
 
 
+class DeformablePreviewWorker(QThread):
+    """Background thread that deformably corrects the ROI for in-viewer preview.
+
+    Solves the dense field per selected channel and warps the raw ROI sub-volume,
+    but writes nothing — it returns the corrected sub-volumes so the widget can
+    add them as napari layers for visual QC before a full deformable export.
+    """
+
+    progress = Signal(int, int, str)  # (done, total, description) scaled by 100
+    # Emits (layers, translate): layers is a list of (name, ndarray, colormap);
+    # translate is the (z, y, x) ROI origin.
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        loaders: list[Any],
+        reference_index: int,
+        channels_to_register: list[int],
+        roi_bounds: tuple[int, int, int, int],
+        z_start: int,
+        z_end: int,
+        background_subtraction: bool,
+        gaussian_smoothing: bool,
+        use_gpu: bool,
+        colormaps: dict[int, str],
+        filenames: dict[int, str],
+    ) -> None:
+        super().__init__()
+        self.loaders = loaders
+        self.reference_index = reference_index
+        self.channels_to_register = channels_to_register
+        self.roi_bounds = roi_bounds
+        self.z_start = z_start
+        self.z_end = z_end
+        self.background_subtraction = background_subtraction
+        self.gaussian_smoothing = gaussian_smoothing
+        self.use_gpu = use_gpu
+        self.colormaps = colormaps
+        self.filenames = filenames
+
+    def run(self) -> None:
+        try:
+            payload = self._compute()
+            release_memory(use_gpu=self.use_gpu, context="deformable preview")
+            self.finished.emit(payload)
+        except Exception:
+            release_memory(use_gpu=self.use_gpu, context="deformable preview (error)")
+            self.error.emit(traceback.format_exc())
+
+    def _compute(self):
+        from shifter.registration.deeds_deformable import (
+            register_deformable,
+            warp_corrected,
+        )
+
+        y0, y1, x0, x1 = self.roi_bounds
+        scale = 100
+
+        def sub(ch_i):
+            return extract_subvolume(
+                self.loaders[ch_i].dask_array,
+                self.z_start, self.z_end, y0, y1, x0, x1,
+            )
+
+        ref_raw = sub(self.reference_index)
+        ref_pp = preprocess(
+            ref_raw,
+            background_subtraction=self.background_subtraction,
+            gaussian_smoothing=self.gaussian_smoothing,
+            use_gpu=self.use_gpu,
+        )
+
+        # The reference channel (uncorrected) is shown for comparison.
+        layers = [
+            (
+                f"{self.filenames[self.reference_index]}_deformable_ref",
+                ref_raw,
+                self.colormaps.get(self.reference_index, "gray"),
+            )
+        ]
+
+        total = len(self.channels_to_register) + 1
+        for done, ch_i in enumerate(self.channels_to_register, start=1):
+            self.progress.emit(
+                done * scale, total * scale,
+                f"Deformable preview channel {ch_i}...",
+            )
+            mov_raw = sub(ch_i)
+            mov_pp = preprocess(
+                mov_raw,
+                background_subtraction=self.background_subtraction,
+                gaussian_smoothing=self.gaussian_smoothing,
+                use_gpu=self.use_gpu,
+            )
+            result = register_deformable(
+                ref_pp, mov_pp, use_gpu=self.use_gpu,
+                progress_callback=lambda f, d=done: self.progress.emit(
+                    int((d - 1 + f) * scale), total * scale,
+                    f"Deformable preview channel {ch_i}...",
+                ),
+            )
+            corrected = warp_corrected(mov_raw, result, use_gpu=self.use_gpu)
+            layers.append(
+                (
+                    f"{self.filenames[ch_i]}_deformable_preview",
+                    corrected,
+                    self.colormaps.get(ch_i, "green"),
+                )
+            )
+
+        self.progress.emit(total * scale, total * scale, "Deformable preview complete.")
+        return layers, (self.z_start, y0, x0)
+
+
 class ChromaticShiftWidget(QWidget):
     """Docked widget providing the full chromatic-shift-correction workflow."""
 
@@ -506,6 +621,7 @@ class ChromaticShiftWidget(QWidget):
         self._export_worker: ExportWorker | None = None
         self._registration_worker: RegistrationWorker | None = None
         self._deformable_worker: DeformableExportWorker | None = None
+        self._deformable_preview_worker: DeformablePreviewWorker | None = None
 
         # Per-channel confidence scores (channel_index -> confidence float).
         self._confidence_scores: dict[int, float] = {}
@@ -901,9 +1017,18 @@ class ChromaticShiftWidget(QWidget):
         self.btn_export.clicked.connect(self._on_export)
         lay.addWidget(self.btn_export)
 
-        # Deformable (deedsBCV) ROI export — a separate path that solves a dense
-        # sub-voxel displacement field and warps the ROI, rather than applying a
-        # single integer shift. Writes BigTIFF; does not affect the shift table.
+        # Deformable (deedsBCV) ROI path — solves a dense sub-voxel displacement
+        # field and warps the ROI, rather than applying a single integer shift.
+        # "Preview" shows the corrected ROI as napari layers (nothing written);
+        # "Export" writes corrected BigTIFF. Neither affects the shift table.
+        self.btn_preview_deformable = QPushButton("Preview Deformable (deedsBCV, ROI)")
+        self.btn_preview_deformable.setToolTip(
+            "Deformably correct the drawn ROI for the registration-selected "
+            "channels and show the result as napari layers (nothing is written)."
+        )
+        self.btn_preview_deformable.clicked.connect(self._on_preview_deformable)
+        lay.addWidget(self.btn_preview_deformable)
+
         self.btn_export_deformable = QPushButton("Export Deformable (deedsBCV, ROI)")
         self.btn_export_deformable.setToolTip(
             "Dense sub-voxel deformable correction of the drawn ROI for the "
@@ -2164,36 +2289,32 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_progress.setVisible(False)
         QMessageBox.critical(self, "Export Error", f"Export failed:\n{tb}")
 
-    # ---- Deformable (deedsBCV) ROI export ---------------------------- #
+    # ---- Deformable (deedsBCV) ROI preview + export ------------------ #
 
-    def _on_export_deformable(self) -> None:
+    def _validate_deformable_roi(self):
+        """Shared pre-flight for the deformable preview/export actions.
+
+        Returns ``(bounds, z_start, z_end, ref_idx, channels)`` or ``None`` if a
+        validation dialog was shown.
+        """
         if not self.loaders:
             QMessageBox.warning(self, "No Data", "Load data first.")
-            return
-        outdir = self.lbl_outdir.text().strip()
-        if not outdir:
-            QMessageBox.warning(self, "No Output Dir", "Select an output directory.")
-            return
-        outdir_path = Path(outdir)
-
+            return None
         bounds = self._get_roi_bounds()
         if bounds is None:
             QMessageBox.warning(
                 self, "No ROI",
-                "Deformable export operates on a drawn ROI. Draw an ROI "
+                "Deformable registration operates on a drawn ROI. Draw an ROI "
                 "rectangle and set the Z range first.",
             )
-            return
+            return None
         y_start, y_end, x_start, x_end = bounds
         z_start = self.spin_z_start.value()
         z_end = self.spin_z_end.value() + 1  # inclusive → exclusive
         if z_end <= z_start:
             QMessageBox.warning(self, "Invalid Z", "Z end must be > Z start.")
-            return
+            return None
 
-        # The deformable solver needs an ROI at least 2x the coarsest grid
-        # spacing per axis (including Z); reject small ROIs up front with a clear
-        # message rather than failing deep inside the solver.
         from shifter.registration.deeds_deformable import GRID_SPACING
 
         min_size = 2 * max(GRID_SPACING)
@@ -2206,13 +2327,12 @@ class ChromaticShiftWidget(QWidget):
                 f"{roi_nx}×{roi_ny}×{roi_nz}.\n\nEnlarge the ROI rectangle or the "
                 "Z range.",
             )
-            return
+            return None
 
         ref_idx = self.shift_manager.reference_index
         if ref_idx is None:
             QMessageBox.warning(self, "No Reference", "No reference channel set.")
-            return
-
+            return None
         channels = [ch for ch, chk in self._reg_channel_checkboxes if chk.isChecked()]
         if not channels:
             QMessageBox.warning(
@@ -2220,7 +2340,78 @@ class ChromaticShiftWidget(QWidget):
                 "Select at least one channel (in Auto-Registration) to correct "
                 "deformably.",
             )
+            return None
+        return bounds, z_start, z_end, ref_idx, channels
+
+    def _on_preview_deformable(self) -> None:
+        validated = self._validate_deformable_roi()
+        if validated is None:
             return
+        bounds, z_start, z_end, ref_idx, channels = validated
+
+        # Clear any existing preview layers so the deformable preview is distinct.
+        self._on_clear_preview()
+
+        self._set_ui_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.lbl_progress.setVisible(True)
+        self.lbl_progress.setText("Starting deformable preview...")
+
+        colormaps = {t.channel_index: t.colormap for t in self.shift_manager.transforms}
+        filenames = {t.channel_index: t.filename for t in self.shift_manager.transforms}
+
+        self._deformable_preview_worker = DeformablePreviewWorker(
+            loaders=self.loaders,
+            reference_index=ref_idx,
+            channels_to_register=channels,
+            roi_bounds=bounds,
+            z_start=z_start,
+            z_end=z_end,
+            background_subtraction=self.chk_bg_sub.isChecked(),
+            gaussian_smoothing=self.chk_gaussian.isChecked(),
+            use_gpu=gpu_available(),
+            colormaps=colormaps,
+            filenames=filenames,
+        )
+        self._deformable_preview_worker.progress.connect(self._on_deformable_progress)
+        self._deformable_preview_worker.finished.connect(
+            self._on_deformable_preview_finished
+        )
+        self._deformable_preview_worker.error.connect(self._on_deformable_error)
+        self._deformable_preview_worker.start()
+
+    def _on_deformable_preview_finished(self, payload) -> None:
+        self._set_ui_enabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_progress.setVisible(False)
+
+        layers, translate = payload
+        for name, array, colormap in layers:
+            self._preview_layer_names.append(name)
+            layer = self.viewer.add_image(
+                array,
+                name=name,
+                colormap=colormap,
+                blending="additive",
+                translate=translate,
+                visible=True,
+            )
+            layer.reset_contrast_limits()
+
+    # ---- Deformable (deedsBCV) ROI export ---------------------------- #
+
+    def _on_export_deformable(self) -> None:
+        outdir = self.lbl_outdir.text().strip()
+        if not outdir:
+            QMessageBox.warning(self, "No Output Dir", "Select an output directory.")
+            return
+        outdir_path = Path(outdir)
+
+        validated = self._validate_deformable_roi()
+        if validated is None:
+            return
+        bounds, z_start, z_end, ref_idx, channels = validated
 
         # Deformable output is always BigTIFF, so force a .tif name regardless of
         # the input format — otherwise an H5 input would yield a .h5-named file
@@ -2250,8 +2441,8 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_progress.setVisible(True)
         self.lbl_progress.setText("Starting deformable export...")
 
-        # v1 runs on CPU (the GPU path is not yet hardware-validated); the solver
-        # itself supports use_gpu once verified.
+        # GPU is used when available; the solver falls back to CPU per-op on any
+        # failure (e.g. out of memory), so enabling it here is safe.
         self._deformable_worker = DeformableExportWorker(
             loaders=self.loaders,
             reference_index=ref_idx,
@@ -2261,7 +2452,7 @@ class ChromaticShiftWidget(QWidget):
             z_end=z_end,
             background_subtraction=self.chk_bg_sub.isChecked(),
             gaussian_smoothing=self.chk_gaussian.isChecked(),
-            use_gpu=False,
+            use_gpu=gpu_available(),
             output_dir=outdir_path,
             output_names=output_names,
         )
@@ -2304,6 +2495,7 @@ class ChromaticShiftWidget(QWidget):
             self.btn_clear_preview,
             self.btn_select_outdir,
             self.btn_export,
+            self.btn_preview_deformable,
             self.btn_export_deformable,
             self.slider_ram,
             self.chk_write_pyramids,

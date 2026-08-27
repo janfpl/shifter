@@ -274,7 +274,10 @@ Included mainly to complete the pairing of both similarity metrics (mutual infor
 
 The six algorithms above all estimate a single **global integer translation** per channel. For **local, non-rigid** chromatic distortion that a global shift cannot correct, there is a separate **deformable** path: a faithful numpy/cupy port of the full deedsBCV algorithm that solves a dense, sub-voxel **displacement field** and warps the moving channel with trilinear interpolation.
 
-It is deliberately kept **off** the integer transform model — the shift table, the manual spin boxes, and the normal "Apply & Export" all stay integer-only and untouched. Instead, a dedicated **"Export Deformable (deedsBCV, ROI)"** button in the Export section runs the deformable solver on the drawn ROI for the registration-selected channels and writes corrected BigTIFF volumes directly (the reference and unselected channels are written unchanged).
+It is deliberately kept **off** the integer transform model — the shift table, the manual spin boxes, and the normal "Apply & Export" all stay integer-only and untouched. Two dedicated buttons in the Export section drive it for the registration-selected channels over the drawn ROI:
+
+- **"Preview Deformable (deedsBCV, ROI)"** solves the field and adds the corrected ROI channels to the napari viewer as layers (nothing is written), for visual QC — the reference channel is shown alongside for comparison.
+- **"Export Deformable (deedsBCV, ROI)"** does the same solve and writes corrected BigTIFF volumes directly (the reference and unselected channels are written unchanged; output is always `.tif`, even for H5 inputs).
 
 The solver ports the reference pipeline (`deedsBCV0.cpp`): a 5-level control-point grid (`grid_spacing = 8,7,6,5,4`), MIND-SSC descriptors, a discrete per-control-point data cost over a `(2·L+1)^3` displacement label space, minimum-spanning-tree **belief-propagation** regularization (`primsMST` + separable squared-L2 `messageDT`), and forward+backward **symmetric inverse-consistent** composition (`consistentMappingCL`). The displacement field warps the moving volume as `corrected(p) = moving(p + field(p))`.
 
@@ -282,7 +285,7 @@ The solver ports the reference pipeline (`deedsBCV0.cpp`): a 5-level control-poi
 |--------|--------|
 | Output | Warped corrected BigTIFF volumes for the ROI (a dense field per channel, applied with sub-voxel interpolation) |
 | Best for | Local, spatially-varying misalignment that a single translation leaves behind |
-| Scope (v1) | ROI / downsampled volumes held in RAM; runs on CPU. Native full-size slab+halo streaming warp and the GPU path are planned follow-ups |
+| Scope (v1) | ROI / downsampled volumes held in RAM. Uses the GPU (CuPy) when available with automatic per-solve CPU fallback. Native full-size slab+halo streaming warp is a planned follow-up |
 | Fidelity | Faithful to the reference apart from the inherited descriptor deviation (float32 `exp(-x)` MIND-SSC + SSD instead of quantised popcount Hamming), and no affine pre-stage — assumes roughly pre-aligned inputs |
 
 On synthetic data with a known smooth deformation, the full schedule reduces fixed↔moving SSD by ~98%. Because it solves a per-voxel field over a multi-level label search, it is substantially slower than the translation methods (tens of seconds for a modest ROI on CPU) — it is an export-time correction, not an interactive one.
