@@ -44,6 +44,7 @@ from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
 )
+from shifter.registration.timing import note, phase
 from shifter.registration.mutual_information import (
     _MI_BINS,
     _COARSE_STEP,
@@ -131,46 +132,56 @@ class MutualInformationBrentRegistration(RegistrationAlgorithm):
         sr_xy, sr_z = search_range_xy, search_range_z
 
         # ---- coarse grid pass: locate the basin ------------------------
-        seed, mi_values = self._coarse_seed(
-            ref, mov, sr_xy, sr_z, progress_callback
-        )
+        with phase(f"{ALGORITHM_NAME} coarse seed"):
+            seed, mi_values = self._coarse_seed(
+                ref, mov, sr_xy, sr_z, progress_callback
+            )
 
         # ---- Brent refinement: cyclic per-axis line search -------------
+        # Each objective evaluation computes a full-overlap mutual-information
+        # histogram (single-threaded numpy) plus a sub-voxel interpolation, so on
+        # a large ROI this refinement — not the (numba-parallel) coarse seed —
+        # dominates. The eval count and timing are logged to make that visible.
         cur = [float(seed[0]), float(seed[1]), float(seed[2])]
         limits = (sr_z, sr_xy, sr_xy)
+        n_evals = 0
 
-        for sweep in range(_MAX_SWEEPS):
-            prev = list(cur)
-            for axis in range(3):
-                lo = max(-limits[axis], cur[axis] - _BRENT_RADIUS)
-                hi = min(limits[axis], cur[axis] + _BRENT_RADIUS)
-                if hi - lo < 1e-3:
-                    continue
+        with phase(f"{ALGORITHM_NAME} Brent refine"):
+            for sweep in range(_MAX_SWEEPS):
+                prev = list(cur)
+                for axis in range(3):
+                    lo = max(-limits[axis], cur[axis] - _BRENT_RADIUS)
+                    hi = min(limits[axis], cur[axis] + _BRENT_RADIUS)
+                    if hi - lo < 1e-3:
+                        continue
 
-                def objective(x: float, axis: int = axis) -> float:
-                    trial = list(cur)
-                    trial[axis] = x
-                    val = _neg_mi_continuous(ref, mov, trial[0], trial[1], trial[2])
-                    if val < _INVALID:
-                        mi_values.append(-val)
-                    return val
+                    def objective(x: float, axis: int = axis) -> float:
+                        nonlocal n_evals
+                        n_evals += 1
+                        trial = list(cur)
+                        trial[axis] = x
+                        val = _neg_mi_continuous(ref, mov, trial[0], trial[1], trial[2])
+                        if val < _INVALID:
+                            mi_values.append(-val)
+                        return val
 
-                res = minimize_scalar(
-                    objective,
-                    bounds=(lo, hi),
-                    method="bounded",
-                    options={"xatol": _BRENT_XATOL, "maxiter": _BRENT_MAXITER},
+                    res = minimize_scalar(
+                        objective,
+                        bounds=(lo, hi),
+                        method="bounded",
+                        options={"xatol": _BRENT_XATOL, "maxiter": _BRENT_MAXITER},
+                    )
+                    if np.isfinite(res.fun) and res.fun < _INVALID:
+                        cur[axis] = float(res.x)
+
+                _report(
+                    progress_callback,
+                    0.5 + 0.5 * (sweep + 1) / _MAX_SWEEPS,
                 )
-                if np.isfinite(res.fun) and res.fun < _INVALID:
-                    cur[axis] = float(res.x)
+                if max(abs(cur[i] - prev[i]) for i in range(3)) < _CONVERGE_TOL:
+                    break
 
-            _report(
-                progress_callback,
-                0.5 + 0.5 * (sweep + 1) / _MAX_SWEEPS,
-            )
-            if max(abs(cur[i] - prev[i]) for i in range(3)) < _CONVERGE_TOL:
-                break
-
+        note(f"{ALGORITHM_NAME}: {n_evals} MI objective evaluations")
         _report(progress_callback, 1.0)
 
         # ---- round to the integer-shift model --------------------------

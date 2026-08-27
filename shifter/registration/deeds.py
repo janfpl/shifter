@@ -60,6 +60,7 @@ from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
 )
+from shifter.registration.timing import phase
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,9 @@ class DeedsRegistration(RegistrationAlgorithm):
             f0 = level / n_levels
             f1 = (level + 1) / n_levels
 
+            level_timer = phase(f"{ALGORITHM_NAME} level {level} (factor {factor})")
+            level_timer.__enter__()
+
             ref_level = _downsample(ref, factor, xp)
             mov_level = _downsample(mov, factor, xp)
             desc_ref = mind_ssc(ref_level, self.quantisation_step, xp)
@@ -423,6 +427,8 @@ class DeedsRegistration(RegistrationAlgorithm):
             del desc_ref, desc_mov, ref_level, mov_level
             if xp is not np:
                 xp.get_default_memory_pool().free_all_blocks()
+
+            level_timer.__exit__(None, None, None)
 
         _report(progress_callback, 1.0)
 

@@ -46,6 +46,7 @@ from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
 )
+from shifter.registration.timing import note, phase
 from shifter.registration.deeds import (
     DeedsRegistration,
     _build_shifts,
@@ -146,13 +147,15 @@ class DeedsBrentRegistration(RegistrationAlgorithm):
         limits_full = (sr_z, sr_xy, sr_xy)
 
         # ---- coarse seed on the coarsest pyramid level -----------------
-        seed, coarse_costs, factor = self._coarse_seed(
-            ref, mov, sr_xy, sr_z, qs, progress_callback
-        )
+        with phase(f"{ALGORITHM_NAME} coarse seed"):
+            seed, coarse_costs, factor = self._coarse_seed(
+                ref, mov, sr_xy, sr_z, qs, progress_callback
+            )
 
         # ---- full-resolution descriptors -------------------------------
-        desc_ref = mind_ssc(ref, qs, np)
-        desc_mov = mind_ssc(mov, qs, np)
+        with phase(f"{ALGORITHM_NAME} full-res descriptors"):
+            desc_ref = mind_ssc(ref, qs, np)
+            desc_mov = mind_ssc(mov, qs, np)
         shape = tuple(int(s) for s in ref.shape)
 
         # Brent may nudge the reference sample by up to this many voxels.
@@ -172,7 +175,11 @@ class DeedsBrentRegistration(RegistrationAlgorithm):
         mov_samples = np.stack([desc_mov[c][bz, by, bx] for c in range(_N_DESCRIPTORS)])
         seed_col = np.asarray(seed, dtype=np.float64)[:, None]
 
+        n_evals = 0
+
         def cost(delta: tuple[float, float, float]) -> float:
+            nonlocal n_evals
+            n_evals += 1
             coords = base + seed_col + np.asarray(delta, dtype=np.float64)[:, None]
             total = 0.0
             for c in range(_N_DESCRIPTORS):
@@ -185,34 +192,36 @@ class DeedsBrentRegistration(RegistrationAlgorithm):
 
         # ---- Brent refinement: cyclic per-axis line search -------------
         cur = [0.0, 0.0, 0.0]  # residual delta around the seed
-        for sweep in range(_MAX_SWEEPS):
-            prev = list(cur)
-            for axis in range(3):
-                # Bound the residual so the total shift (seed + delta) stays in
-                # the search range, and within the interpolation radius.
-                lo = max(-radius, -limits_full[axis] - seed[axis])
-                hi = min(radius, limits_full[axis] - seed[axis])
-                if hi - lo < 1e-3:
-                    continue
+        with phase(f"{ALGORITHM_NAME} Brent refine"):
+            for sweep in range(_MAX_SWEEPS):
+                prev = list(cur)
+                for axis in range(3):
+                    # Bound the residual so the total shift (seed + delta) stays
+                    # in the search range, and within the interpolation radius.
+                    lo = max(-radius, -limits_full[axis] - seed[axis])
+                    hi = min(radius, limits_full[axis] - seed[axis])
+                    if hi - lo < 1e-3:
+                        continue
 
-                def objective(x: float, axis: int = axis) -> float:
-                    trial = list(cur)
-                    trial[axis] = x
-                    return cost(trial)
+                    def objective(x: float, axis: int = axis) -> float:
+                        trial = list(cur)
+                        trial[axis] = x
+                        return cost(trial)
 
-                res = minimize_scalar(
-                    objective,
-                    bounds=(lo, hi),
-                    method="bounded",
-                    options={"xatol": _BRENT_XATOL, "maxiter": _BRENT_MAXITER},
-                )
-                if np.isfinite(res.fun):
-                    cur[axis] = float(res.x)
+                    res = minimize_scalar(
+                        objective,
+                        bounds=(lo, hi),
+                        method="bounded",
+                        options={"xatol": _BRENT_XATOL, "maxiter": _BRENT_MAXITER},
+                    )
+                    if np.isfinite(res.fun):
+                        cur[axis] = float(res.x)
 
-            _report(progress_callback, 0.4 + 0.6 * (sweep + 1) / _MAX_SWEEPS)
-            if max(abs(cur[i] - prev[i]) for i in range(3)) < _CONVERGE_TOL:
-                break
+                _report(progress_callback, 0.4 + 0.6 * (sweep + 1) / _MAX_SWEEPS)
+                if max(abs(cur[i] - prev[i]) for i in range(3)) < _CONVERGE_TOL:
+                    break
 
+        note(f"{ALGORITHM_NAME}: {n_evals} descriptor-cost evaluations")
         _report(progress_callback, 1.0)
 
         best_cost = cost(cur)

@@ -38,6 +38,7 @@ from shifter.registration.deeds_field import (
     compose_consistent,
 )
 from shifter.registration.deeds_mst import prims_graph, regularise
+from shifter.registration.timing import phase
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ def register_deformable(
         return a.get() if hasattr(a, "get") else np.asarray(a)
 
     for li, (step, hw, quant, mstep) in enumerate(levels):
+        level_timer = phase(f"{ALGORITHM_NAME} level {li} (grid {step}, radius {hw})")
+        level_timer.__enter__()
         g = grid_of(step)
         desc_fix, desc_mov = descriptors(mstep)
 
@@ -187,6 +190,8 @@ def register_deformable(
 
         # ---- inverse-consistent symmetric composition ---------------------
         uf, ub = compose_consistent(uf, ub, step, xp)
+
+        level_timer.__exit__(None, None, None)
 
         if progress_callback is not None:
             progress_callback((li + 1) / n_levels)
