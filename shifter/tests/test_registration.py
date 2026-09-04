@@ -1,5 +1,7 @@
 """Validation script for auto-registration algorithms.
 
+Covers every algorithm in ``ALGORITHM_REGISTRY``.
+
 Generates synthetic 3-channel test volumes with **known shifts**, runs each
 registration algorithm, and verifies that the detected shifts match the
 ground truth exactly (integer-shift accuracy).
@@ -158,7 +160,10 @@ def run_validation() -> bool:
     algorithms = [
         ("Phase Cross-Correlation", PhaseCorrelation(normalization=None)),
         ("Mutual Information", ALGORITHM_REGISTRY["Mutual Information"]()),
+        ("Mutual Information (Brent)", ALGORITHM_REGISTRY["Mutual Information (Brent)"]()),
         ("Zero-Normalized Cross-Correlation", ALGORITHM_REGISTRY["Zero-Normalized Cross-Correlation"]()),
+        ("deedsBCV (MIND-SSC)", ALGORITHM_REGISTRY["deedsBCV (MIND-SSC)"]()),
+        ("deedsBCV (MIND-SSC, Brent)", ALGORITHM_REGISTRY["deedsBCV (MIND-SSC, Brent)"]()),
     ]
 
     for algo_name, algo in algorithms:

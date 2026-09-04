@@ -15,6 +15,7 @@ from shifter.registration.base import (
     RegistrationAlgorithm,
     RegistrationResult,
 )
+from shifter.registration.timing import note, phase
 
 logger = logging.getLogger(__name__)
 
@@ -379,9 +380,10 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         """Numba-accelerated parallel coarse-to-fine MI search."""
         # ---- coarse pass (parallel, batched for progress) --------------
         coarse_shifts = _build_shifts_array(sr_xy, sr_z, _COARSE_STEP)
-        coarse_mi = _grid_search_batched(
-            ref, mov, coarse_shifts, _MI_BINS, progress_callback, 0.0, 0.5
-        )
+        with phase(f"{ALGORITHM_NAME} coarse pass ({coarse_shifts.shape[0]} shifts)"):
+            coarse_mi = _grid_search_batched(
+                ref, mov, coarse_shifts, _MI_BINS, progress_callback, 0.0, 0.5
+            )
 
         best_idx = int(np.argmax(coarse_mi))
         best_shift = (
@@ -395,9 +397,10 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         fine_shifts = _build_fine_shifts_array(best_shift, fine_radius, sr_xy, sr_z)
 
         if fine_shifts.shape[0] > 0:
-            fine_mi = _grid_search_batched(
-                ref, mov, fine_shifts, _MI_BINS, progress_callback, 0.5, 1.0
-            )
+            with phase(f"{ALGORITHM_NAME} fine pass ({fine_shifts.shape[0]} shifts)"):
+                fine_mi = _grid_search_batched(
+                    ref, mov, fine_shifts, _MI_BINS, progress_callback, 0.5, 1.0
+                )
             fine_best_idx = int(np.argmax(fine_mi))
             best_shift = (
                 int(fine_shifts[fine_best_idx, 0]),
@@ -431,13 +434,18 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         progress_callback: ProgressCallback | None = None,
     ) -> RegistrationResult:
         """Pure-numpy serial fallback (no numba)."""
+        note(f"{ALGORITHM_NAME}: running the serial numpy fallback (numba not "
+             "available) — install numba for a large parallel speed-up")
         # ---- coarse pass ------------------------------------------------
         coarse_step = _COARSE_STEP
-        best_shift, mi_values = self._grid_search(
-            ref, mov, sr_xy, sr_z, coarse_step, progress_callback, 0.0, 0.5
-        )
+        with phase(f"{ALGORITHM_NAME} coarse pass (serial)"):
+            best_shift, mi_values = self._grid_search(
+                ref, mov, sr_xy, sr_z, coarse_step, progress_callback, 0.0, 0.5
+            )
 
         # ---- fine pass --------------------------------------------------
+        fine_timer = phase(f"{ALGORITHM_NAME} fine pass (serial)")
+        fine_timer.__enter__()
         fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         fine_shifts: list[tuple[int, int, int, float]] = []
         bz, by, bx = best_shift
@@ -464,6 +472,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                     fine_shifts.append((dz, dy, dx, mi))
                     mi_values.append(mi)
 
+        fine_timer.__exit__(None, None, None)
         _report(progress_callback, 1.0)
 
         if fine_shifts:
