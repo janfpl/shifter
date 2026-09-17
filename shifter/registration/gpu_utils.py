@@ -16,6 +16,56 @@ _GPU_AVAILABLE: bool | None = None
 _GPU_NAME: str = ""
 _GPU_FAIL_REASON: str = ""
 
+# CUDA major versions this project supports, in order of preference
+# (newest first).  CuPy ships a separate wheel per major version
+# (``cupy-cuda12x`` for CUDA 12.x, ``cupy-cuda13x`` for CUDA 13.x), so a
+# usable install is one where the CuPy wheel matches the available CUDA
+# Toolkit major version.
+_SUPPORTED_CUDA_MAJORS: tuple[int, ...] = (13, 12)
+
+
+def _cupy_install_hint() -> str:
+    """Return a pip install hint listing the supported CuPy wheels."""
+    wheels = " or ".join(f"cupy-cuda{major}x" for major in _SUPPORTED_CUDA_MAJORS)
+    return f"install the wheel matching your CUDA Toolkit, e.g. pip install {wheels}"
+
+
+def _major_pref_rank(major: int) -> tuple[int, int]:
+    """Sort key ranking CUDA majors: supported first, then newest first."""
+    if major in _SUPPORTED_CUDA_MAJORS:
+        return (0, -major)
+    # Unknown/unsupported majors come last, newest first.
+    return (1, -major)
+
+
+def _cuda_path_var_major(key: str) -> int:
+    """Parse the major version from a ``CUDA_PATH_V<major>_<minor>`` key.
+
+    For example ``CUDA_PATH_V12_6`` -> 12 and ``CUDA_PATH_V13_0`` -> 13.
+    Returns 0 when no version can be parsed.
+    """
+    suffix = key[len("CUDA_PATH_V"):]
+    digits = ""
+    for ch in suffix:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else 0
+
+
+def _cuda_runtime_major(cupy_mod: Any) -> int:
+    """Return the CUDA runtime major version CuPy reports, or 0 on failure.
+
+    ``runtimeGetVersion`` returns an int like ``12060`` (12.6) or
+    ``13000`` (13.0); the major version is that value // 1000.
+    """
+    try:
+        version = int(cupy_mod.cuda.runtime.runtimeGetVersion())
+    except Exception:
+        return 0
+    return version // 1000
+
 
 def _ensure_cuda_env() -> None:
     """Try to locate and configure CUDA paths on Windows.
@@ -50,13 +100,17 @@ def _ensure_cuda_env() -> None:
         return
 
     # 3. CUDA_PATH_V* variables (set by some CUDA installers, e.g.
-    #    CUDA_PATH_V12_6).  Prefer 12.x versions.
+    #    CUDA_PATH_V12_6 or CUDA_PATH_V13_0).  Prefer the newest supported
+    #    major version (13.x, then 12.x).
     cuda_path_vars: list[tuple[str, str]] = []
     for key, val in os.environ.items():
         if key.startswith("CUDA_PATH_V") and Path(val).is_dir():
             cuda_path_vars.append((key, val))
-    # Sort so that CUDA_PATH_V12* entries come first (preferred).
-    cuda_path_vars.sort(key=lambda kv: (not kv[0].startswith("CUDA_PATH_V12"), kv[0]))
+    # Sort by version preference (supported majors first, newest first),
+    # then by key name for determinism.
+    cuda_path_vars.sort(
+        key=lambda kv: (_major_pref_rank(_cuda_path_var_major(kv[0])), kv[0])
+    )
     for key, val in cuda_path_vars:
         logger.info("Found CUDA via %s = %s", key, val)
         os.environ["CUDA_PATH"] = val
@@ -102,25 +156,32 @@ def _ensure_cuda_env() -> None:
     for root in search_roots:
         if not root.is_dir():
             continue
-        # Pick the highest-versioned CUDA 12.x directory available.
-        versions = sorted(root.iterdir(), reverse=True)
+        # Highest-versioned directories first (e.g. v13.0 before v12.6).
+        versions = sorted(
+            (d for d in root.iterdir() if d.is_dir()),
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        # Prefer the newest supported major version (13.x, then 12.x).
+        for major in _SUPPORTED_CUDA_MAJORS:
+            prefix = f"v{major}"
+            for ver_dir in versions:
+                if ver_dir.name.startswith(prefix):
+                    nvrtc_candidates = list(ver_dir.glob("bin/nvrtc64_*.dll"))
+                    if nvrtc_candidates:
+                        logger.info("Auto-detected CUDA at %s", ver_dir)
+                        os.environ["CUDA_PATH"] = str(ver_dir)
+                        _add_cuda_bin_to_path(ver_dir)
+                        return
+        # If no supported major was found, try any version as a fallback —
+        # CuPy may still work if the installed wheel matches this major.
         for ver_dir in versions:
-            if ver_dir.is_dir() and ver_dir.name.startswith("v12"):
-                nvrtc_candidates = list(ver_dir.glob("bin/nvrtc64_*.dll"))
-                if nvrtc_candidates:
-                    logger.info("Auto-detected CUDA at %s", ver_dir)
-                    os.environ["CUDA_PATH"] = str(ver_dir)
-                    _add_cuda_bin_to_path(ver_dir)
-                    return
-        # If no v12.x found, try any version as a fallback — CuPy may
-        # still work if the major version is compatible.
-        for ver_dir in versions:
-            if ver_dir.is_dir() and ver_dir.name.startswith("v"):
+            if ver_dir.name.startswith("v"):
                 nvrtc_candidates = list(ver_dir.glob("bin/nvrtc64_*.dll"))
                 if nvrtc_candidates:
                     logger.info(
-                        "Auto-detected CUDA at %s (non-12.x — may not "
-                        "be compatible with cupy-cuda12x)",
+                        "Auto-detected CUDA at %s (unrecognised major "
+                        "version — ensure your CuPy wheel matches)",
                         ver_dir,
                     )
                     os.environ["CUDA_PATH"] = str(ver_dir)
@@ -131,7 +192,7 @@ def _ensure_cuda_env() -> None:
         "Could not auto-detect a CUDA installation on Windows. "
         "Set the CUDA_PATH environment variable to your CUDA Toolkit "
         "directory (e.g. C:\\Program Files\\NVIDIA GPU Computing Toolkit"
-        "\\CUDA\\v12.6)."
+        "\\CUDA\\v13.0 or ...\\CUDA\\v12.6)."
     )
 
 
@@ -199,9 +260,25 @@ def _probe_gpu() -> tuple[bool, str, str]:
     try:
         import cupy  # noqa: F401
     except ImportError:
-        return False, "", "CuPy is not installed (install with: pip install cupy-cuda12x)"
+        return False, "", f"CuPy is not installed ({_cupy_install_hint()})"
     except Exception as exc:
         return False, "", f"CuPy import failed: {exc}"
+
+    # Report the CUDA runtime version CuPy is built against, and flag a
+    # wheel that targets an unsupported major version up front.
+    runtime_major = _cuda_runtime_major(cupy)
+    if runtime_major:
+        logger.info("CuPy is using CUDA runtime major version %d", runtime_major)
+        if runtime_major not in _SUPPORTED_CUDA_MAJORS:
+            supported = ", ".join(
+                f"{m}.x" for m in sorted(_SUPPORTED_CUDA_MAJORS, reverse=True)
+            )
+            return (
+                False,
+                _get_device_name(cupy),
+                f"CuPy is built for CUDA {runtime_major}.x, which is not "
+                f"supported (supported: {supported}). {_cupy_install_hint()}.",
+            )
 
     try:
         dev = cupy.cuda.Device(0)
@@ -245,17 +322,18 @@ def _probe_gpu() -> tuple[bool, str, str]:
                 name,
                 f"NVRTC compilation failed: {err_msg}. "
                 "This usually indicates a CuPy / CUDA Toolkit version "
-                "mismatch. Try reinstalling CuPy to match your CUDA "
-                "version (pip install cupy-cuda12x) or install the "
-                "CUDA 12.x Toolkit.",
+                f"mismatch. Reinstall CuPy to match your CUDA Toolkit "
+                f"({_cupy_install_hint()}), or install a supported "
+                "CUDA Toolkit (12.x or 13.x).",
             )
         if "nvrtc" in err_msg.lower() or "FileNotFoundError" in err_msg:
             return (
                 False,
                 name,
                 f"CUDA toolkit libraries (NVRTC) not found: {err_msg}. "
-                "Install the CUDA 12.x Toolkit or set the CUDA_PATH "
-                "environment variable to your CUDA installation directory.",
+                "Install a supported CUDA Toolkit (12.x or 13.x) or set the "
+                "CUDA_PATH environment variable to your CUDA installation "
+                "directory.",
             )
         return False, name, f"GPU computation test failed: {err_msg}"
 

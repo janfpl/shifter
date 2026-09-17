@@ -32,6 +32,12 @@ dev = [
 gpu = [
     "cupy-cuda12x",
 ]
+gpu-cuda12 = [
+    "cupy-cuda12x",
+]
+gpu-cuda13 = [
+    "cupy-cuda13x",
+]
 
 [project.scripts]
 shifter = "shifter.main:main"

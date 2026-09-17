@@ -37,13 +37,22 @@ pip install -e .
 > `performance_log.txt`. If it instead reads `numpy (single-threaded fallback …)`, the
 > line names the underlying error.
 
-For GPU acceleration (optional, requires **CUDA Toolkit 12.6**):
+For GPU acceleration (optional, requires **CUDA Toolkit 12.x or 13.x**):
 
 ```bash
-pip install -e ".[gpu]"
+# CUDA 12.x toolkit (installs cupy-cuda12x)
+pip install -e ".[gpu-cuda12]"
+
+# CUDA 13.x toolkit (installs cupy-cuda13x)
+pip install -e ".[gpu-cuda13]"
 ```
 
-> **Note:** CUDA Toolkit **12.6** is the recommended and tested version. CUDA 10.x and 13.x are **not compatible**.
+The `[gpu]` extra remains an alias for `[gpu-cuda12]` for backwards compatibility.
+
+> **Note:** CuPy ships a separate wheel per CUDA major version, so install the one
+> matching your installed CUDA Toolkit — `cupy-cuda12x` for CUDA 12.x or
+> `cupy-cuda13x` for CUDA 13.x. CUDA 10.x is **not compatible**. On startup the app
+> auto-detects the CUDA installation and reports which runtime CuPy is using.
 
 Requires Python 3.12.
 
@@ -226,13 +235,14 @@ This is the default algorithm. It is the most robust across dissimilar intensity
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.
 
-Install GPU support:
+Install GPU support (pick the extra matching your CUDA Toolkit):
 
 ```bash
-pip install -e ".[gpu]"
+pip install -e ".[gpu-cuda12]"   # CUDA 12.x
+pip install -e ".[gpu-cuda13]"   # CUDA 13.x
 ```
 
-Requires CUDA Toolkit 12.6 and compatible hardware/drivers. CUDA 10.x and 13.x are not supported.
+Requires CUDA Toolkit 12.x or 13.x and compatible hardware/drivers. CUDA 10.x is not supported. The installed CuPy wheel must match your CUDA Toolkit major version (`cupy-cuda12x` for 12.x, `cupy-cuda13x` for 13.x); a mismatch is reported in the GPU status tooltip.
 
 **Troubleshooting: GPU not detected**
 
@@ -255,7 +265,8 @@ mkdir "%CONDA_PREFIX%\etc\conda\activate.d"
 echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%CONDA_PREFIX%\etc\conda\activate.d\cuda_path.bat"
 ```
 
-Ensure the path points to your CUDA 12.6 installation.
+Ensure the path points to your installed CUDA Toolkit (for example
+`...\CUDA\v12.6` for CUDA 12.x or `...\CUDA\v13.0` for CUDA 13.x).
 
 ## Dependencies
 

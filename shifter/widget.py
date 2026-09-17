@@ -805,8 +805,9 @@ class ChromaticShiftWidget(QWidget):
                 self.lbl_gpu_status.setToolTip(reason)
             else:
                 self.lbl_gpu_status.setToolTip(
-                    "No compatible GPU detected. Install cupy-cuda12x and "
-                    "the CUDA 12.x Toolkit for GPU acceleration."
+                    "No compatible GPU detected. Install the CuPy wheel "
+                    "matching your CUDA Toolkit (cupy-cuda12x for CUDA 12.x "
+                    "or cupy-cuda13x for CUDA 13.x) for GPU acceleration."
                 )
 
     def _on_algorithm_changed(self, text: str) -> None:
