@@ -178,7 +178,9 @@ Output format matches the input format:
 
 ## Registration Algorithms
 
-Three algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
+Six algorithms are available for automatic shift detection. All operate on integer voxel shifts and support configurable XY and Z search ranges.
+
+Every algorithm estimates **one global integer translation per channel** — Shifter corrects rigid chromatic shift, not local deformation. Where an algorithm is named after an upstream package that does more than that (currently deedsBCV), only the part that produces a translation is implemented; the per-algorithm scope notes below say exactly what was and was not taken from the original.
 
 ### Phase Cross-Correlation
 
@@ -222,9 +224,82 @@ Coarse-to-fine exhaustive search maximizing mutual information via joint histogr
 
 This is the default algorithm. It is the most robust across dissimilar intensity distributions between channels (e.g. different fluorophores), at the cost of speed; install `numba` (recommended) for a large parallel speed-up.
 
+### Mutual Information (Brent)
+
+The same mutual-information metric as above, but the exhaustive *fine* search is replaced with **Brent's method** — the bounded one-dimensional optimizer from `scipy.optimize.minimize_scalar` (`method="bounded"`), applied per axis in a cyclic coordinate-descent loop. A cheap coarse grid pass (step 5) first locates the correct basin — mutual information is multimodal over a translation, so a purely local optimizer would otherwise get trapped — and Brent then refines it. The integer part of each candidate shift is evaluated by exact overlap slicing (as in the grid method); the sub-voxel remainder is applied by linear interpolation so Brent sees a smooth objective, and the converged shift is rounded to the nearest voxel.
+
+| Aspect | Detail |
+|--------|--------|
+| Speed | Faster than grid Mutual Information — Brent reaches the optimum in far fewer metric evaluations than the exhaustive fine grid (roughly 5–8× faster in practice) |
+| Best for | The mutual-information use case (dissimilar/non-linear intensity relationships) when the exhaustive fine grid is unnecessarily slow |
+| Limitations | Local refinement — relies on the coarse pass to seed the right basin; result is still integer-rounded |
+| Parameters | None (beyond search range) |
+| GPU | Not used — Brent is a sequential optimizer, so this method runs on CPU regardless of the GPU toggle |
+
+Recovers the same shifts as grid Mutual Information on well-structured data, at a fraction of the run time; install `numba` for a fast coarse pass.
+
+### deedsBCV (MIND-SSC)
+
+> **Scope: translation only — this is not the full deedsBCV.** deedsBCV proper is a *deformable* registration: dense discrete displacements on a control-point grid, regularized with a minimum spanning tree. Shifter applies one global integer shift per channel, so what is implemented here is deeds' similarity core — the MIND-SSC descriptor plus the discrete data-cost search — in the translation-only role that `linearBCV` plays before deeds' deformable pass. The regularization and the deformable field are not implemented, as this pipeline has nowhere to apply them. Expect deeds-quality *shift detection*, not deeds-quality non-rigid alignment: local warping, and any residual misalignment that varies across the field of view, is out of reach for this (and every other) algorithm in Shifter.
+
+Registration on **MIND-SSC** descriptors — the modality-independent self-similarity descriptor from [deedsBCV](https://github.com/mattiaspaul/deedsBCV) (Mattias P. Heinrich, MIT-licensed). Each voxel is described by 12 values measuring how its local patch differs from patches at neighbouring offsets, so the descriptor encodes *structure* rather than intensity: an arbitrary brightness/contrast change leaves it unchanged. Shifts are then found by a discrete displacement search over a 4× / 2× / 1× downsampling pyramid, minimizing the descriptor sum-of-squared-differences over a strided grid of sample points.
+
+| Aspect | Detail |
+|--------|--------|
+| Speed | Moderate (pyramid search; roughly a few seconds per channel for a 160³ ROI) |
+| Best for | Channels whose intensity relationship is non-linear or inverted — the mutual-information use case, at a fraction of the cost |
+| Limitations | Translation only (see the scope note above); descriptor computation holds two 12-channel `float32` volumes in RAM |
+| Parameters | Descriptor quantisation step (default 1) and refinement radius (default 3) |
+| GPU | Supported via CuPy (whole pipeline, descriptors and search) |
+
+The descriptors follow `src/MINDSSCbox.h` of the reference implementation, with two deviations: descriptor entries are kept as `float32` (the `exp(-x)` form the reference leaves commented out) and compared by SSD rather than quantized into a 64-bit word and compared by Hamming distance, and box filtering uses a mean rather than a running sum — the constant cancels in the per-voxel noise normalization that follows.
+
+Confidence is how far the best candidate stands out from the coarsest level's cost distribution, `(median − min) / (max − min)`, the minimization counterpart of the mutual-information confidence.
+
+### deedsBCV (MIND-SSC, Brent)
+
+The MIND-SSC descriptor above, but the finer pyramid grid searches are replaced with **Brent's method** — the same bounded per-axis optimizer used by Mutual Information (Brent). Descriptors are computed once at full resolution; the coarsest pyramid level grid-searches the whole range for a seed, then Brent refines it, evaluating the descriptor cost at continuous (sub-voxel) shifts by linear interpolation of the descriptor field (`scipy.ndimage.map_coordinates`) so the objective is smooth. The converged shift is rounded to the nearest voxel.
+
+| Aspect | Detail |
+|--------|--------|
+| Speed | Comparable to grid deedsBCV — the descriptor grid search is already cheap, so Brent is a modest saving rather than a large one (unlike the Mutual Information pair, where it replaces an expensive fine grid) |
+| Best for | The MIND-SSC use case when you specifically want a gradient-free continuous optimizer over the descriptor cost rather than a discrete grid |
+| Limitations | Local refinement seeded by the coarse pyramid level; translation-only (as with grid deedsBCV); result is integer-rounded |
+| Parameters | Descriptor quantisation step (default 1) |
+| GPU | Not used — Brent is a sequential optimizer, so this method runs on CPU regardless of the GPU toggle |
+
+Included mainly to complete the pairing of both similarity metrics (mutual information and MIND-SSC) with both search strategies (grid and Brent). For MIND-SSC the grid search is already fast, so the grid variant remains the better default; the speed win from Brent is real for Mutual Information, where the exhaustive fine grid is the bottleneck.
+
+## Deformable Registration (deedsBCV)
+
+The six algorithms above all estimate a single **global integer translation** per channel. For **local, non-rigid** chromatic distortion that a global shift cannot correct, there is a separate **deformable** path: a faithful numpy/cupy port of the full deedsBCV algorithm that solves a dense, sub-voxel **displacement field** and warps the moving channel with trilinear interpolation.
+
+It is deliberately kept **off** the integer transform model — the shift table, the manual spin boxes, and the normal "Apply & Export" all stay integer-only and untouched. Two dedicated buttons in the Export section drive it for the registration-selected channels over the drawn ROI:
+
+- **"Preview Deformable (deedsBCV, ROI)"** solves the field and adds the corrected ROI channels to the napari viewer as layers (nothing is written), for visual QC — the reference channel is shown alongside for comparison.
+- **"Export Deformable (deedsBCV, ROI)"** does the same solve and writes corrected BigTIFF volumes directly (the reference and unselected channels are written unchanged; output is always `.tif`, even for H5 inputs).
+
+The solver ports the reference pipeline (`deedsBCV0.cpp`): a 5-level control-point grid (`grid_spacing = 8,7,6,5,4`), MIND-SSC descriptors, a discrete per-control-point data cost over a `(2·L+1)^3` displacement label space, minimum-spanning-tree **belief-propagation** regularization (`primsMST` + separable squared-L2 `messageDT`), and forward+backward **symmetric inverse-consistent** composition (`consistentMappingCL`). The displacement field warps the moving volume as `corrected(p) = moving(p + field(p))`.
+
+| Aspect | Detail |
+|--------|--------|
+| Output | Warped corrected BigTIFF volumes for the ROI (a dense field per channel, applied with sub-voxel interpolation) |
+| Best for | Local, spatially-varying misalignment that a single translation leaves behind |
+| Scope (v1) | ROI / downsampled volumes held in RAM. Uses the GPU (CuPy) when available with automatic per-solve CPU fallback. Native full-size slab+halo streaming warp is a planned follow-up |
+| Fidelity | Faithful to the reference apart from the inherited descriptor deviation (float32 `exp(-x)` MIND-SSC + SSD instead of quantised popcount Hamming), and no affine pre-stage — assumes roughly pre-aligned inputs |
+
+On synthetic data with a known smooth deformation, the full schedule reduces fixed↔moving SSD by ~98%. Because it solves a per-voxel field over a multi-level label search, it is substantially slower than the translation methods (tens of seconds for a modest ROI on CPU) — it is an export-time correction, not an interactive one.
+
 ## GPU Acceleration
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.
+
+On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it.
+
+The probe is attempted twice, each in its own subprocess. The first attempt is **isolated**: it removes any system CUDA-toolkit directory from `PATH` so CuPy loads only its own bundled CUDA libraries. This fixes the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL (already on `PATH` from the CUDA installer) shadows the different-version one bundled with `cupy-cuda12x` and crashes the compile. The second attempt injects the **system** CUDA toolkit path, for setups (e.g. conda `cudatoolkit`) whose CuPy relies on the system libraries. Whichever succeeds, that same `PATH` arrangement is applied to the app process for the real GPU work. Two environment variables control the check:
+
+- `SHIFTER_DISABLE_GPU=1` — skip the GPU probe entirely and run on CPU (fastest startup; use this if the probe is slow or unreliable on your machine).
+- `SHIFTER_GPU_PROBE=inprocess` — run the probe in-process (the old behaviour), for debugging only; a native CuPy fault will crash the app.
 
 Install GPU support:
 
@@ -232,11 +307,27 @@ Install GPU support:
 pip install -e ".[gpu]"
 ```
 
-Requires CUDA Toolkit 12.6 and compatible hardware/drivers. CUDA 10.x and 13.x are not supported.
+Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); the app is tested against CUDA 12.6. The CuPy wheel bundles its own CUDA 12.x libraries, so it may report a runtime version (e.g. 12.9) different from a separately installed toolkit — that is expected and fine. CUDA 11.x and 13.x are not supported.
 
-**Troubleshooting: GPU not detected**
+**Troubleshooting: GPU shows CPU mode with a "could not compile a test kernel" banner**
 
-If the widget shows CPU-only mode despite having a CUDA-capable GPU, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
+If the startup banner reports that CuPy could not compile a test kernel on an otherwise-supported CUDA 12.x runtime, a system CUDA toolkit's `nvrtc` DLL is most likely shadowing CuPy's bundled one. Try, in order:
+
+1. Refresh the bundled CUDA libraries: `pip install -U cupy-cuda12x`.
+2. Update your NVIDIA driver.
+3. Diagnose directly with the probe, which takes a `--strategy` and prints its JSON result (and, thanks to faulthandler, any native crash stack):
+
+   ```cmd
+   python -m shifter.registration._gpu_probe --strategy isolated
+   python -m shifter.registration._gpu_probe --strategy system
+   python -m shifter.registration._gpu_probe --strategy bundled
+   ```
+
+   `isolated` is what the app tries first (it drops system CUDA-toolkit dirs from `PATH` so CuPy uses its bundled libraries); `bundled` leaves `PATH` untouched. If `isolated` prints `"available": true`, the app will use the GPU on the next launch.
+
+**Troubleshooting: GPU not detected (conda-installed CUDA toolkit)**
+
+If you rely on a conda-installed `cudatoolkit` rather than the bundled CuPy libraries, and the widget shows CPU-only mode, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
 
 ```cmd
 echo %CUDA_PATH%
@@ -256,6 +347,17 @@ echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%
 ```
 
 Ensure the path points to your CUDA 12.6 installation.
+
+**Troubleshooting: app closes immediately on startup**
+
+The GPU probe now runs out-of-process, so a native CuPy/NVRTC crash should no longer take the app down — it falls back to CPU and prints a banner explaining why. If you are on an older build, or the app still exits during "Building Chromatic Shift Corrector widget" with a *Windows fatal exception: access violation* traceback pointing into `cupy`/NVRTC, start with the probe disabled:
+
+```cmd
+set SHIFTER_DISABLE_GPU=1
+python -m shifter
+```
+
+The app will run on CPU. To restore GPU acceleration, reinstall CuPy to match your CUDA version (`pip install cupy-cuda12x` for CUDA 12.x) and update your NVIDIA driver, then unset the variable.
 
 ## Dependencies
 
