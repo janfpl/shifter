@@ -86,57 +86,42 @@ def _ensure_cuda_env() -> None:
         return
 
     # 1. CUDA_PATH already set.
-    cuda_path = os.environ.get("CUDA_PATH")
-    if cuda_path and Path(cuda_path).is_dir():
-        _add_cuda_bin_to_path(Path(cuda_path))
+    if _use_cuda_root(os.environ.get("CUDA_PATH"), "CUDA_PATH"):
         return
 
     # 2. CUDA_HOME (alternative environment variable).
-    cuda_home = os.environ.get("CUDA_HOME")
-    if cuda_home and Path(cuda_home).is_dir():
-        logger.info("Found CUDA via CUDA_HOME = %s", cuda_home)
-        os.environ["CUDA_PATH"] = cuda_home
-        _add_cuda_bin_to_path(Path(cuda_home))
+    if _use_cuda_root(os.environ.get("CUDA_HOME"), "CUDA_HOME"):
         return
 
     # 3. CUDA_PATH_V* variables (set by some CUDA installers, e.g.
     #    CUDA_PATH_V12_6 or CUDA_PATH_V13_0).  Prefer the newest supported
     #    major version (13.x, then 12.x).
-    cuda_path_vars: list[tuple[str, str]] = []
-    for key, val in os.environ.items():
-        if key.startswith("CUDA_PATH_V") and Path(val).is_dir():
-            cuda_path_vars.append((key, val))
+    cuda_path_vars = [
+        (key, val) for key, val in os.environ.items()
+        if key.startswith("CUDA_PATH_V")
+    ]
     # Sort by version preference (supported majors first, newest first),
     # then by key name for determinism.
     cuda_path_vars.sort(
         key=lambda kv: (_major_pref_rank(_cuda_path_var_major(kv[0])), kv[0])
     )
     for key, val in cuda_path_vars:
-        logger.info("Found CUDA via %s = %s", key, val)
-        os.environ["CUDA_PATH"] = val
-        _add_cuda_bin_to_path(Path(val))
-        return
+        if _use_cuda_root(val, key):
+            return
 
     # 4. Conda environment — cudatoolkit packages install into
     #    <env>/Library/ on Windows.
     conda_library = Path(sys.prefix) / "Library"
-    if conda_library.is_dir():
-        # Check for nvrtc DLLs in the conda env's bin directory.
-        conda_bin = conda_library / "bin"
-        if conda_bin.is_dir() and list(conda_bin.glob("nvrtc64_*.dll")):
-            logger.info("Auto-detected CUDA in conda env at %s", conda_library)
-            os.environ["CUDA_PATH"] = str(conda_library)
-            _add_cuda_bin_to_path(conda_library)
-            return
+    if _has_nvrtc(conda_library) and _use_cuda_root(
+        str(conda_library), "conda env"
+    ):
+        return
 
     # 5. Check if nvcc is already on PATH and derive root from it.
+    #    nvcc lives in <cuda_root>/bin/nvcc.exe (the root is normalised,
+    #    so a copy under bin/x64 also resolves correctly).
     nvcc_path = _find_nvcc_on_path()
-    if nvcc_path is not None:
-        # nvcc lives in <cuda_root>/bin/nvcc.exe
-        cuda_root = nvcc_path.parent.parent
-        logger.info("Auto-detected CUDA via nvcc at %s", cuda_root)
-        os.environ["CUDA_PATH"] = str(cuda_root)
-        _add_cuda_bin_to_path(cuda_root)
+    if nvcc_path is not None and _use_cuda_root(str(nvcc_path.parent), "nvcc"):
         return
 
     # 6. Search common CUDA installation directories on the filesystem.
@@ -158,34 +143,26 @@ def _ensure_cuda_env() -> None:
             continue
         # Highest-versioned directories first (e.g. v13.0 before v12.6).
         versions = sorted(
-            (d for d in root.iterdir() if d.is_dir()),
+            (d for d in root.iterdir() if d.is_dir() and _has_nvrtc(d)),
             key=lambda d: d.name,
             reverse=True,
         )
         # Prefer the newest supported major version (13.x, then 12.x).
         for major in _SUPPORTED_CUDA_MAJORS:
-            prefix = f"v{major}"
             for ver_dir in versions:
-                if ver_dir.name.startswith(prefix):
-                    nvrtc_candidates = list(ver_dir.glob("bin/nvrtc64_*.dll"))
-                    if nvrtc_candidates:
-                        logger.info("Auto-detected CUDA at %s", ver_dir)
-                        os.environ["CUDA_PATH"] = str(ver_dir)
-                        _add_cuda_bin_to_path(ver_dir)
+                if ver_dir.name.startswith(f"v{major}"):
+                    if _use_cuda_root(str(ver_dir), "Program Files"):
                         return
         # If no supported major was found, try any version as a fallback —
         # CuPy may still work if the installed wheel matches this major.
         for ver_dir in versions:
             if ver_dir.name.startswith("v"):
-                nvrtc_candidates = list(ver_dir.glob("bin/nvrtc64_*.dll"))
-                if nvrtc_candidates:
-                    logger.info(
-                        "Auto-detected CUDA at %s (unrecognised major "
-                        "version — ensure your CuPy wheel matches)",
-                        ver_dir,
-                    )
-                    os.environ["CUDA_PATH"] = str(ver_dir)
-                    _add_cuda_bin_to_path(ver_dir)
+                logger.info(
+                    "CUDA at %s has an unrecognised major version — "
+                    "ensure your CuPy wheel matches",
+                    ver_dir,
+                )
+                if _use_cuda_root(str(ver_dir), "Program Files"):
                     return
 
     logger.warning(
@@ -194,6 +171,68 @@ def _ensure_cuda_env() -> None:
         "directory (e.g. C:\\Program Files\\NVIDIA GPU Computing Toolkit"
         "\\CUDA\\v13.0 or ...\\CUDA\\v12.6)."
     )
+
+
+def _normalize_cuda_root(path: Path) -> Path:
+    """Return the CUDA Toolkit root for *path*.
+
+    Users and installers sometimes point ``CUDA_PATH`` at a subdirectory
+    such as ``<root>\\bin`` or ``<root>\\bin\\x64`` instead of the toolkit
+    root.  CuPy appends ``bin`` itself, so such a value produces a
+    non-existent ``...\\bin\\bin`` directory.  Strip those trailing
+    components so the root is always used.
+    """
+    parts = [p.lower() for p in path.parts]
+    if len(parts) >= 2 and parts[-1] == "x64" and parts[-2] in ("bin", "lib"):
+        return path.parent.parent
+    if parts and parts[-1] == "bin":
+        return path.parent
+    return path
+
+
+def _cuda_dll_dirs(cuda_root: Path) -> list[Path]:
+    """Return the directories that may hold CUDA DLLs under *cuda_root*.
+
+    CUDA 12.x and older keep DLLs in ``bin``; CUDA 13.x moved them to
+    ``bin\\x64``.  Both are returned so either layout works.
+    """
+    return [
+        cuda_root / "bin",
+        cuda_root / "bin" / "x64",
+        cuda_root / "lib" / "x64",
+    ]
+
+
+def _has_nvrtc(cuda_root: Path) -> bool:
+    """Return True if *cuda_root* contains an ``nvrtc64_*.dll``."""
+    for dll_dir in _cuda_dll_dirs(cuda_root)[:2]:
+        if dll_dir.is_dir() and any(dll_dir.glob("nvrtc64_*.dll")):
+            return True
+    return False
+
+
+def _use_cuda_root(value: str | None, source: str) -> bool:
+    """Adopt *value* as the CUDA Toolkit root if it is a valid directory.
+
+    The path is normalised to the toolkit root, written back to
+    ``CUDA_PATH`` (which CuPy reads) and its DLL directories are added to
+    the search path.  Returns True on success.
+    """
+    if not value:
+        return False
+    cuda_root = _normalize_cuda_root(Path(value))
+    if not (cuda_root / "bin").is_dir():
+        logger.debug("Ignoring %s = %s: no bin directory under %s",
+                     source, value, cuda_root)
+        return False
+    if cuda_root != Path(value):
+        logger.info("%s = %s is not the toolkit root; using %s",
+                    source, value, cuda_root)
+    else:
+        logger.info("Found CUDA via %s = %s", source, cuda_root)
+    os.environ["CUDA_PATH"] = str(cuda_root)
+    _add_cuda_bin_to_path(cuda_root)
+    return True
 
 
 def _find_nvcc_on_path() -> Path | None:
@@ -209,14 +248,12 @@ def _find_nvcc_on_path() -> Path | None:
 def _add_cuda_bin_to_path(cuda_root: Path) -> None:
     """Ensure CUDA DLL directories are on the DLL search path.
 
-    Adds both ``<cuda_root>/bin`` (contains nvrtc, cudart, etc.) and
-    ``<cuda_root>/lib/x64`` (contains additional libraries on some
-    installations) to PATH and the DLL search directories.
+    Adds ``<cuda_root>/bin`` (nvrtc, cudart, etc. on CUDA 12.x),
+    ``<cuda_root>/bin/x64`` (the same DLLs on CUDA 13.x) and
+    ``<cuda_root>/lib/x64`` (additional libraries on some installations)
+    to PATH and the DLL search directories.
     """
-    dirs_to_add = [
-        cuda_root / "bin",
-        cuda_root / "lib" / "x64",
-    ]
+    dirs_to_add = [d for d in _cuda_dll_dirs(cuda_root) if d.is_dir()]
     current_path = os.environ.get("PATH", "")
     for dll_dir in dirs_to_add:
         dll_dir_str = str(dll_dir)

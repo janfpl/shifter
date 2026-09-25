@@ -12,6 +12,7 @@ Runnable via pytest, or standalone::
 from __future__ import annotations
 
 import sys
+from pathlib import Path, PureWindowsPath
 
 from shifter.registration import gpu_utils as g
 
@@ -67,6 +68,46 @@ def test_install_hint_lists_supported_wheels() -> None:
     hint = g._cupy_install_hint()
     assert "cupy-cuda12x" in hint
     assert "cupy-cuda13x" in hint
+
+
+def test_normalize_cuda_root_strips_bin_components() -> None:
+    root = PureWindowsPath(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2")
+    assert g._normalize_cuda_root(root) == root
+    assert g._normalize_cuda_root(root / "bin") == root
+    assert g._normalize_cuda_root(root / "BIN") == root
+    assert g._normalize_cuda_root(root / "bin" / "x64") == root
+    assert g._normalize_cuda_root(root / "lib" / "x64") == root
+
+
+def _make_toolkit(root: Path, dll_subdir: str) -> Path:
+    dll_dir = root / dll_subdir
+    dll_dir.mkdir(parents=True)
+    (dll_dir / "nvrtc64_130_0.dll").touch()
+    return root
+
+
+def test_has_nvrtc_handles_cuda12_and_cuda13_layouts(tmp_path: Path) -> None:
+    assert g._has_nvrtc(_make_toolkit(tmp_path / "v12.6", "bin"))
+    assert g._has_nvrtc(_make_toolkit(tmp_path / "v13.2", "bin/x64"))
+    assert not g._has_nvrtc(tmp_path / "missing")
+
+
+def test_use_cuda_root_fixes_cuda_path_pointing_at_bin(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Regression: CUDA_PATH=<root>\bin made CuPy look for <root>\bin\bin.
+    root = _make_toolkit(tmp_path / "v13.2", "bin/x64")
+    monkeypatch.setenv("CUDA_PATH", str(root / "bin"))
+    monkeypatch.setenv("PATH", "")
+    assert g._use_cuda_root(str(root / "bin"), "CUDA_PATH")
+    import os
+    assert os.environ["CUDA_PATH"] == str(root)
+    assert str(root / "bin" / "x64") in os.environ["PATH"]
+
+
+def test_use_cuda_root_rejects_invalid_paths(tmp_path: Path) -> None:
+    assert not g._use_cuda_root(None, "CUDA_PATH")
+    assert not g._use_cuda_root(str(tmp_path / "nope"), "CUDA_PATH")
 
 
 if __name__ == "__main__":
