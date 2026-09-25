@@ -911,7 +911,7 @@ class ChromaticShiftWidget(QWidget):
         self.btn_reg_roi_size.toggled.connect(self._on_toggle_reg_roi_size)
         lay.addWidget(self.btn_reg_roi_size)
 
-        # Sizes are centred on the volume; Y and Z default to the full
+        # Sizes are centred on the volume; X and Z default to the full
         # extent once a dataset is loaded.
         self._reg_roi_size_container = QWidget()
         size_lay = QVBoxLayout()
@@ -929,8 +929,8 @@ class ChromaticShiftWidget(QWidget):
             row.addWidget(QLabel(label))
             row.addWidget(spin)
             size_lay.addLayout(row)
-        self.spin_reg_roi_x.setValue(2)
-        self.spin_reg_roi_y.setValue(1)
+        self.spin_reg_roi_x.setValue(1)
+        self.spin_reg_roi_y.setValue(2)
         self.spin_reg_roi_z.setValue(1)
         self._reg_roi_size_container.setLayout(size_lay)
         self._reg_roi_size_container.setVisible(False)
@@ -1414,13 +1414,13 @@ class ChromaticShiftWidget(QWidget):
         self.spin_z_start.setValue(0)
         self.spin_z_end.setValue(min(min_z - 1, 99))
 
-        # Registration ROI defaults: 2 voxels in X, full Y and full Z.
+        # Registration ROI defaults: full X, 2 voxels in Y and full Z.
         nz, ny, nx = self._min_volume_shape()
         self.spin_reg_roi_x.setRange(1, max(nx, 1))
         self.spin_reg_roi_y.setRange(1, max(ny, 1))
         self.spin_reg_roi_z.setRange(1, max(nz, 1))
-        self.spin_reg_roi_x.setValue(min(2, nx))
-        self.spin_reg_roi_y.setValue(ny)
+        self.spin_reg_roi_x.setValue(nx)
+        self.spin_reg_roi_y.setValue(min(2, ny))
         self.spin_reg_roi_z.setValue(nz)
 
     # ---- Pyramid Level Range ---------------------------------------- #
@@ -1852,8 +1852,8 @@ class ChromaticShiftWidget(QWidget):
     def _on_add_registration_roi(self) -> None:
         """Add a rectangle ROI centred in the volume using the configured sizes.
 
-        With the defaults this is a 2-voxel-wide slab at the X midpoint that
-        spans the full Y extent and the full Z depth.
+        With the defaults this is a 2-voxel-tall slab at the Y midpoint that
+        spans the full X width and the full Z depth.
         """
         if not self.loaders:
             QMessageBox.warning(self, "No Data", "Load data first.")
