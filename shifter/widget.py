@@ -26,6 +26,7 @@ from qtpy.QtWidgets import (
     QSlider,
     QSpinBox,
     QTableWidget,
+    QToolButton,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -651,6 +652,48 @@ class ChromaticShiftWidget(QWidget):
         self._update_gpu_indicator()
         lay.addWidget(self.lbl_gpu_status)
 
+        # Registration ROI: a thin slab through the middle of the volume.
+        self.btn_add_reg_roi = QPushButton("Add registration ROI")
+        self.btn_add_reg_roi.clicked.connect(self._on_add_registration_roi)
+        self.btn_add_reg_roi.setEnabled(False)
+        self.btn_add_reg_roi.setToolTip("Load a dataset first.")
+        lay.addWidget(self.btn_add_reg_roi)
+
+        self.btn_reg_roi_size = QToolButton()
+        self.btn_reg_roi_size.setText("Registration ROI size")
+        self.btn_reg_roi_size.setCheckable(True)
+        self.btn_reg_roi_size.setChecked(False)
+        self.btn_reg_roi_size.setArrowType(Qt.RightArrow)
+        self.btn_reg_roi_size.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_reg_roi_size.setStyleSheet("QToolButton { border: none; }")
+        self.btn_reg_roi_size.toggled.connect(self._on_toggle_reg_roi_size)
+        lay.addWidget(self.btn_reg_roi_size)
+
+        # Sizes are centred on the volume; Y and Z default to the full
+        # extent once a dataset is loaded.
+        self._reg_roi_size_container = QWidget()
+        size_lay = QVBoxLayout()
+        size_lay.setContentsMargins(12, 0, 0, 0)
+        self.spin_reg_roi_x = QSpinBox()
+        self.spin_reg_roi_y = QSpinBox()
+        self.spin_reg_roi_z = QSpinBox()
+        for label, spin in [
+            ("X size (voxels):", self.spin_reg_roi_x),
+            ("Y size (voxels):", self.spin_reg_roi_y),
+            ("Z size (planes):", self.spin_reg_roi_z),
+        ]:
+            spin.setRange(1, 1_000_000)
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(spin)
+            size_lay.addLayout(row)
+        self.spin_reg_roi_x.setValue(2)
+        self.spin_reg_roi_y.setValue(1)
+        self.spin_reg_roi_z.setValue(1)
+        self._reg_roi_size_container.setLayout(size_lay)
+        self._reg_roi_size_container.setVisible(False)
+        lay.addWidget(self._reg_roi_size_container)
+
         # Run button.
         self.btn_run_registration = QPushButton("Run Auto-Registration")
         self.btn_run_registration.clicked.connect(self._on_run_registration)
@@ -840,7 +883,14 @@ class ChromaticShiftWidget(QWidget):
         )
 
     def _update_run_button_state(self) -> None:
-        """Enable the Run button only when ROI is defined and data loaded."""
+        """Enable the Run button only when ROI is defined and data loaded.
+
+        Also enables the "Add registration ROI" button whenever data is loaded.
+        """
+        self.btn_add_reg_roi.setEnabled(bool(self.loaders))
+        self.btn_add_reg_roi.setToolTip(
+            "" if self.loaders else "Load a dataset first."
+        )
         enabled = bool(self.loaders) and self._has_roi()
         self.btn_run_registration.setEnabled(enabled)
         if not enabled:
@@ -1102,6 +1152,15 @@ class ChromaticShiftWidget(QWidget):
         self.spin_z_start.setValue(0)
         self.spin_z_end.setValue(min(min_z - 1, 99))
 
+        # Registration ROI defaults: 2 voxels in X, full Y and full Z.
+        nz, ny, nx = self._min_volume_shape()
+        self.spin_reg_roi_x.setRange(1, max(nx, 1))
+        self.spin_reg_roi_y.setRange(1, max(ny, 1))
+        self.spin_reg_roi_z.setRange(1, max(nz, 1))
+        self.spin_reg_roi_x.setValue(min(2, nx))
+        self.spin_reg_roi_y.setValue(ny)
+        self.spin_reg_roi_z.setValue(nz)
+
     # ---- Pyramid Level Range ---------------------------------------- #
 
     def _setup_pyramid_controls(self) -> None:
@@ -1215,6 +1274,7 @@ class ChromaticShiftWidget(QWidget):
             self._h5_file_manager.close_all()
             self._h5_file_manager = None
         self._disable_pyramid_controls("No pyramid data loaded.")
+        self._update_run_button_state()
 
     # ------------------------------------------------------------------ #
     # Callbacks — Shift Table
@@ -1494,8 +1554,8 @@ class ChromaticShiftWidget(QWidget):
     # Callbacks — ROI Preview
     # ------------------------------------------------------------------ #
 
-    def _on_draw_roi(self) -> None:
-        """Activate the rectangle drawing tool in napari."""
+    def _ensure_shapes_layer(self) -> None:
+        """Create the ROI shapes layer if it does not exist yet."""
         if self._shapes_layer is None or self._shapes_layer not in self.viewer.layers:
             self._shapes_layer = self.viewer.add_shapes(
                 name="ROI",
@@ -1504,12 +1564,65 @@ class ChromaticShiftWidget(QWidget):
                 face_color="transparent",
                 edge_width=2,
             )
+            # After drawing, update the run button state.
+            self._shapes_layer.events.data.connect(
+                lambda _: self._update_run_button_state()
+            )
+
+    def _on_draw_roi(self) -> None:
+        """Activate the rectangle drawing tool in napari."""
+        self._ensure_shapes_layer()
         self.viewer.layers.selection.active = self._shapes_layer
         self._shapes_layer.mode = "add_rectangle"
-        # After drawing, update the run button state.
-        self._shapes_layer.events.data.connect(
-            lambda _: self._update_run_button_state()
+
+    def _min_volume_shape(self) -> tuple[int, int, int]:
+        """(nz, ny, nx) shared by all loaded channels."""
+        return (
+            min(ld.shape[0] for ld in self.loaders),
+            min(ld.shape[1] for ld in self.loaders),
+            min(ld.shape[2] for ld in self.loaders),
         )
+
+    def _on_toggle_reg_roi_size(self, expanded: bool) -> None:
+        self.btn_reg_roi_size.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._reg_roi_size_container.setVisible(expanded)
+
+    def _on_add_registration_roi(self) -> None:
+        """Add a rectangle ROI centred in the volume using the configured sizes.
+
+        With the defaults this is a 2-voxel-wide slab at the X midpoint that
+        spans the full Y extent and the full Z depth.
+        """
+        if not self.loaders:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+
+        def centred(size: int, extent: int) -> tuple[int, int]:
+            size = max(1, min(size, extent))
+            start = extent // 2 - size // 2
+            return start, start + size
+
+        nz, ny, nx = self._min_volume_shape()
+        x_start, x_end = centred(self.spin_reg_roi_x.value(), nx)
+        y_start, y_end = centred(self.spin_reg_roi_y.value(), ny)
+        z_start, z_end = centred(self.spin_reg_roi_z.value(), nz)
+
+        self._ensure_shapes_layer()
+        rect = np.array(
+            [
+                [y_start, x_start],
+                [y_start, x_end],
+                [y_end, x_end],
+                [y_end, x_start],
+            ],
+            dtype=float,
+        )
+        self._shapes_layer.add(rect, shape_type="rectangle")
+        self._shapes_layer.mode = "pan_zoom"
+
+        self.spin_z_start.setValue(z_start)
+        self.spin_z_end.setValue(z_end - 1)  # exclusive → inclusive
+        self._update_run_button_state()
 
     def _get_roi_bounds(self) -> tuple[int, int, int, int] | None:
         """Extract the bounding box of the last drawn rectangle.
@@ -2044,6 +2157,10 @@ class ChromaticShiftWidget(QWidget):
             self.file_table,
             self.shift_table,
             self.btn_run_registration,
+            self.btn_add_reg_roi,
+            self.spin_reg_roi_x,
+            self.spin_reg_roi_y,
+            self.spin_reg_roi_z,
             self.combo_algorithm,
             self.spin_sr_xy,
             self.spin_sr_z,
