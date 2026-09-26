@@ -57,6 +57,23 @@ python -m shifter
 
 This opens a napari viewer with the Chromatic Shift Corrector widget docked on the right.
 
+### One-click launch on Windows
+
+Double-click `launch_shifter.bat` in the repository folder. It activates the conda
+environment and starts shifter, so users don't need to open Anaconda Prompt. To make a
+desktop shortcut, right-click the file → *Send to* → *Desktop (create shortcut)*.
+
+It should work unchanged if the environment is called `shifter` and conda is on `PATH`
+or in a standard install location. Otherwise, open the file in Notepad and edit the two
+settings at the top:
+
+| Setting | What to put there | How to find it |
+|---------|-------------------|----------------|
+| `ENV_NAME` | Environment name (default `shifter`) or full path to it | `conda env list` in Anaconda Prompt |
+| `CONDA_ROOT` | Anaconda/Miniconda install folder, e.g. `C:\Users\you\anaconda3` (leave empty to auto-detect) | `where conda` in Anaconda Prompt; the root is the folder above `condabin` or `Scripts` |
+
+If something goes wrong, the window stays open and shows the error.
+
 ## Supported Formats
 
 | Format | Extension | Notes |
