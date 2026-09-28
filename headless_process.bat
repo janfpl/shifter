@@ -34,7 +34,7 @@ set "CONDA_ROOT="
 
 rem  Registration search range in voxels.
 set "XY_RANGE=1"
-set "Z_RANGE=75"
+set "Z_RANGE=90"
 
 rem ================================================================
 rem  Nothing below here should need changing

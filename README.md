@@ -81,7 +81,7 @@ without opening napari. Drag a data folder (or several) onto it, drag a `.txt` f
 listing folders onto it, or double-click it and paste a path. In a `.txt` list, separate
 folders with commas and/or new lines. Lines starting with `#` are ignored, and relative
 paths are resolved against the `.txt` file's folder. Edit `ENV_NAME` / `CONDA_ROOT` at the
-top as for the launcher; `XY_RANGE` / `Z_RANGE` set the search range (default 1 / 75).
+top as for the launcher; `XY_RANGE` / `Z_RANGE` set the search range (default 1 / 90).
 
 For each folder, one after another:
 
@@ -110,7 +110,7 @@ The same thing from a terminal:
 
 ```bash
 python -m shifter.headless D:\data\sample1 D:\data\sample2
-python -m shifter.headless folders.txt --xy-range 1 --z-range 75
+python -m shifter.headless folders.txt --xy-range 1 --z-range 90
 python -m shifter.headless --help
 ```
 

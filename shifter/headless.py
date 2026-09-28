@@ -7,7 +7,7 @@ For each input folder of ``.lux.h5`` channel files this:
 3. Builds the automatic registration ROI: centred, full X width, a thin
    Y slab (2 voxels by default) at the Y midpoint, and the full Z depth.
 4. Registers every other channel against the reference with Mutual
-   Information (default search range: 1 voxel XY, 75 voxels Z).
+   Information (default search range: 1 voxel XY, 90 voxels Z).
 5. Exports full-volume corrected ``.lux.h5`` files (original filenames,
    regenerated pyramids, companion headers) into a new sibling folder named
    ``<source folder>_<MMDDYY_HHMM>_shifted``.
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ALGORITHM = "Mutual Information"
 DEFAULT_SEARCH_XY = 1
-DEFAULT_SEARCH_Z = 75
+DEFAULT_SEARCH_Z = 90
 DEFAULT_ROI_Y = 2  # also the GUI's "Add registration ROI" default height
 DEFAULT_RAM_PERCENT = 90
 

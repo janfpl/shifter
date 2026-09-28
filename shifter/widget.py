@@ -64,7 +64,7 @@ from shifter.h5_utils import (
 )
 from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from shifter.preview_engine import extract_subvolume, generate_preview
-from shifter.headless import DEFAULT_ROI_Y
+from shifter.headless import DEFAULT_ROI_Y, DEFAULT_SEARCH_XY, DEFAULT_SEARCH_Z
 from shifter.registration_runner import register_channels
 from shifter.shift_manager import ShiftManager
 from shifter.utils import (
@@ -788,7 +788,7 @@ class ChromaticShiftWidget(QWidget):
         row_sr_xy.addWidget(QLabel("XY search range (voxels):"))
         self.spin_sr_xy = QSpinBox()
         self.spin_sr_xy.setRange(1, MAX_SEARCH_RANGE)
-        self.spin_sr_xy.setValue(1)
+        self.spin_sr_xy.setValue(DEFAULT_SEARCH_XY)
         row_sr_xy.addWidget(self.spin_sr_xy)
         lay.addLayout(row_sr_xy)
 
@@ -796,7 +796,7 @@ class ChromaticShiftWidget(QWidget):
         row_sr_z.addWidget(QLabel("Z search range (voxels):"))
         self.spin_sr_z = QSpinBox()
         self.spin_sr_z.setRange(1, MAX_SEARCH_RANGE)
-        self.spin_sr_z.setValue(75)
+        self.spin_sr_z.setValue(DEFAULT_SEARCH_Z)
         row_sr_z.addWidget(self.spin_sr_z)
         lay.addLayout(row_sr_z)
 
