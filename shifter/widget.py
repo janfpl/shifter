@@ -54,7 +54,6 @@ from shifter.perf_logger import (
     setup_perf_log,
     timed_operation,
     log_event,
-    log_memory,
 )
 from shifter.memory import release_memory
 from shifter.h5_utils import (
@@ -64,6 +63,7 @@ from shifter.h5_utils import (
 )
 from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from shifter.preview_engine import extract_subvolume, generate_preview
+from shifter.registration_runner import register_channels
 from shifter.shift_manager import ShiftManager
 from shifter.utils import (
     DEFAULT_COLORMAPS,
@@ -269,103 +269,22 @@ class RegistrationWorker(QThread):
             self.error.emit(traceback.format_exc())
 
     def _run_registration(self) -> list:
-        y_start, y_end, x_start, x_end = self.roi_bounds
-
-        log_event(f"Registration started | algo={self.algorithm_name} "
-                  f"channels={self.channels_to_register} "
-                  f"search_xy={self.search_range_xy} search_z={self.search_range_z} "
-                  f"gpu={self.use_gpu}")
-        log_memory("registration start", level=logging.INFO)
-
-        # Extract reference sub-volume.
-        ref_loader = self.loaders[self.reference_index]
-        ref_vol = extract_subvolume(
-            ref_loader.dask_array,
-            self.z_start, self.z_end,
-            y_start, y_end, x_start, x_end,
+        return register_channels(
+            self.loaders,
+            self.reference_index,
+            self.channels_to_register,
+            self.algorithm_name,
+            self.algorithm_kwargs,
+            self.search_range_xy,
+            self.search_range_z,
+            self.roi_bounds,
+            self.z_start,
+            self.z_end,
+            self.background_subtraction,
+            self.gaussian_smoothing,
+            self.use_gpu,
+            progress=self.progress.emit,
         )
-
-        # Preprocess reference.
-        ref_vol = preprocess(
-            ref_vol,
-            background_subtraction=self.background_subtraction,
-            gaussian_smoothing=self.gaussian_smoothing,
-            use_gpu=self.use_gpu,
-        )
-
-        # Instantiate algorithm.
-        algo_cls = ALGORITHM_REGISTRY[self.algorithm_name]
-        algo = algo_cls(**self.algorithm_kwargs)
-
-        # Instantiate algorithm.
-        n = len(self.channels_to_register)
-        results = []
-
-        # Progress is tracked at sub-channel resolution: each channel spans one
-        # unit, and the algorithm reports a fraction within it, so the bar keeps
-        # moving during a single (possibly long) mutual-information search rather
-        # than jumping once per channel. ``scale`` gives the bar smooth steps.
-        scale = 1000
-
-        def _emit(idx: int, frac: float) -> None:
-            frac = min(1.0, max(0.0, frac))
-            self.progress.emit(
-                int((idx + frac) * scale),
-                n * scale,
-                f"Registering channel {idx + 1} of {n}...",
-            )
-
-        for idx, ch_i in enumerate(self.channels_to_register):
-            loader = self.loaders[ch_i]
-            _emit(idx, 0.0)
-
-            # Extract moving sub-volume.
-            mov_vol = extract_subvolume(
-                loader.dask_array,
-                self.z_start, self.z_end,
-                y_start, y_end, x_start, x_end,
-            )
-
-            # Preprocess moving.
-            mov_vol = preprocess(
-                mov_vol,
-                background_subtraction=self.background_subtraction,
-                gaussian_smoothing=self.gaussian_smoothing,
-                use_gpu=self.use_gpu,
-            )
-
-            # Advance the bar within this channel as the algorithm searches.
-            channel_cb = lambda frac, _idx=idx: _emit(_idx, frac)
-
-            # Run registration with GPU OOM fallback.
-            with timed_operation(f"Registration channel {ch_i} ({self.algorithm_name})"):
-                try:
-                    result = algo.register(
-                        ref_vol, mov_vol,
-                        self.search_range_xy, self.search_range_z,
-                        use_gpu=self.use_gpu,
-                        progress_callback=channel_cb,
-                    )
-                except Exception:
-                    # If GPU fails (e.g. OOM), retry on CPU.
-                    if self.use_gpu:
-                        result = algo.register(
-                            ref_vol, mov_vol,
-                            self.search_range_xy, self.search_range_z,
-                            use_gpu=False,
-                            progress_callback=channel_cb,
-                        )
-                    else:
-                        raise
-
-            _emit(idx, 1.0)
-            log_event(f"Registration channel {ch_i} result: "
-                      f"shift=({result.shift_z},{result.shift_y},{result.shift_x}) "
-                      f"confidence={result.confidence:.3f}")
-            results.append((ch_i, result))
-
-        self.progress.emit(n * scale, n * scale, "Registration complete.")
-        return results
 
 
 def _deformable_output_name(filename: str) -> str:
