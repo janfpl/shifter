@@ -102,7 +102,8 @@ For each folder, one after another:
 `correction_metadata.json` in the output also records the reference choice, channel
 brightness, ROI, and per-channel shifts and confidence (`headless_registration`).
 `performance_log.txt` covers both registration and export. If one folder fails, the rest
-still run, and the summary at the end lists each folder's result.
+still run, and the summary at the end lists each folder's result. A folder with only one
+channel is skipped (nothing is written) and isn't counted as a failure.
 
 The same thing from a terminal:
 

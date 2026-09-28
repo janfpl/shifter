@@ -140,6 +140,10 @@ def output_folder_for(source: Path, when: datetime) -> Path:
     return out
 
 
+class SkipFolder(Exception):
+    """The folder needs no correction (e.g. a single channel); nothing is written."""
+
+
 class _ProgressPrinter:
     """Single-line console progress that only redraws when the percent changes."""
 
@@ -190,9 +194,8 @@ def process_folder(
     if not files:
         raise ValueError(f"No .lux.h5 channel files found in {folder}")
     if len(files) < 2:
-        raise ValueError(
-            f"Only one channel file in {folder} ({files[0].name}) — "
-            "nothing to register against."
+        raise SkipFolder(
+            f"only one channel ({files[0].name}), nothing to register against"
         )
 
     started = datetime.now()
@@ -365,6 +368,9 @@ def main(argv: list[str] | None = None) -> int:
             mins = (time.monotonic() - t0) / 60
             print(f"  Done in {mins:.1f} min -> {out}")
             outcomes.append((folder, f"OK      -> {out}"))
+        except SkipFolder as exc:
+            print(f"  SKIPPED: {exc}")
+            outcomes.append((folder, f"SKIPPED {exc}"))
         except Exception as exc:
             logger.debug("Failed processing %s", folder, exc_info=True)
             print(f"  FAILED: {exc}")
@@ -375,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\nSummary:")
     for folder, status in outcomes:
         print(f"  {folder}: {status}")
-    return 0 if all(s.startswith("OK") for _, s in outcomes) else 1
+    return 0 if not any(s.startswith("FAILED") for _, s in outcomes) else 1
 
 
 if __name__ == "__main__":

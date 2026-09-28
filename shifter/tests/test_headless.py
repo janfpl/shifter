@@ -116,6 +116,15 @@ def test_main_batch_continues_after_failure() -> None:
         assert len(list(Path(d).glob("good_*_shifted"))) == 1
 
 
+def test_single_channel_folder_is_skipped() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        single = Path(d) / "single"
+        single.mkdir()
+        _create_h5_file(single / "ch0.lux.h5", _make_blob_volume(np.random.default_rng(1)), 0)
+        assert headless.main([str(single)]) == 0
+        assert list(Path(d).glob("*_shifted")) == []
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     failed = 0
