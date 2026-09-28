@@ -30,6 +30,7 @@ if defined CONDA_ROOT goto :check_root
 
 rem --- 2. common install locations ---
 for %%D in (
+    "C:\Luxendo\tracking\Python\Anaconda38wind"
     "%USERPROFILE%\anaconda3"
     "%USERPROFILE%\miniconda3"
     "%USERPROFILE%\miniforge3"
