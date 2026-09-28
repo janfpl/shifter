@@ -110,6 +110,51 @@ def test_use_cuda_root_rejects_invalid_paths(tmp_path: Path) -> None:
     assert not g._use_cuda_root(str(tmp_path / "nope"), "CUDA_PATH")
 
 
+def test_driver_insufficient_detection() -> None:
+    # CUDA 12.x driver running a CUDA 13.x CuPy build.
+    assert g._driver_insufficient({"runtime": 13000, "driver": 12040}, "")
+    # Minor-version compatibility within a major line is fine.
+    assert not g._driver_insufficient({"runtime": 12090, "driver": 12060}, "")
+    assert not g._driver_insufficient({"runtime": 13020, "driver": 13000}, "")
+    # The CUDA error name alone is enough, even without versions.
+    assert g._driver_insufficient(
+        None,
+        "CUDA device detection failed: cudaErrorInsufficientDriver: CUDA "
+        "driver version is insufficient for CUDA runtime version",
+    )
+    assert not g._driver_insufficient(None, "CuPy is not installed")
+
+
+def _banner_for(monkeypatch, versions, reason: str) -> str:
+    lines: list[str] = []
+    monkeypatch.setattr(g, "_GPU_CUDA_VERSIONS", versions)
+    monkeypatch.setattr(g, "_print_banner", lambda body: lines.extend(body))
+    monkeypatch.setattr(g.logger, "warning", lambda *a: lines.append(a[0] % a[1:]))
+    g._report_gpu_unavailable(reason)
+    return "\n".join(lines)
+
+
+def test_banner_cuda13_is_supported(monkeypatch) -> None:
+    text = _banner_for(monkeypatch, {"runtime": 13020, "driver": 13020},
+                       "NVRTC compilation failed: boom")
+    assert "unsupported CUDA version" not in text
+    assert "cupy-cuda13x" in text
+
+
+def test_banner_old_driver(monkeypatch) -> None:
+    text = _banner_for(monkeypatch, {"runtime": 13020, "driver": 12040},
+                       "CUDA device detection failed: cudaErrorInsufficientDriver")
+    assert "driver is too old" in text
+    assert "CUDA 13.2" in text and "CUDA 12.4" in text
+
+
+def test_banner_unsupported_major(monkeypatch) -> None:
+    text = _banner_for(monkeypatch, {"runtime": 11080, "driver": 12040},
+                       "GPU computation test failed: x")
+    assert "unsupported CUDA version" in text
+    assert "12.x or 13.x" in text
+
+
 if __name__ == "__main__":
     import pytest
 

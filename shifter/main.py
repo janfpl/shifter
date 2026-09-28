@@ -79,21 +79,40 @@ def _fit_window_to_screen(viewer) -> None:
 
 
 def main() -> None:
+    # Configure terminal logging and crash diagnostics first, so that anything
+    # going wrong during startup (or later inside the Qt event loop) surfaces a
+    # traceback instead of silently aborting the process.
+    from shifter.logging_setup import configure_logging, install_diagnostics
+    configure_logging()
+    install_diagnostics()
+
     from shifter._qt_setup import ensure_qt
     ensure_qt()
 
-    import napari
+    # Qt is importable now — capture its own warnings/fatals too.
+    install_diagnostics()
 
-    from shifter.widget import ChromaticShiftWidget
+    try:
+        import napari
 
-    viewer = napari.Viewer(title="Chromatic Shift Corrector", show=False)
-    _set_default_font()
-    _fit_window_to_screen(viewer)
-    viewer.show()
+        from shifter.widget import ChromaticShiftWidget
 
-    widget = ChromaticShiftWidget(viewer)
-    viewer.window.add_dock_widget(widget, name="Chromatic Shift Corrector", area="right")
-    napari.run()
+        logger.info("Creating napari viewer")
+        viewer = napari.Viewer(title="Chromatic Shift Corrector", show=False)
+        _set_default_font()
+        _fit_window_to_screen(viewer)
+        viewer.show()
+
+        logger.info("Building Chromatic Shift Corrector widget")
+        widget = ChromaticShiftWidget(viewer)
+        viewer.window.add_dock_widget(
+            widget, name="Chromatic Shift Corrector", area="right"
+        )
+        logger.info("Startup complete — entering napari event loop")
+        napari.run()
+    except Exception:
+        logger.exception("Fatal error during application startup")
+        raise
 
 
 if __name__ == "__main__":

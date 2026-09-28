@@ -998,3 +998,19 @@ def run_export_h5(
 
     meta_path = save_metadata(metadata, output_dir)
     return meta_path
+
+
+def write_volume_tiff(volume: np.ndarray, output_path: "Path | str") -> Path:
+    """Write an in-memory 3-D volume to a BigTIFF, plane by plane.
+
+    Used by the deformable-export path, which produces a warped corrected volume
+    already resident in RAM (ROI / downsampled), so it needs a simple writer
+    rather than the slab-streaming integer-shift machinery. Independent of and
+    additive to the integer export functions above.
+    """
+    output_path = Path(output_path)
+    vol = np.ascontiguousarray(volume)
+    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tw:
+        for i in range(vol.shape[0]):
+            tw.write(vol[i], photometric="minisblack", contiguous=True)
+    return output_path
