@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ALGORITHM = "Mutual Information"
 DEFAULT_SEARCH_XY = 1
 DEFAULT_SEARCH_Z = 75
-DEFAULT_ROI_Y = 2
+DEFAULT_ROI_Y = 2  # also the GUI's "Add registration ROI" default height
 DEFAULT_RAM_PERCENT = 90
 
 

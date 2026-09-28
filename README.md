@@ -90,7 +90,8 @@ For each folder, one after another:
 2. **Reference = brightest channel.** This is the highest mean intensity, measured on
    each channel's coarsest pyramid level (or on the registration ROI if a channel has no
    pyramids).
-3. **Automatic ROI.** Full X width, 2 voxels in Y at the Y midpoint, full Z depth.
+3. **Automatic ROI.** The same as the GUI's *Add registration ROI* default: full X width,
+   2 voxels in Y at the Y midpoint, full Z depth.
 4. **Mutual Information** registration of every other channel against the reference.
    The shifts are applied without prompting. Channels whose shift hits the search limit,
    or whose confidence is low, are flagged in the console but still exported.
@@ -141,7 +142,7 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 
 ### 2. Register Channels
 
-Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
+Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Or click **Add registration ROI** to add a centred ROI and matching Z range; by default it spans the full X width, 2 voxels in Y at the midpoint, and the full Z depth, and the sizes can be changed under *Registration ROI size*. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
 
 Results populate the shift table with X/Y/Z voxel shifts and a confidence score per channel. Confidence is color-coded in the table (green = high, red = low).
 

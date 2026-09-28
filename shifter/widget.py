@@ -64,6 +64,7 @@ from shifter.h5_utils import (
 )
 from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from shifter.preview_engine import extract_subvolume, generate_preview
+from shifter.headless import DEFAULT_ROI_Y
 from shifter.registration_runner import register_channels
 from shifter.shift_manager import ShiftManager
 from shifter.utils import (
@@ -1339,7 +1340,7 @@ class ChromaticShiftWidget(QWidget):
         self.spin_reg_roi_y.setRange(1, max(ny, 1))
         self.spin_reg_roi_z.setRange(1, max(nz, 1))
         self.spin_reg_roi_x.setValue(nx)
-        self.spin_reg_roi_y.setValue(min(2, ny))
+        self.spin_reg_roi_y.setValue(min(DEFAULT_ROI_Y, ny))
         self.spin_reg_roi_z.setValue(nz)
 
     # ---- Pyramid Level Range ---------------------------------------- #
