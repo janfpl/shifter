@@ -32,13 +32,13 @@ SHIFTS = {0: (3, 1, -1), 2: (-4, -1, 1)}  # applied (Z, Y, X)
 SCALES = {0: 0.5, 1: 1.0, 2: 0.3}
 
 
-def _make_dataset(folder: Path) -> np.ndarray:
+def _make_dataset(folder: Path, shifts: dict = SHIFTS) -> np.ndarray:
     folder.mkdir(parents=True)
     ref = _make_blob_volume(np.random.default_rng(7))
     for ch, scale in SCALES.items():
         data = (ref.astype(np.float64) * scale).astype(np.uint16)
-        if ch in SHIFTS:
-            data = _apply_shift(data, SHIFTS[ch])
+        if ch in shifts:
+            data = _apply_shift(data, shifts[ch])
         _create_h5_file(folder / f"ch{ch}.lux.h5", data, ch)
     return ref
 
@@ -94,6 +94,33 @@ def test_process_folder_end_to_end() -> None:
         assert reg["source_folder"] == str(src.resolve())
 
         # Corrected channels line up with the reference in the interior.
+        m = 12
+        inner = (slice(m, -m),) * 3
+        for ch, scale in SCALES.items():
+            with h5py.File(out / f"ch{ch}.lux.h5", "r") as f:
+                got = f["Data"][inner]
+            expected = (ref.astype(np.float64) * scale).astype(np.uint16)[inner]
+            assert np.array_equal(got, expected), f"ch{ch} not aligned"
+
+
+def test_default_xy_range_is_zero_z_only() -> None:
+    assert headless.DEFAULT_SEARCH_XY == 0
+    z_only = {ch: (dz, 0, 0) for ch, (dz, _, _) in SHIFTS.items()}
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "sample1"
+        ref = _make_dataset(src, z_only)
+
+        out = headless.process_folder(
+            src, search_xy=0, search_z=8, roi_y=64, use_gpu=False
+        )
+
+        results = json.loads((out / "correction_metadata.json").read_text())[
+            "headless_registration"]["results"]
+        for r in results:
+            assert r["shift_x"] == 0 and r["shift_y"] == 0, r
+            # A range of 0 is "not searched", never "hit the search limit".
+            assert "XY shift at search limit" not in r["warnings"], r
+
         m = 12
         inner = (slice(m, -m),) * 3
         for ch, scale in SCALES.items():

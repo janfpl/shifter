@@ -32,8 +32,9 @@ rem  Leave empty to auto-detect (checks PATH, then common locations).
 rem  To find it: open Anaconda Prompt and run   where conda
 set "CONDA_ROOT="
 
-rem  Registration search range in voxels.
-set "XY_RANGE=1"
+rem  Registration search range in voxels. XY_RANGE=0 means no XY search
+rem  (only the Z shift is registered).
+set "XY_RANGE=0"
 set "Z_RANGE=90"
 
 rem  Height of the automatic registration ROI in Y voxels.

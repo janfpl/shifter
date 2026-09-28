@@ -19,6 +19,19 @@ conda activate shifter
 pip install -e .
 ```
 
+> **No git?** You can download the code instead of cloning it. On the
+> [repository page](https://github.com/janfpl/shifter), click the green **Code** button →
+> **Download ZIP**, then extract the ZIP (right-click → *Extract All*). In Anaconda Prompt,
+> `cd` into the extracted folder (the one containing `README.md`, e.g.
+> `cd C:\Users\you\Downloads\shifter-main\shifter-main`) and run the commands above from
+> `conda create` onwards. To install a branch other than `main`, pick it in the branch
+> menu on the repository page before clicking **Code**.
+>
+> `pip install -e .` runs shifter directly from that folder, so extract it somewhere
+> permanent (not *Downloads*, which tends to get cleaned up) and don't move or delete it
+> afterwards. A ZIP doesn't update itself: to get a newer version, download and extract
+> it again, then rerun `pip install -e .` from the new folder.
+
 The environment is named **`shifter`**. The double-click launchers
 (`launch_shifter.bat` and `headless_process.bat`) activate an environment by that name. If
 you pick a different name (`conda create -n myname ...`), open both `.bat` files in Notepad
@@ -203,7 +216,7 @@ The same thing from a terminal:
 
 ```bash
 python -m shifter.headless D:\data\sample1 D:\data\sample2
-python -m shifter.headless folders.txt --xy-range 1 --z-range 90
+python -m shifter.headless folders.txt --xy-range 0 --z-range 90
 python -m shifter.headless --help
 ```
 
@@ -217,7 +230,7 @@ around `=`, and save. The new values apply from the next run.
 |---------|---------|--------------|-------------------------|
 | `ENV_NAME` | `shifter` | Conda environment to activate (name or full path) | — |
 | `CONDA_ROOT` | empty (auto-detect) | Anaconda/Miniconda install folder, see [One-click launch](#one-click-launch-on-windows) | — |
-| `XY_RANGE` | `1` | Registration search range in X and Y, in voxels | `--xy-range` |
+| `XY_RANGE` | `0` | Registration search range in X and Y, in voxels. `0` means no XY search: only the Z shift is registered and X/Y stay at 0. Raise it (e.g. `1`–`5`) if the channels are also offset laterally | `--xy-range` |
 | `Z_RANGE` | `90` | Registration search range in Z, in voxels. The stack must be at least 2 × `Z_RANGE` planes deep; a folder that isn't fails with a message saying so | `--z-range` |
 | `ROI_Y` | `2` | Height of the automatic registration ROI in Y, in voxels. Must be at least 2 × `XY_RANGE`, so raise it when you raise `XY_RANGE` | `--roi-y` |
 | `RAM_PERCENT` | `90` | Percent of system RAM the export may use. Lower it if other programs need memory during a run | `--ram` |
