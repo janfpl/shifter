@@ -57,6 +57,63 @@ python -m shifter
 
 This opens a napari viewer with the Chromatic Shift Corrector widget docked on the right.
 
+### One-click launch on Windows
+
+Double-click `launch_shifter.bat` in the repository folder. It activates the conda
+environment and starts shifter, so users don't need to open Anaconda Prompt. To make a
+desktop shortcut, right-click the file → *Send to* → *Desktop (create shortcut)*.
+
+It should work unchanged if the environment is called `shifter` and conda is on `PATH`
+or in a standard install location. Otherwise, open the file in Notepad and edit the two
+settings at the top:
+
+| Setting | What to put there | How to find it |
+|---------|-------------------|----------------|
+| `ENV_NAME` | Environment name (default `shifter`) or full path to it | `conda env list` in Anaconda Prompt |
+| `CONDA_ROOT` | Anaconda/Miniconda install folder, e.g. `C:\Users\you\anaconda3` (leave empty to auto-detect) | `where conda` in Anaconda Prompt; the root is the folder above `condabin` or `Scripts` |
+
+If something goes wrong, the window stays open and shows the error.
+
+### Headless batch processing (no napari window)
+
+`headless_process.bat` registers and exports one or more Luxendo `.lux.h5` folders
+without opening napari. Drag a data folder (or several) onto it, drag a `.txt` file
+listing folders onto it, or double-click it and paste a path. In a `.txt` list, separate
+folders with commas and/or new lines. Lines starting with `#` are ignored, and relative
+paths are resolved against the `.txt` file's folder. Edit `ENV_NAME` / `CONDA_ROOT` at the
+top as for the launcher; `XY_RANGE` / `Z_RANGE` set the search range (default 1 / 90).
+
+For each folder, one after another:
+
+1. **Load** every `.lux.h5` channel. Companion `.ims` / `*_bdv.h5` headers and `main*`
+   files are skipped.
+2. **Reference = brightest channel.** This is the highest mean intensity, measured on
+   each channel's coarsest pyramid level (or on the registration ROI if a channel has no
+   pyramids).
+3. **Automatic ROI.** The same as the GUI's *Add registration ROI* default: full X width,
+   2 voxels in Y at the Y midpoint, full Z depth.
+4. **Mutual Information** registration of every other channel against the reference.
+   The shifts are applied without prompting. Channels whose shift hits the search limit,
+   or whose confidence is low, are flagged in the console but still exported.
+5. **Export** full-volume corrected `.lux.h5` files: original filenames, regenerated
+   pyramids, and companion headers. They go into a new folder next to the source,
+   `<folder>_MMDDYY_HHMM_shifted` (e.g. `sample1_092826_1430_shifted`). The name gets a
+   `_2`, `_3`, … suffix rather than overwriting an existing folder.
+
+`correction_metadata.json` in the output also records the reference choice, channel
+brightness, ROI, and per-channel shifts and confidence (`headless_registration`).
+`performance_log.txt` covers both registration and export. If one folder fails, the rest
+still run, and the summary at the end lists each folder's result. A folder with only one
+channel is skipped (nothing is written) and isn't counted as a failure.
+
+The same thing from a terminal:
+
+```bash
+python -m shifter.headless D:\data\sample1 D:\data\sample2
+python -m shifter.headless folders.txt --xy-range 1 --z-range 90
+python -m shifter.headless --help
+```
+
 ## Supported Formats
 
 | Format | Extension | Notes |
@@ -85,7 +142,7 @@ All data is loaded lazily via Dask arrays to avoid loading entire volumes into m
 
 ### 2. Register Channels
 
-Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
+Draw a rectangle ROI on the napari viewer and specify a Z sub-range to define the registration volume. Or click **Add registration ROI** to add a centred ROI and matching Z range; by default it spans the full X width, 2 voxels in Y at the midpoint, and the full Z depth, and the sizes can be changed under *Registration ROI size*. Select which channels to register against the reference, choose an algorithm (Mutual Information is the default), and run.
 
 Results populate the shift table with X/Y/Z voxel shifts and a confidence score per channel. Confidence is color-coded in the table (green = high, red = low).
 
@@ -212,7 +269,7 @@ A fast, robust general-purpose option when channels have similar intensity profi
 
 ### Mutual Information
 
-Coarse-to-fine exhaustive search maximizing mutual information via joint histograms. Coarse pass uses a step size of 5 voxels; fine pass refines within a 5-voxel radius.
+Coarse-to-fine exhaustive search maximizing mutual information via joint histograms. Coarse pass uses a step size of 5 voxels; fine pass refines within a 5-voxel radius. Both are capped per axis at that axis' search range, so a small range (e.g. 1 voxel in XY) is searched exhaustively in both directions.
 
 | Aspect | Detail |
 |--------|--------|

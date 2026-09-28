@@ -26,6 +26,7 @@ from qtpy.QtWidgets import (
     QSlider,
     QSpinBox,
     QTableWidget,
+    QToolButton,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -54,7 +55,6 @@ from shifter.perf_logger import (
     setup_perf_log,
     timed_operation,
     log_event,
-    log_memory,
 )
 from shifter.memory import release_memory
 from shifter.h5_utils import (
@@ -64,6 +64,8 @@ from shifter.h5_utils import (
 )
 from shifter.mip_panel import assemble_channel_panel, build_crosshair_overlay, compute_mips
 from shifter.preview_engine import extract_subvolume, generate_preview
+from shifter.headless import DEFAULT_ROI_Y, DEFAULT_SEARCH_XY, DEFAULT_SEARCH_Z
+from shifter.registration_runner import register_channels
 from shifter.shift_manager import ShiftManager
 from shifter.utils import (
     DEFAULT_COLORMAPS,
@@ -269,103 +271,22 @@ class RegistrationWorker(QThread):
             self.error.emit(traceback.format_exc())
 
     def _run_registration(self) -> list:
-        y_start, y_end, x_start, x_end = self.roi_bounds
-
-        log_event(f"Registration started | algo={self.algorithm_name} "
-                  f"channels={self.channels_to_register} "
-                  f"search_xy={self.search_range_xy} search_z={self.search_range_z} "
-                  f"gpu={self.use_gpu}")
-        log_memory("registration start", level=logging.INFO)
-
-        # Extract reference sub-volume.
-        ref_loader = self.loaders[self.reference_index]
-        ref_vol = extract_subvolume(
-            ref_loader.dask_array,
-            self.z_start, self.z_end,
-            y_start, y_end, x_start, x_end,
+        return register_channels(
+            self.loaders,
+            self.reference_index,
+            self.channels_to_register,
+            self.algorithm_name,
+            self.algorithm_kwargs,
+            self.search_range_xy,
+            self.search_range_z,
+            self.roi_bounds,
+            self.z_start,
+            self.z_end,
+            self.background_subtraction,
+            self.gaussian_smoothing,
+            self.use_gpu,
+            progress=self.progress.emit,
         )
-
-        # Preprocess reference.
-        ref_vol = preprocess(
-            ref_vol,
-            background_subtraction=self.background_subtraction,
-            gaussian_smoothing=self.gaussian_smoothing,
-            use_gpu=self.use_gpu,
-        )
-
-        # Instantiate algorithm.
-        algo_cls = ALGORITHM_REGISTRY[self.algorithm_name]
-        algo = algo_cls(**self.algorithm_kwargs)
-
-        # Instantiate algorithm.
-        n = len(self.channels_to_register)
-        results = []
-
-        # Progress is tracked at sub-channel resolution: each channel spans one
-        # unit, and the algorithm reports a fraction within it, so the bar keeps
-        # moving during a single (possibly long) mutual-information search rather
-        # than jumping once per channel. ``scale`` gives the bar smooth steps.
-        scale = 1000
-
-        def _emit(idx: int, frac: float) -> None:
-            frac = min(1.0, max(0.0, frac))
-            self.progress.emit(
-                int((idx + frac) * scale),
-                n * scale,
-                f"Registering channel {idx + 1} of {n}...",
-            )
-
-        for idx, ch_i in enumerate(self.channels_to_register):
-            loader = self.loaders[ch_i]
-            _emit(idx, 0.0)
-
-            # Extract moving sub-volume.
-            mov_vol = extract_subvolume(
-                loader.dask_array,
-                self.z_start, self.z_end,
-                y_start, y_end, x_start, x_end,
-            )
-
-            # Preprocess moving.
-            mov_vol = preprocess(
-                mov_vol,
-                background_subtraction=self.background_subtraction,
-                gaussian_smoothing=self.gaussian_smoothing,
-                use_gpu=self.use_gpu,
-            )
-
-            # Advance the bar within this channel as the algorithm searches.
-            channel_cb = lambda frac, _idx=idx: _emit(_idx, frac)
-
-            # Run registration with GPU OOM fallback.
-            with timed_operation(f"Registration channel {ch_i} ({self.algorithm_name})"):
-                try:
-                    result = algo.register(
-                        ref_vol, mov_vol,
-                        self.search_range_xy, self.search_range_z,
-                        use_gpu=self.use_gpu,
-                        progress_callback=channel_cb,
-                    )
-                except Exception:
-                    # If GPU fails (e.g. OOM), retry on CPU.
-                    if self.use_gpu:
-                        result = algo.register(
-                            ref_vol, mov_vol,
-                            self.search_range_xy, self.search_range_z,
-                            use_gpu=False,
-                            progress_callback=channel_cb,
-                        )
-                    else:
-                        raise
-
-            _emit(idx, 1.0)
-            log_event(f"Registration channel {ch_i} result: "
-                      f"shift=({result.shift_z},{result.shift_y},{result.shift_x}) "
-                      f"confidence={result.confidence:.3f}")
-            results.append((ch_i, result))
-
-        self.progress.emit(n * scale, n * scale, "Registration complete.")
-        return results
 
 
 def _deformable_output_name(filename: str) -> str:
@@ -867,7 +788,7 @@ class ChromaticShiftWidget(QWidget):
         row_sr_xy.addWidget(QLabel("XY search range (voxels):"))
         self.spin_sr_xy = QSpinBox()
         self.spin_sr_xy.setRange(1, MAX_SEARCH_RANGE)
-        self.spin_sr_xy.setValue(1)
+        self.spin_sr_xy.setValue(DEFAULT_SEARCH_XY)
         row_sr_xy.addWidget(self.spin_sr_xy)
         lay.addLayout(row_sr_xy)
 
@@ -875,7 +796,7 @@ class ChromaticShiftWidget(QWidget):
         row_sr_z.addWidget(QLabel("Z search range (voxels):"))
         self.spin_sr_z = QSpinBox()
         self.spin_sr_z.setRange(1, MAX_SEARCH_RANGE)
-        self.spin_sr_z.setValue(75)
+        self.spin_sr_z.setValue(DEFAULT_SEARCH_Z)
         row_sr_z.addWidget(self.spin_sr_z)
         lay.addLayout(row_sr_z)
 
@@ -892,6 +813,48 @@ class ChromaticShiftWidget(QWidget):
         self.lbl_gpu_status = QLabel()
         self._update_gpu_indicator()
         lay.addWidget(self.lbl_gpu_status)
+
+        # Registration ROI: a thin slab through the middle of the volume.
+        self.btn_add_reg_roi = QPushButton("Add registration ROI")
+        self.btn_add_reg_roi.clicked.connect(self._on_add_registration_roi)
+        self.btn_add_reg_roi.setEnabled(False)
+        self.btn_add_reg_roi.setToolTip("Load a dataset first.")
+        lay.addWidget(self.btn_add_reg_roi)
+
+        self.btn_reg_roi_size = QToolButton()
+        self.btn_reg_roi_size.setText("Registration ROI size")
+        self.btn_reg_roi_size.setCheckable(True)
+        self.btn_reg_roi_size.setChecked(False)
+        self.btn_reg_roi_size.setArrowType(Qt.RightArrow)
+        self.btn_reg_roi_size.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_reg_roi_size.setStyleSheet("QToolButton { border: none; }")
+        self.btn_reg_roi_size.toggled.connect(self._on_toggle_reg_roi_size)
+        lay.addWidget(self.btn_reg_roi_size)
+
+        # Sizes are centred on the volume; X and Z default to the full
+        # extent once a dataset is loaded.
+        self._reg_roi_size_container = QWidget()
+        size_lay = QVBoxLayout()
+        size_lay.setContentsMargins(12, 0, 0, 0)
+        self.spin_reg_roi_x = QSpinBox()
+        self.spin_reg_roi_y = QSpinBox()
+        self.spin_reg_roi_z = QSpinBox()
+        for label, spin in [
+            ("X size (voxels):", self.spin_reg_roi_x),
+            ("Y size (voxels):", self.spin_reg_roi_y),
+            ("Z size (planes):", self.spin_reg_roi_z),
+        ]:
+            spin.setRange(1, 1_000_000)
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(spin)
+            size_lay.addLayout(row)
+        self.spin_reg_roi_x.setValue(1)
+        self.spin_reg_roi_y.setValue(2)
+        self.spin_reg_roi_z.setValue(1)
+        self._reg_roi_size_container.setLayout(size_lay)
+        self._reg_roi_size_container.setVisible(False)
+        lay.addWidget(self._reg_roi_size_container)
 
         # Run button.
         self.btn_run_registration = QPushButton("Run Auto-Registration")
@@ -1102,7 +1065,14 @@ class ChromaticShiftWidget(QWidget):
         )
 
     def _update_run_button_state(self) -> None:
-        """Enable the Run button only when ROI is defined and data loaded."""
+        """Enable the Run button only when ROI is defined and data loaded.
+
+        Also enables the "Add registration ROI" button whenever data is loaded.
+        """
+        self.btn_add_reg_roi.setEnabled(bool(self.loaders))
+        self.btn_add_reg_roi.setToolTip(
+            "" if self.loaders else "Load a dataset first."
+        )
         enabled = bool(self.loaders) and self._has_roi()
         self.btn_run_registration.setEnabled(enabled)
         if not enabled:
@@ -1364,6 +1334,15 @@ class ChromaticShiftWidget(QWidget):
         self.spin_z_start.setValue(0)
         self.spin_z_end.setValue(min(min_z - 1, 99))
 
+        # Registration ROI defaults: full X, 2 voxels in Y and full Z.
+        nz, ny, nx = self._min_volume_shape()
+        self.spin_reg_roi_x.setRange(1, max(nx, 1))
+        self.spin_reg_roi_y.setRange(1, max(ny, 1))
+        self.spin_reg_roi_z.setRange(1, max(nz, 1))
+        self.spin_reg_roi_x.setValue(nx)
+        self.spin_reg_roi_y.setValue(min(DEFAULT_ROI_Y, ny))
+        self.spin_reg_roi_z.setValue(nz)
+
     # ---- Pyramid Level Range ---------------------------------------- #
 
     def _setup_pyramid_controls(self) -> None:
@@ -1477,6 +1456,7 @@ class ChromaticShiftWidget(QWidget):
             self._h5_file_manager.close_all()
             self._h5_file_manager = None
         self._disable_pyramid_controls("No pyramid data loaded.")
+        self._update_run_button_state()
 
     # ------------------------------------------------------------------ #
     # Callbacks — Shift Table
@@ -1756,8 +1736,8 @@ class ChromaticShiftWidget(QWidget):
     # Callbacks — ROI Preview
     # ------------------------------------------------------------------ #
 
-    def _on_draw_roi(self) -> None:
-        """Activate the rectangle drawing tool in napari."""
+    def _ensure_shapes_layer(self) -> None:
+        """Create the ROI shapes layer if it does not exist yet."""
         if self._shapes_layer is None or self._shapes_layer not in self.viewer.layers:
             self._shapes_layer = self.viewer.add_shapes(
                 name="ROI",
@@ -1766,12 +1746,65 @@ class ChromaticShiftWidget(QWidget):
                 face_color="transparent",
                 edge_width=2,
             )
+            # After drawing, update the run button state.
+            self._shapes_layer.events.data.connect(
+                lambda _: self._update_run_button_state()
+            )
+
+    def _on_draw_roi(self) -> None:
+        """Activate the rectangle drawing tool in napari."""
+        self._ensure_shapes_layer()
         self.viewer.layers.selection.active = self._shapes_layer
         self._shapes_layer.mode = "add_rectangle"
-        # After drawing, update the run button state.
-        self._shapes_layer.events.data.connect(
-            lambda _: self._update_run_button_state()
+
+    def _min_volume_shape(self) -> tuple[int, int, int]:
+        """(nz, ny, nx) shared by all loaded channels."""
+        return (
+            min(ld.shape[0] for ld in self.loaders),
+            min(ld.shape[1] for ld in self.loaders),
+            min(ld.shape[2] for ld in self.loaders),
         )
+
+    def _on_toggle_reg_roi_size(self, expanded: bool) -> None:
+        self.btn_reg_roi_size.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._reg_roi_size_container.setVisible(expanded)
+
+    def _on_add_registration_roi(self) -> None:
+        """Add a rectangle ROI centred in the volume using the configured sizes.
+
+        With the defaults this is a 2-voxel-tall slab at the Y midpoint that
+        spans the full X width and the full Z depth.
+        """
+        if not self.loaders:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+
+        def centred(size: int, extent: int) -> tuple[int, int]:
+            size = max(1, min(size, extent))
+            start = extent // 2 - size // 2
+            return start, start + size
+
+        nz, ny, nx = self._min_volume_shape()
+        x_start, x_end = centred(self.spin_reg_roi_x.value(), nx)
+        y_start, y_end = centred(self.spin_reg_roi_y.value(), ny)
+        z_start, z_end = centred(self.spin_reg_roi_z.value(), nz)
+
+        self._ensure_shapes_layer()
+        rect = np.array(
+            [
+                [y_start, x_start],
+                [y_start, x_end],
+                [y_end, x_end],
+                [y_end, x_start],
+            ],
+            dtype=float,
+        )
+        self._shapes_layer.add(rect, shape_type="rectangle")
+        self._shapes_layer.mode = "pan_zoom"
+
+        self.spin_z_start.setValue(z_start)
+        self.spin_z_end.setValue(z_end - 1)  # exclusive → inclusive
+        self._update_run_button_state()
 
     def _get_roi_bounds(self) -> tuple[int, int, int, int] | None:
         """Extract the bounding box of the last drawn rectangle.
@@ -2502,6 +2535,10 @@ class ChromaticShiftWidget(QWidget):
             self.file_table,
             self.shift_table,
             self.btn_run_registration,
+            self.btn_add_reg_roi,
+            self.spin_reg_roi_x,
+            self.spin_reg_roi_y,
+            self.spin_reg_roi_z,
             self.combo_algorithm,
             self.spin_sr_xy,
             self.spin_sr_z,

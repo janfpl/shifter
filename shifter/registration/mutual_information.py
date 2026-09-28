@@ -292,34 +292,47 @@ def _overlapping_regions(
 # Helpers for building shift arrays
 # ---------------------------------------------------------------------------
 
+def _coarse_axis(sr: int, step: int) -> range:
+    """Coarse-pass offsets along one axis.
+
+    The step is capped at the axis' search range so a range smaller than the
+    coarse step still samples both signs: with ``range(-1, 2, 5)`` only ``-1``
+    was tried, and the fine pass could never reach ``+1``.
+    """
+    return range(-sr, sr + 1, max(1, min(step, sr)))
+
+
+def _fine_axis(center: int, sr: int) -> list[int]:
+    """Fine-pass offsets along one axis, around *center* and within ``[-sr, sr]``.
+
+    The radius is per axis: a small XY range must not shrink the Z refinement
+    below the coarse step, or Z offsets between coarse samples are unreachable.
+    """
+    r = min(_FINE_RADIUS, sr)
+    return [d for d in range(center - r, center + r + 1) if abs(d) <= sr]
+
+
 def _build_shifts_array(sr_xy: int, sr_z: int, step: int) -> np.ndarray:
     """Pre-generate all (dz, dy, dx) candidates as an (N, 3) int64 array."""
     shifts = []
-    for dz in range(-sr_z, sr_z + 1, step):
-        for dy in range(-sr_xy, sr_xy + 1, step):
-            for dx in range(-sr_xy, sr_xy + 1, step):
+    for dz in _coarse_axis(sr_z, step):
+        for dy in _coarse_axis(sr_xy, step):
+            for dx in _coarse_axis(sr_xy, step):
                 shifts.append((dz, dy, dx))
     return np.array(shifts, dtype=np.int64)
 
 
 def _build_fine_shifts_array(
     best_shift: tuple[int, int, int],
-    fine_radius: int,
     sr_xy: int,
     sr_z: int,
 ) -> np.ndarray:
     """Pre-generate fine-pass shifts around *best_shift*."""
     bz, by, bx = best_shift
     shifts = []
-    for dz in range(bz - fine_radius, bz + fine_radius + 1):
-        if abs(dz) > sr_z:
-            continue
-        for dy in range(by - fine_radius, by + fine_radius + 1):
-            if abs(dy) > sr_xy:
-                continue
-            for dx in range(bx - fine_radius, bx + fine_radius + 1):
-                if abs(dx) > sr_xy:
-                    continue
+    for dz in _fine_axis(bz, sr_z):
+        for dy in _fine_axis(by, sr_xy):
+            for dx in _fine_axis(bx, sr_xy):
                 shifts.append((dz, dy, dx))
     return np.array(shifts, dtype=np.int64) if shifts else np.empty((0, 3), dtype=np.int64)
 
@@ -393,8 +406,7 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         )
 
         # ---- fine pass (parallel, batched for progress) ----------------
-        fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
-        fine_shifts = _build_fine_shifts_array(best_shift, fine_radius, sr_xy, sr_z)
+        fine_shifts = _build_fine_shifts_array(best_shift, sr_xy, sr_z)
 
         if fine_shifts.shape[0] > 0:
             with phase(f"{ALGORITHM_NAME} fine pass ({fine_shifts.shape[0]} shifts)"):
@@ -446,22 +458,16 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         # ---- fine pass --------------------------------------------------
         fine_timer = phase(f"{ALGORITHM_NAME} fine pass (serial)")
         fine_timer.__enter__()
-        fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         fine_shifts: list[tuple[int, int, int, float]] = []
         bz, by, bx = best_shift
+        fzs, fys, fxs = _fine_axis(bz, sr_z), _fine_axis(by, sr_xy), _fine_axis(bx, sr_xy)
         # Report progress across [0.5, 1.0] as we walk the fine neighbourhood.
-        fine_total = max(1, (2 * fine_radius + 1) ** 3)
+        fine_total = max(1, len(fzs) * len(fys) * len(fxs))
         report_every = max(1, fine_total // _PROGRESS_BATCHES)
         fine_seen = 0
-        for dz in range(bz - fine_radius, bz + fine_radius + 1):
-            if abs(dz) > sr_z:
-                continue
-            for dy in range(by - fine_radius, by + fine_radius + 1):
-                if abs(dy) > sr_xy:
-                    continue
-                for dx in range(bx - fine_radius, bx + fine_radius + 1):
-                    if abs(dx) > sr_xy:
-                        continue
+        for dz in fzs:
+            for dy in fys:
+                for dx in fxs:
                     fine_seen += 1
                     if fine_seen % report_every == 0:
                         _report(progress_callback, 0.5 + 0.5 * (fine_seen / fine_total))
@@ -512,9 +518,9 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         best_shift = (0, 0, 0)
         mi_values: list[float] = []
 
-        zs = range(-sr_z, sr_z + 1, step)
-        ys = range(-sr_xy, sr_xy + 1, step)
-        xs = range(-sr_xy, sr_xy + 1, step)
+        zs = _coarse_axis(sr_z, step)
+        ys = _coarse_axis(sr_xy, step)
+        xs = _coarse_axis(sr_xy, step)
         total = max(1, len(zs) * len(ys) * len(xs))
         report_every = max(1, total // _PROGRESS_BATCHES)
         seen = 0
@@ -605,9 +611,9 @@ class MutualInformationRegistration(RegistrationAlgorithm):
         mi_values: list[float] = []
         step = _COARSE_STEP
 
-        zs = range(-sr_z, sr_z + 1, step)
-        ys = range(-sr_xy, sr_xy + 1, step)
-        xs = range(-sr_xy, sr_xy + 1, step)
+        zs = _coarse_axis(sr_z, step)
+        ys = _coarse_axis(sr_xy, step)
+        xs = _coarse_axis(sr_xy, step)
         coarse_total = max(1, len(zs) * len(ys) * len(xs))
         coarse_every = max(1, coarse_total // _PROGRESS_BATCHES)
         coarse_seen = 0
@@ -628,20 +634,14 @@ class MutualInformationRegistration(RegistrationAlgorithm):
                         best_shift = (dz, dy, dx)
 
         # Fine search (progress across [0.5, 1.0]).
-        fine_radius = min(_FINE_RADIUS, sr_xy, sr_z)
         bz, by, bx = best_shift
-        fine_total = max(1, (2 * fine_radius + 1) ** 3)
+        fzs, fys, fxs = _fine_axis(bz, sr_z), _fine_axis(by, sr_xy), _fine_axis(bx, sr_xy)
+        fine_total = max(1, len(fzs) * len(fys) * len(fxs))
         fine_every = max(1, fine_total // _PROGRESS_BATCHES)
         fine_seen = 0
-        for dz in range(bz - fine_radius, bz + fine_radius + 1):
-            if abs(dz) > sr_z:
-                continue
-            for dy in range(by - fine_radius, by + fine_radius + 1):
-                if abs(dy) > sr_xy:
-                    continue
-                for dx in range(bx - fine_radius, bx + fine_radius + 1):
-                    if abs(dx) > sr_xy:
-                        continue
+        for dz in fzs:
+            for dy in fys:
+                for dx in fxs:
                     fine_seen += 1
                     if fine_seen % fine_every == 0:
                         _report(progress_callback, 0.5 + 0.5 * (fine_seen / fine_total))

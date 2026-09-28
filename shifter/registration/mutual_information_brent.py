@@ -49,6 +49,7 @@ from shifter.registration.mutual_information import (
     _MI_BINS,
     _COARSE_STEP,
     _build_shifts_array,
+    _coarse_axis,
     _compute_mi,
     _HAVE_NUMBA,
     _overlapping_regions,
@@ -242,9 +243,9 @@ class MutualInformationBrentRegistration(RegistrationAlgorithm):
         best_mi = -np.inf
         best = (0, 0, 0)
         mi_values: list[float] = []
-        zs = range(-sr_z, sr_z + 1, _COARSE_STEP)
-        ys = range(-sr_xy, sr_xy + 1, _COARSE_STEP)
-        xs = range(-sr_xy, sr_xy + 1, _COARSE_STEP)
+        zs = _coarse_axis(sr_z, _COARSE_STEP)
+        ys = _coarse_axis(sr_xy, _COARSE_STEP)
+        xs = _coarse_axis(sr_xy, _COARSE_STEP)
         total = max(1, len(zs) * len(ys) * len(xs))
         seen = 0
         for dz in zs:
