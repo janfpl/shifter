@@ -25,9 +25,11 @@ pip install cupy-cuda13x    # CUDA 13.x
 
 ## Usage
 
-Launch the application:
+Open a new Anaconda Prompt (or terminal), activate the environment, go to the install folder and launch the application:
 
 ```bash
+conda activate shifter
+cd path/to/shifter
 python -m shifter
 ```
 
