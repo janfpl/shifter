@@ -4,7 +4,7 @@ Napari-based axial and lateral chromatic shift correction for light sheet micros
 
 ## Installation
 
-Clone the repository and create a conda environment with Python 3.12, Qt, and numba:
+Requires Python 3.12. Clone the repository and create a conda environment:
 
 ```bash
 git clone https://github.com/janfpl/shifter.git
@@ -14,38 +14,14 @@ conda activate shifter
 pip install -e .
 ```
 
-> **Install `numba` — it is strongly recommended, not cosmetic.** It parallelises two
-> hot paths across CPU cores. On a measured 431 GiB two-channel export, pyramid
-> generation took **103 s per channel with numba versus 631 s without (6.1×)**, and
-> mutual-information registration is likewise far slower on the pure-NumPy fallback.
-> Results are bit-identical either way — only the speed differs.
->
-> Install it via conda (as in the command above) because conda ships pre-built binaries
-> for `numba` and its dependency `llvmlite`; installing via pip may fail on macOS and
-> other platforms due to build toolchain incompatibilities. The pip extra
-> `pip install -e ".[numba]"` also works but may require additional build dependencies.
->
-> To confirm it is active in the environment you actually run the app from:
->
-> ```bash
-> conda activate shifter
-> python -c "import numba; print(numba.__version__)"
-> ```
->
-> Every export also logs the backend in use — look for
-> `Pyramid reduction backend: numba (N threads)` near the top of
-> `performance_log.txt`. If it instead reads `numpy (single-threaded fallback …)`, the
-> line names the underlying error.
+`numba` is strongly recommended (it is several times faster for pyramid generation and mutual-information registration). Install it via conda as above; pip builds can fail on some platforms.
 
-For GPU acceleration (optional, requires **CUDA Toolkit 12.6**):
+Optional GPU acceleration, matching your CUDA version:
 
 ```bash
-pip install -e ".[gpu]"
+pip install -e ".[gpu]"     # CUDA 12.x (tested with 12.6)
+pip install cupy-cuda13x    # CUDA 13.x
 ```
-
-> **Note:** CUDA Toolkit **12.6** is the recommended and tested version. CUDA 10.x and 13.x are **not compatible**.
-
-Requires Python 3.12.
 
 ## Usage
 
@@ -364,7 +340,7 @@ Install GPU support:
 pip install -e ".[gpu]"
 ```
 
-Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); the app is tested against CUDA 12.6. The CuPy wheel bundles its own CUDA 12.x libraries, so it may report a runtime version (e.g. 12.9) different from a separately installed toolkit — that is expected and fine. CUDA 11.x and 13.x are not supported.
+Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); the app is tested against CUDA 12.6. The CuPy wheel bundles its own CUDA 12.x libraries, so it may report a runtime version (e.g. 12.9) different from a separately installed toolkit — that is expected and fine. For CUDA 13.x, install `cupy-cuda13x` instead. CUDA 11.x is not supported.
 
 **Troubleshooting: GPU shows CPU mode with a "could not compile a test kernel" banner**
 
