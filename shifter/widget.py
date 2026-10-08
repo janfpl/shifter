@@ -787,7 +787,8 @@ class ChromaticShiftWidget(QWidget):
         row_sr_xy = QHBoxLayout()
         row_sr_xy.addWidget(QLabel("XY search range (voxels):"))
         self.spin_sr_xy = QSpinBox()
-        self.spin_sr_xy.setRange(1, MAX_SEARCH_RANGE)
+        self.spin_sr_xy.setRange(0, MAX_SEARCH_RANGE)
+        self.spin_sr_xy.setToolTip("0 = no XY search: only the Z shift is registered.")
         self.spin_sr_xy.setValue(DEFAULT_SEARCH_XY)
         row_sr_xy.addWidget(self.spin_sr_xy)
         lay.addLayout(row_sr_xy)
@@ -1030,8 +1031,9 @@ class ChromaticShiftWidget(QWidget):
                 self.lbl_gpu_status.setToolTip(reason)
             else:
                 self.lbl_gpu_status.setToolTip(
-                    "No compatible GPU detected. Install cupy-cuda12x and "
-                    "the CUDA 12.x Toolkit for GPU acceleration."
+                    "No compatible GPU detected. Install the CuPy wheel "
+                    "matching your CUDA Toolkit (cupy-cuda12x for CUDA 12.x "
+                    "or cupy-cuda13x for CUDA 13.x) for GPU acceleration."
                 )
 
     def _on_algorithm_changed(self, text: str) -> None:
@@ -1685,13 +1687,14 @@ class ChromaticShiftWidget(QWidget):
             self._confidence_scores[ch_i] = result.confidence
             confidences.append(result.confidence)
 
-            # Check if shift hit search range limit.
-            if abs(result.shift_x) >= sr_xy or abs(result.shift_y) >= sr_xy:
+            # Check if shift hit search range limit. A range of 0 means the
+            # axis is not searched, so it has no limit to hit.
+            if sr_xy > 0 and (abs(result.shift_x) >= sr_xy or abs(result.shift_y) >= sr_xy):
                 warnings.append(
                     f"ch{ch_i}: XY shift hit search range limit. "
                     "Consider increasing the XY search range."
                 )
-            if abs(result.shift_z) >= sr_z:
+            if sr_z > 0 and abs(result.shift_z) >= sr_z:
                 warnings.append(
                     f"ch{ch_i}: Z shift hit search range limit. "
                     "Consider increasing the Z search range."

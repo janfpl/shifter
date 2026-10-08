@@ -32,13 +32,26 @@ rem  Leave empty to auto-detect (checks PATH, then common locations).
 rem  To find it: open Anaconda Prompt and run   where conda
 set "CONDA_ROOT="
 
-rem  Registration search range in voxels.
-set "XY_RANGE=1"
+rem  Registration search range in voxels. XY_RANGE=0 means no XY search
+rem  (only the Z shift is registered).
+set "XY_RANGE=0"
 set "Z_RANGE=90"
+
+rem  Height of the automatic registration ROI in Y voxels.
+set "ROI_Y=2"
+
+rem  Percent of system RAM the export may use.
+set "RAM_PERCENT=90"
+
+rem  Write low-resolution pyramid layers: yes or no.
+set "PYRAMIDS=yes"
 
 rem ================================================================
 rem  Nothing below here should need changing
 rem ================================================================
+
+set "OPTS=--xy-range %XY_RANGE% --z-range %Z_RANGE% --roi-y %ROI_Y% --ram %RAM_PERCENT%"
+if /i "%PYRAMIDS%"=="no" set "OPTS=%OPTS% --no-pyramids"
 
 if defined CONDA_ROOT goto :check_root
 
@@ -94,12 +107,12 @@ set /p "INPUT=Path: "
 if not defined INPUT goto :fail
 set "INPUT=%INPUT:"=%"
 echo.
-python -m shifter.headless "%INPUT%" --xy-range %XY_RANGE% --z-range %Z_RANGE%
+python -m shifter.headless "%INPUT%" %OPTS%
 goto :done
 
 :run_args
 echo.
-python -m shifter.headless %* --xy-range %XY_RANGE% --z-range %Z_RANGE%
+python -m shifter.headless %* %OPTS%
 
 :done
 if errorlevel 1 goto :fail

@@ -16,12 +16,14 @@ pip install -e .
 
 `numba` is strongly recommended (it is several times faster for pyramid generation and mutual-information registration). Install it via conda as above; pip builds can fail on some platforms.
 
-Optional GPU acceleration, matching your CUDA version:
+Optional GPU acceleration, matching the `CUDA Version` that `nvidia-smi` reports (install only one):
 
 ```bash
-pip install -e ".[gpu]"     # CUDA 12.x (tested with 12.6)
-pip install cupy-cuda13x    # CUDA 13.x
+pip install -e ".[gpu-cuda12]"   # CUDA 12.x (tested with 12.6)
+pip install -e ".[gpu-cuda13]"   # CUDA 13.x (NVIDIA driver R580 or newer)
 ```
+
+To switch, `pip uninstall -y` the other CuPy build (`cupy-cuda12x` or `cupy-cuda13x`) first. Step-by-step Windows instructions (ZIP download instead of git, CUDA Toolkit, `CUDA_PATH`, checking the GPU) are in [Detailed installation (Windows)](#detailed-installation-windows).
 
 ## Usage
 
@@ -58,8 +60,8 @@ If something goes wrong, the window stays open and shows the error.
 without opening napari. Drag a data folder (or several) onto it, drag a `.txt` file
 listing folders onto it, or double-click it and paste a path. In a `.txt` list, separate
 folders with commas and/or new lines. Lines starting with `#` are ignored, and relative
-paths are resolved against the `.txt` file's folder. Edit `ENV_NAME` / `CONDA_ROOT` at the
-top as for the launcher; `XY_RANGE` / `Z_RANGE` set the search range (default 1 / 90).
+paths are resolved against the `.txt` file's folder. The settings it uses are described
+under [Changing the headless defaults](#changing-the-headless-defaults) below.
 
 For each folder, one after another:
 
@@ -88,9 +90,49 @@ The same thing from a terminal:
 
 ```bash
 python -m shifter.headless D:\data\sample1 D:\data\sample2
-python -m shifter.headless folders.txt --xy-range 1 --z-range 90
+python -m shifter.headless folders.txt --xy-range 0 --z-range 90
 python -m shifter.headless --help
 ```
+
+#### Changing the headless defaults
+
+Open `headless_process.bat` in Notepad (right-click → *Edit*) and change the lines in the
+**USER SETTINGS** block at the top. Keep the `set "NAME=value"` form, with no spaces
+around `=`, and save. The new values apply from the next run.
+
+| Setting | Default | What it does | Command-line equivalent |
+|---------|---------|--------------|-------------------------|
+| `ENV_NAME` | `shifter` | Conda environment to activate (name or full path) | — |
+| `CONDA_ROOT` | empty (auto-detect) | Anaconda/Miniconda install folder, see [One-click launch](#one-click-launch-on-windows) | — |
+| `XY_RANGE` | `0` | Registration search range in X and Y, in voxels. `0` means no XY search: only the Z shift is registered and X/Y stay at 0. Raise it (e.g. `1`–`5`) if the channels are also offset laterally | `--xy-range` |
+| `Z_RANGE` | `90` | Registration search range in Z, in voxels. The stack must be at least 2 × `Z_RANGE` planes deep; a folder that isn't fails with a message saying so | `--z-range` |
+| `ROI_Y` | `2` | Height of the automatic registration ROI in Y, in voxels. Must be at least 2 × `XY_RANGE`, so raise it when you raise `XY_RANGE` | `--roi-y` |
+| `RAM_PERCENT` | `90` | Percent of system RAM the export may use. Lower it if other programs need memory during a run | `--ram` |
+| `PYRAMIDS` | `yes` | `no` skips writing low-resolution pyramid layers (faster export, but viewers such as Imaris or BigDataViewer lose their overview levels) | `--no-pyramids` |
+
+For example, a wider search with a taller ROI and no pyramids:
+
+```bat
+set "XY_RANGE=5"
+set "Z_RANGE=120"
+set "ROI_Y=16"
+set "PYRAMIDS=no"
+```
+
+To keep several configurations, copy the file (e.g. `headless_process_wide.bat`) and edit
+the copy; each copy has its own settings.
+
+Other environment variables can go in the same block, e.g. `set "SHIFTER_DISABLE_GPU=1"`
+to run on the CPU only, or `set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"`
+if `CUDA_PATH` isn't configured in the conda environment ([Detailed installation step 3](#3-point-the-conda-environment-at-the-cuda-toolkit-cuda_path)).
+
+When running `python -m shifter.headless` from a terminal, pass the options shown in the
+last column; anything you leave out uses the built-in default. The built-in defaults are
+the `DEFAULT_*` constants at the top of `shifter/headless.py`. The `.bat` file always
+passes its own values, so editing the `.bat` is enough for double-click use.
+The GUI takes its starting values from the same constants: `DEFAULT_SEARCH_XY` and
+`DEFAULT_SEARCH_Z` for the search range, and `DEFAULT_ROI_Y` for the *Add registration ROI*
+height. Changing them there changes both the GUI and terminal runs.
 
 ## Supported Formats
 
@@ -325,30 +367,177 @@ The solver ports the reference pipeline (`deedsBCV0.cpp`): a 5-level control-poi
 
 On synthetic data with a known smooth deformation, the full schedule reduces fixed↔moving SSD by ~98%. Because it solves a per-voxel field over a multi-level label search, it is substantially slower than the translation methods (tens of seconds for a modest ROI on CPU) — it is an export-time correction, not an interactive one.
 
+## Detailed installation (Windows)
+
+These steps are written for Windows with Anaconda or Miniconda. The same `conda` and `pip`
+commands work on macOS and Linux, but the GPU part is Windows/Linux only.
+
+### 1. Create the conda environment
+
+Open **Anaconda Prompt** and run:
+
+```cmd
+git clone https://github.com/janfpl/shifter.git
+cd shifter
+conda create -n shifter python=3.12 pyqt numba -y
+conda activate shifter
+pip install -e .
+```
+
+> **No git?** You can download the code instead of cloning it. On the
+> [repository page](https://github.com/janfpl/shifter), click the green **Code** button →
+> **Download ZIP**, then extract the ZIP (right-click → *Extract All*). In Anaconda Prompt,
+> `cd` into the extracted folder (the one containing `README.md`, e.g.
+> `cd C:\Users\you\Downloads\shifter-main\shifter-main`) and run the commands above from
+> `conda create` onwards. To install a branch other than `main`, pick it in the branch
+> menu on the repository page before clicking **Code**.
+>
+> `pip install -e .` runs shifter directly from that folder, so extract it somewhere
+> permanent (not *Downloads*, which tends to get cleaned up) and don't move or delete it
+> afterwards. A ZIP doesn't update itself: to get a newer version, download and extract
+> it again, then rerun `pip install -e .` from the new folder.
+
+The environment is named **`shifter`**. The double-click launchers
+(`launch_shifter.bat` and `headless_process.bat`) activate an environment by that name. If
+you pick a different name (`conda create -n myname ...`), open both `.bat` files in Notepad
+and set `ENV_NAME=myname` at the top. `conda env list` shows the environments you have.
+
+Always install into the activated `shifter` environment. `pip` from another Python (for
+example the Microsoft Store Python in `C:\Users\...\AppData\Local\Packages\PythonSoftwareFoundation...`)
+installs packages that the launchers never see. `where python` should list
+`...\envs\shifter\python.exe` first.
+
+> **Install `numba` — it is strongly recommended, not cosmetic.** It parallelises two
+> hot paths across CPU cores. On a measured 431 GiB two-channel export, pyramid
+> generation took **103 s per channel with numba versus 631 s without (6.1×)**, and
+> mutual-information registration is likewise far slower on the pure-NumPy fallback.
+> Results are bit-identical either way — only the speed differs.
+>
+> Install it via conda (as in the command above) because conda ships pre-built binaries
+> for `numba` and its dependency `llvmlite`; installing via pip may fail on macOS and
+> other platforms due to build toolchain incompatibilities. The pip extra
+> `pip install -e ".[numba]"` also works but may require additional build dependencies.
+>
+> To confirm it is active in the environment you actually run the app from:
+>
+> ```bash
+> conda activate shifter
+> python -c "import numba; print(numba.__version__)"
+> ```
+>
+> Every export also logs the backend in use — look for
+> `Pyramid reduction backend: numba (N threads)` near the top of
+> `performance_log.txt`. If it instead reads `numpy (single-threaded fallback …)`, the
+> line names the underlying error.
+
+### 2. GPU acceleration (optional): choose CUDA 12 or CUDA 13
+
+The GPU is optional; without it everything runs on the CPU. It needs an NVIDIA GPU with
+compute capability 8.6 or newer (GeForce RTX 30-series, RTX A-series workstation cards,
+or newer).
+
+CuPy, the GPU library, comes in one build per CUDA major version, and the build must
+match both your NVIDIA driver and your CUDA Toolkit. Run `nvidia-smi` and read
+**`CUDA Version`** in the top-right corner. That is the newest CUDA your driver supports.
+
+| `nvidia-smi` shows | Use | CUDA Toolkit to install | pip extra | Installs |
+|---|---|---|---|---|
+| `CUDA Version: 13.x` (driver R580 or newer) | CUDA 13 | 13.x | `.[gpu-cuda13]` | `cupy-cuda13x` |
+| `CUDA Version: 12.x` | CUDA 12 | 12.x (12.6 is the tested version) | `.[gpu-cuda12]` | `cupy-cuda12x` |
+| lower than 12.0 | update the NVIDIA driver first | | | |
+
+A driver that supports CUDA 13 also runs CUDA 12, so CUDA 12 works on either kind of
+machine. Within one major version the minor versions don't need to match (a 13.4 toolkit
+runs on a driver that reports 13.0).
+
+1. Install the NVIDIA CUDA Toolkit of that major version from
+   [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads)
+   (older versions: *CUDA Toolkit Archive*). It installs to
+   `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v<version>`.
+2. Install the matching CuPy build into the `shifter` environment. Only one CuPy build may
+   be installed at a time, so remove the other one first:
+
+   **CUDA 12:**
+   ```cmd
+   conda activate shifter
+   pip uninstall -y cupy-cuda13x
+   pip install -e ".[gpu-cuda12]"
+   ```
+
+   **CUDA 13:**
+   ```cmd
+   conda activate shifter
+   pip uninstall -y cupy-cuda12x
+   pip install -e ".[gpu-cuda13]"
+   ```
+
+   The older `.[gpu]` extra still works and is the same as `.[gpu-cuda12]`.
+
+### 3. Point the conda environment at the CUDA Toolkit (`CUDA_PATH`)
+
+shifter looks for the toolkit automatically (`CUDA_PATH`, `CUDA_PATH_V13_4`-style
+variables set by the NVIDIA installer, `nvcc` on `PATH`, then `C:\Program Files\NVIDIA GPU
+Computing Toolkit\CUDA`), so this step is often unnecessary. Set it explicitly if you have
+several toolkits installed, the GPU check fails, or the toolkit is in a non-standard place.
+
+Store the variable in the conda environment itself, so it is set whenever the
+environment is activated (including by the launchers):
+
+```cmd
+conda activate shifter
+conda env config vars set CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+conda deactivate
+conda activate shifter
+echo %CUDA_PATH%
+```
+
+Use your own toolkit folder, e.g. `...\CUDA\v12.6` for CUDA 12. Point it at the toolkit
+folder itself, **not** its `bin` subfolder. `conda env config vars list` shows what is
+set, and `conda env config vars unset CUDA_PATH` removes it.
+
+If your conda is too old for `conda env config vars` (before 4.8), use an activation
+script instead:
+
+```cmd
+conda activate shifter
+mkdir "%CONDA_PREFIX%\etc\conda\activate.d"
+echo set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"> "%CONDA_PREFIX%\etc\conda\activate.d\cuda_path.bat"
+```
+
+Alternatively set `CUDA_PATH` machine-wide under *Windows Settings → System → About →
+Advanced system settings → Environment Variables*, then open a new Anaconda Prompt.
+
+### 4. Check the GPU
+
+```cmd
+conda activate shifter
+python -c "from shifter.registration.gpu_utils import gpu_available, gpu_fail_reason, gpu_name; print(gpu_available(), gpu_name(), gpu_fail_reason())"
+```
+
+`True <your GPU name>` means the GPU will be used. `False` is followed by the reason; see
+[GPU Acceleration](#gpu-acceleration) for the common ones. This runs the same check the
+app runs at startup.
+
 ## GPU Acceleration
 
 All registration algorithms support optional GPU acceleration via CuPy. The widget displays the detected GPU name or indicates CPU-only mode. If a GPU computation fails (e.g., out of memory), it falls back to CPU automatically.
 
 On startup the app checks for a usable GPU by JIT-compiling a small test kernel with CuPy/NVRTC. Because a CuPy build that does not match the installed CUDA driver/toolkit can make that compile fault at the native level (a Windows *access violation*), the check runs in a **separate subprocess** — if it crashes, the app reports CPU mode and keeps running rather than going down with it.
 
-The probe is attempted twice, each in its own subprocess. The first attempt is **isolated**: it removes any system CUDA-toolkit directory from `PATH` so CuPy loads only its own bundled CUDA libraries. This fixes the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL (already on `PATH` from the CUDA installer) shadows the different-version one bundled with `cupy-cuda12x` and crashes the compile. The second attempt injects the **system** CUDA toolkit path, for setups (e.g. conda `cudatoolkit`) whose CuPy relies on the system libraries. Whichever succeeds, that same `PATH` arrangement is applied to the app process for the real GPU work. Two environment variables control the check:
+The probe is attempted twice, each in its own subprocess. The first attempt is **isolated**: it removes any system CUDA-toolkit directory from `PATH` so CuPy loads only its own bundled CUDA libraries. This fixes the most common failure on Windows, where a system CUDA toolkit's `nvrtc` DLL (already on `PATH` from the CUDA installer) shadows the different-version one used by `cupy-cuda12x`/`cupy-cuda13x` and crashes the compile. The second attempt injects the **system** CUDA toolkit path, for setups (e.g. conda `cudatoolkit`) whose CuPy relies on the system libraries. Whichever succeeds, that same `PATH` arrangement is applied to the app process for the real GPU work. Two environment variables control the check:
 
 - `SHIFTER_DISABLE_GPU=1` — skip the GPU probe entirely and run on CPU (fastest startup; use this if the probe is slow or unreliable on your machine).
 - `SHIFTER_GPU_PROBE=inprocess` — run the probe in-process (the old behaviour), for debugging only; a native CuPy fault will crash the app.
 
-Install GPU support:
+To install GPU support, see [Installation](#installation), or [Detailed installation step 2](#2-gpu-acceleration-optional-choose-cuda-12-or-cuda-13) for choosing between CUDA 12 and 13.
 
-```bash
-pip install -e ".[gpu]"
-```
-
-Any **CUDA 12.x** runtime is supported (this is what `cupy-cuda12x` targets); the app is tested against CUDA 12.6. The CuPy wheel bundles its own CUDA 12.x libraries, so it may report a runtime version (e.g. 12.9) different from a separately installed toolkit — that is expected and fine. For CUDA 13.x, install `cupy-cuda13x` instead. CUDA 11.x is not supported.
+Any **CUDA 12.x** or **CUDA 13.x** runtime is supported; the installed CuPy wheel must match the major version (`cupy-cuda12x` for 12.x, `cupy-cuda13x` for 13.x). The app is tested against CUDA 12.6. The CuPy wheel may report a runtime version (e.g. 12.9) different from a separately installed toolkit of the same major version — that is expected and fine. CUDA 11.x and older are not supported. CUDA 13.x requires an NVIDIA driver from the R580 series or newer; an older driver fails with `cudaErrorInsufficientDriver` and the startup banner says so.
 
 **Troubleshooting: GPU shows CPU mode with a "could not compile a test kernel" banner**
 
-If the startup banner reports that CuPy could not compile a test kernel on an otherwise-supported CUDA 12.x runtime, a system CUDA toolkit's `nvrtc` DLL is most likely shadowing CuPy's bundled one. Try, in order:
+If the startup banner reports that CuPy could not compile a test kernel on an otherwise-supported CUDA 12.x or 13.x runtime, a system CUDA toolkit's `nvrtc` DLL is most likely shadowing CuPy's bundled one. Try, in order:
 
-1. Refresh the bundled CUDA libraries: `pip install -U cupy-cuda12x`.
+1. Refresh CuPy for your CUDA version: `pip install -U cupy-cuda12x` (CUDA 12.x) or `pip install -U cupy-cuda13x` (CUDA 13.x).
 2. Update your NVIDIA driver.
 3. Diagnose directly with the probe, which takes a `--strategy` and prints its JSON result (and, thanks to faulthandler, any native crash stack):
 
@@ -358,30 +547,20 @@ If the startup banner reports that CuPy could not compile a test kernel on an ot
    python -m shifter.registration._gpu_probe --strategy bundled
    ```
 
-   `isolated` is what the app tries first (it drops system CUDA-toolkit dirs from `PATH` so CuPy uses its bundled libraries); `bundled` leaves `PATH` untouched. If `isolated` prints `"available": true`, the app will use the GPU on the next launch.
+   `isolated` is what the app tries first (it drops system CUDA-toolkit dirs from `PATH` so CuPy uses its bundled libraries); if it fails, the app tries `system` (it adds the CUDA Toolkit from `CUDA_PATH`). `bundled` leaves `PATH` untouched. If **either** `isolated` or `system` prints `"available": true`, the app will use the GPU on the next launch. With a system CUDA 13 toolkit it is normal for `isolated` to fail with `failed to open nvrtc-builtins64_1xx.dll` and `system` to succeed: CuPy uses the toolkit's NVRTC, whose companion DLL the isolated check hides on purpose.
 
-**Troubleshooting: GPU not detected (conda-installed CUDA toolkit)**
+**Troubleshooting: GPU not detected / "NVRTC not found"**
 
-If you rely on a conda-installed `cudatoolkit` rather than the bundled CuPy libraries, and the widget shows CPU-only mode, the `CUDA_PATH` environment variable may not be visible inside your conda environment. Verify by running:
+If the reason mentions NVRTC or missing CUDA libraries, `CUDA_PATH` is probably unset
+inside the conda environment, or points at the wrong toolkit. Check it with
+`echo %CUDA_PATH%` in the activated environment and set it as described in
+[Detailed installation step 3](#3-point-the-conda-environment-at-the-cuda-toolkit-cuda_path).
 
-```cmd
-echo %CUDA_PATH%
-```
+**Troubleshooting: "NVIDIA driver is too old" banner**
 
-If this prints nothing, set it manually for your session:
-
-```cmd
-set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
-```
-
-To make this permanent for the conda environment, create an activation script:
-
-```cmd
-mkdir "%CONDA_PREFIX%\etc\conda\activate.d"
-echo set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6 > "%CONDA_PREFIX%\etc\conda\activate.d\cuda_path.bat"
-```
-
-Ensure the path points to your CUDA 12.6 installation.
+The installed CuPy build needs a newer CUDA than your driver supports (typically
+`cupy-cuda13x` on a driver older than R580). Update the NVIDIA driver, or switch to the
+CUDA 12 build: `pip uninstall -y cupy-cuda13x` then `pip install -e ".[gpu-cuda12]"`.
 
 **Troubleshooting: app closes immediately on startup**
 
@@ -392,7 +571,7 @@ set SHIFTER_DISABLE_GPU=1
 python -m shifter
 ```
 
-The app will run on CPU. To restore GPU acceleration, reinstall CuPy to match your CUDA version (`pip install cupy-cuda12x` for CUDA 12.x) and update your NVIDIA driver, then unset the variable.
+The app will run on CPU. To restore GPU acceleration, reinstall CuPy to match your CUDA version (`pip install cupy-cuda12x` for CUDA 12.x, `pip install cupy-cuda13x` for CUDA 13.x) and update your NVIDIA driver, then unset the variable.
 
 ## Dependencies
 
